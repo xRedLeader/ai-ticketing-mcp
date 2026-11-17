@@ -206,6 +206,8 @@ export interface Transaction extends Reader {
   remove<K extends Table>(table: K, id: string): Promise<void>;
 }
 export interface StorageAdapter extends Reader {
+  /** One consistent read-only view, independent of project mutation locks. */
+  readSnapshot<T>(work: (reader: Reader) => Promise<T>): Promise<T>;
   /** Serializes mutations in a scope, commits atomically, and rolls back on failure. */
   transaction<T>(scope: string, work: (tx: Transaction) => Promise<T>): Promise<T>;
   /** Atomically leases durable jobs, including abandoned jobs whose lease expired. */

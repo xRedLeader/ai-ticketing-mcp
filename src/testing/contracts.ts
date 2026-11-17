@@ -148,6 +148,65 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
       );
       assert.equal(await f.storage.get('actors', id), null);
     });
+    check('keeps one read-only snapshot coherent without blocking mutations or other readers', async (f) => {
+      const ticket = await f.ticket();
+      let entered!: () => void;
+      let advance!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const resume = new Promise<void>((resolve) => {
+        advance = resolve;
+      });
+      const reading = f.storage.readSnapshot(async (reader) => {
+        assert.equal('put' in reader, false);
+        assert.equal('remove' in reader, false);
+        const before = await reader.get('tickets', ticket.id);
+        entered();
+        await resume;
+        return [before, await reader.get('tickets', ticket.id)];
+      });
+      await Promise.race([
+        ready,
+        reading.then(() => {
+          throw new Error('Snapshot ended before its first read.');
+        }),
+      ]);
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const concurrent = Promise.all([
+        f.call(f.worker.id, 'ticket_update', {
+          ticket_id: ticket.id,
+          expected_revision: ticket.revision,
+          priority: 1,
+        }),
+        f.storage.readSnapshot((reader) => reader.get('projects', f.project.id)),
+      ]);
+      let completed: boolean;
+      try {
+        completed = await Promise.race([
+          concurrent.then(() => true),
+          new Promise<boolean>((resolve) => {
+            timeout = setTimeout(() => resolve(false), 5000);
+          }),
+        ]);
+      } finally {
+        advance();
+        clearTimeout(timeout);
+      }
+      const [before, after] = await reading;
+      await concurrent;
+      assert.equal(completed, true, 'Snapshot serialized a concurrent mutation or reader.');
+      assert.deepEqual(after, before);
+      assert.equal(after?.priority, ticket.priority);
+      assert.equal((await f.storage.get('tickets', ticket.id))?.priority, 1);
+      await assert.rejects(
+        f.storage.readSnapshot(async () => {
+          throw new Error('abort snapshot');
+        }),
+        /abort snapshot/,
+      );
+      assert.equal((await f.storage.readSnapshot((reader) => reader.get('tickets', ticket.id)))?.priority, 1);
+    });
     check('grants exactly one concurrent claim', async (f) => {
       const ticket = await f.ticket();
       const attempts = await Promise.allSettled(

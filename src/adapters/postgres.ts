@@ -6,6 +6,7 @@ import {
   DomainError,
   ensure,
   type StorageAdapter,
+  type Reader,
   type Transaction,
   type Table,
   type Tables,
@@ -256,6 +257,21 @@ export class PostgresStorage implements StorageAdapter {
       // A project lock orders writes and event cursors by commit, including graph mutations.
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [scope]);
       const result = await work(repository(client));
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      return translate(error);
+    } finally {
+      client.release();
+    }
+  }
+  async readSnapshot<T>(work: (reader: Reader) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      const { get, find, unansweredQuestions, workCandidates } = repository(client);
+      const result = await work({ get, find, unansweredQuestions, workCandidates });
       await client.query('COMMIT');
       return result;
     } catch (error) {

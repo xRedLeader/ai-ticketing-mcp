@@ -28,5 +28,10 @@ export function createRuntime(env: NodeJS.ProcessEnv = process.env) {
     spaceId: env.EMBEDDING_SPACE_ID?.trim() || undefined,
     timeoutMs: Number(env.EMBEDDING_TIMEOUT_MS ?? 30000),
   });
-  return createApplication({ storage, search, embeddings });
+  return createApplication({
+    storage,
+    search,
+    embeddings,
+    referenceTokenMetrics: env.REFERENCE_TOKEN_METRICS === 'true',
+  });
 }

@@ -28,6 +28,7 @@ export interface ApplicationOptions {
   embeddings: EmbeddingProvider;
   now?: () => Date;
   countReferenceTokens?: (text: string) => number;
+  referenceTokenMetrics?: boolean;
 }
 const LEASE_MS = 600_000;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -48,6 +49,7 @@ export class Application {
   readonly embeddings: CachedEmbeddings;
   private now: () => Date;
   private countTokens: (text: string) => number;
+  private referenceTokenMetrics: boolean;
   readonly metrics = {
     requests: 0,
     errors: 0,
@@ -68,8 +70,10 @@ export class Application {
         : new CachedEmbeddings(options.embeddings);
     this.now = options.now ?? (() => new Date());
     this.countTokens = options.countReferenceTokens ?? countReferenceTokens;
+    this.referenceTokenMetrics = options.referenceTokenMetrics === true;
   }
   recordReferenceTokens(kind: 'request' | 'result', text: string) {
+    if (!this.referenceTokenMetrics) return;
     try {
       const count = this.countTokens(text);
       ensure(
@@ -181,7 +185,7 @@ export class Application {
     await this.queue(tx, ticket, 'ticket');
   }
   private async scoped(
-    actor: Actor,
+    actorId: string,
     operation: Operation,
     input: { project_id?: string; idempotency_key: string; include_context?: boolean; max_tokens?: number },
     roles: Role[],
@@ -189,7 +193,7 @@ export class Application {
   ): Promise<unknown> {
     const scope = input.project_id ?? 'catalog';
     return this.storage.transaction(scope, async (tx) => {
-      actor = await this.actor(actor.id, tx);
+      const actor = await this.actor(actorId, tx);
       const project = input.project_id ? await this.access(tx, actor, input.project_id, roles) : null;
       if (!project) ensure(actor.system_admin, 'FORBIDDEN', 'System administrator access is required.');
       const receiptId = digest([actor.id, scope, operation, input.idempotency_key]);
@@ -489,8 +493,9 @@ export class Application {
         throw new DomainError('INVALID_INPUT', 'Input does not match the operation schema.', {
           issues: result.error.issues,
         });
-      const actor = await this.actor(actorId);
-      return this.result(operation, await this.dispatch(actor, operation, result.data));
+      if (readOperations.has(operation))
+        return this.result(operation, await this.read(actorId, operation, result.data));
+      return await this.dispatch(actorId, operation, result.data);
     } catch (error) {
       this.metrics.errors++;
       throw error;
@@ -498,13 +503,12 @@ export class Application {
       this.metrics.duration_ms += performance.now() - started;
     }
   }
-  private async dispatch(actor: Actor, operation: Operation, input: any): Promise<unknown> {
-    if (readOperations.has(operation)) return this.read(actor, operation, input);
+  private async dispatch(actorId: string, operation: Operation, input: any): Promise<unknown> {
     const roles: Role[] = ['contributor', 'admin'];
     if (['project_update', 'member_set'].includes(operation)) roles.splice(0, roles.length, 'admin');
     if (operation === 'ticket_review') roles.splice(0, roles.length, 'verifier', 'admin');
     if (operation === 'ticket_note') roles.push('verifier');
-    return this.scoped(actor, operation, input, roles, async (tx, project, actor) => {
+    return this.scoped(actorId, operation, input, roles, async (tx, project, actor) => {
       switch (operation) {
         case 'project_create': {
           const data = input as Input<'project_create'>;
@@ -988,13 +992,16 @@ export class Application {
       blockers,
     };
   }
-  private async read(actor: Actor, operation: Operation, input: any): Promise<unknown> {
-    if (operation === 'ticket_context')
-      return this.storage.transaction(input.project_id, async (tx) => {
-        const currentActor = await this.actor(actor.id, tx);
-        const project = await this.access(tx, currentActor, input.project_id);
-        return this.context(tx, currentActor, project, input);
+  private async read(actorId: string, operation: Operation, input: any): Promise<unknown> {
+    if (operation === 'ticket_context') {
+      const snapshot = await this.storage.readSnapshot(async (reader) => {
+        const actor = await this.actor(actorId, reader);
+        const project = await this.access(reader, actor, input.project_id);
+        return this.collectContext(reader, actor, project, input);
       });
+      return this.packContext(snapshot, input);
+    }
+    const actor = await this.actor(actorId);
     if (operation === 'project_list') {
       if (actor.system_admin)
         return {
@@ -1058,6 +1065,16 @@ export class Application {
         );
       case 'ticket_history': {
         const ticket = await this.ticket(this.storage, project.id, input.ticket_id);
+        if (input.unanswered_questions)
+          return {
+            items: await this.storage.unansweredQuestions(
+              project.id,
+              ticket.id,
+              false,
+              input.limit,
+              input.offset,
+            ),
+          };
         return {
           items: await this.storage.find(input.kind as 'notes' | 'submissions' | 'reviews', {
             where: {
@@ -1289,6 +1306,14 @@ export class Application {
     input: Input<'ticket_context'>,
     receipt?: Record<string, unknown>,
   ) {
+    return this.packContext(await this.collectContext(reader, actor, project, input), input, receipt);
+  }
+  private async collectContext(
+    reader: Reader,
+    actor: Actor,
+    project: Project,
+    input: Input<'ticket_context'>,
+  ) {
     const at = this.timestamp();
     const ticket = await this.ticket(reader, project.id, input.ticket_id);
     const detail = await this.details(reader, project.id, ticket, actor, at);
@@ -1336,7 +1361,41 @@ export class Application {
             })
           : [],
       ]);
-    const sourceSummaries = this.result('ticket_list', { tickets: dependencies }) as {
+    return {
+      actor,
+      project,
+      ticket,
+      detail,
+      limit,
+      checkpoints,
+      questions,
+      reviews,
+      submissions,
+      member,
+      unfinishedChildren,
+      dependencies,
+    };
+  }
+  private packContext(
+    snapshot: Awaited<ReturnType<Application['collectContext']>>,
+    input: Input<'ticket_context'>,
+    receipt?: Record<string, unknown>,
+  ) {
+    const {
+      actor,
+      project,
+      ticket,
+      detail,
+      limit,
+      checkpoints,
+      questions,
+      reviews,
+      submissions,
+      member,
+      unfinishedChildren,
+      dependencies,
+    } = snapshot;
+    const sourceSummaries = resultSchemas.ticket_list.parse({ tickets: dependencies }) as {
       tickets: { id: string }[];
     };
     const sourcesById = new Map(sourceSummaries.tickets.map((source) => [source.id, source]));
@@ -1373,6 +1432,7 @@ export class Application {
       detail: input.detail,
       max_tokens: maxTokens,
     });
+    if (input.if_none_match === fingerprint) return { fingerprint, not_modified: true };
     const base = {
       fingerprint,
       not_modified: false,
@@ -1390,7 +1450,7 @@ export class Application {
     type Omission = {
       section: string;
       retrieve_with: string;
-      arguments: Record<string, string | number>;
+      arguments: Record<string, string | number | boolean>;
       revision?: number;
       required_before?: 'execution' | 'review';
     };
@@ -1417,7 +1477,11 @@ export class Application {
         name: 'open_questions',
         value: questions.slice(0, limit),
         empty: !questions.length,
-        omission: { section: 'open_questions', retrieve_with: 'ticket_history', arguments: history('notes') },
+        omission: {
+          section: 'open_questions',
+          retrieve_with: 'ticket_history',
+          arguments: { ...history('notes'), unanswered_questions: true, offset: 0 },
+        },
       },
       {
         name: 'reviews',
@@ -1445,12 +1509,6 @@ export class Application {
       },
     ];
     const overflow: Omission[] = [];
-    if (questions.length > limit)
-      overflow.push({
-        section: 'open_questions_more',
-        retrieve_with: 'ticket_history',
-        arguments: { ...history('notes'), offset: 0 },
-      });
     for (const [name, items] of [
       ['reviews', reviews],
       ['submissions', submissions],
@@ -1486,42 +1544,92 @@ export class Application {
         ],
       },
     );
+    const candidates = [output];
+    const sectionCosts = new Map<string, number>();
+    let estimate = requiredTokens;
     for (const section of sections) {
       if (section.empty) continue;
-      const candidate = {
-        ...output,
-        [section.name]: section.value,
-        omitted: output.omitted.filter((omission) => omission.section !== section.name),
-      };
-      if (this.responseTokens(response(candidate)) <= maxTokens) output = candidate;
+      const cost = this.responseTokens({ [section.name]: section.value });
+      sectionCosts.set(section.name, cost);
+      const omitted = output.omitted.filter((omission) => omission.section !== section.name);
+      let addedNotice: Omission | undefined;
+      if (section.name === 'open_questions' && questions.length > limit)
+        addedNotice = {
+          section: 'open_questions_more',
+          retrieve_with: 'ticket_history',
+          arguments: { ...history('notes'), unanswered_questions: true, offset: 0 },
+        };
+      const delta =
+        cost - this.responseTokens(section.omission) + (addedNotice ? this.responseTokens(addedNotice) : 0);
+      if (estimate + delta > maxTokens) continue;
+      if (addedNotice) omitted.push(addedNotice);
+      output = { ...output, [section.name]: section.value, omitted };
+      estimate += delta;
+      candidates.push(output);
     }
     for (const [name, items, fetched] of [
       ['reviews', reviews.slice(0, limit), reviews.length],
       ['submissions', contextSubmissions, submissions.length],
     ] as const) {
-      const included = output[name] as unknown[] | undefined;
-      if (!included?.length) continue;
-      for (const item of items.slice(1)) {
-        const current = output[name] as unknown[];
-        const count = current.length + 1;
-        const candidate = {
-          ...output,
-          [name]: [...current, item],
-          omitted: output.omitted.flatMap((omission) =>
-            omission.section !== `${name}_more`
-              ? [omission]
-              : count >= fetched
-                ? []
-                : [{ ...omission, arguments: { ...omission.arguments, offset: count } }],
-          ),
-        };
-        if (this.responseTokens(response(candidate)) > maxTokens) break;
-        output = candidate;
+      if (!(output[name] as unknown[] | undefined)?.length || items.length < 2) continue;
+      const currentCost = sectionCosts.get(name)!;
+      const oldNotice = output.omitted.find((omission) => omission.section === `${name}_more`);
+      const oldNoticeCost = oldNotice ? this.responseTokens(oldNotice) : 0;
+      const measure = (count: number) =>
+        this.responseTokens({ [name]: items.slice(0, count) }) -
+        currentCost -
+        oldNoticeCost +
+        (oldNotice && count < fetched
+          ? this.responseTokens({ ...oldNotice, arguments: { ...oldNotice.arguments, offset: count } })
+          : 0);
+      let count = items.length;
+      let cost = measure(count);
+      if (estimate + cost > maxTokens) {
+        let low = 2;
+        let high = count - 1;
+        count = 1;
+        cost = 0;
+        while (low <= high) {
+          const middle = Math.floor((low + high) / 2);
+          const measured = measure(middle);
+          if (estimate + measured <= maxTokens) {
+            count = middle;
+            cost = measured;
+            low = middle + 1;
+          } else high = middle - 1;
+        }
       }
+      if (count === 1) continue;
+      output = {
+        ...output,
+        [name]: items.slice(0, count),
+        omitted: output.omitted.flatMap((omission) =>
+          omission.section !== `${name}_more`
+            ? [omission]
+            : count >= fetched
+              ? []
+              : [{ ...omission, arguments: { ...omission.arguments, offset: count } }],
+        ),
+      };
+      estimate += cost;
+      candidates.push(output);
     }
-    if (input.if_none_match === fingerprint) return { fingerprint, not_modified: true };
-    return output;
+    if (candidates.length === 1 || this.responseTokens(response(output)) <= maxTokens) return output;
+    // Section counts only estimate BPE joins; repair with a bounded search over whole-group prefixes.
+    let best = candidates[0]!;
+    let low = 1;
+    let high = candidates.length - 2;
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      const candidate = candidates[middle]!;
+      if (this.responseTokens(response(candidate)) <= maxTokens) {
+        best = candidate;
+        low = middle + 1;
+      } else high = middle - 1;
+    }
+    return best;
   }
+
   async indexOnce(limit = 10) {
     const jobs = await this.storage.leaseJobs(limit, 300_000);
     for (const job of jobs) {

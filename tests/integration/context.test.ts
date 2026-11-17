@@ -279,6 +279,7 @@ it('keeps token-accounting failures from changing committed mutations', async ()
       storage: f.storage,
       search: f.search,
       embeddings: testEmbeddings,
+      referenceTokenMetrics: true,
       countReferenceTokens: () => {
         throw new Error('counter unavailable');
       },
@@ -387,6 +388,7 @@ it('uses the refreshed reviewer kind when a human becomes an agent while queued'
 it('batches dependency reads and refuses an overflowing mandatory question set', async () => {
   const f = await setup();
   const transaction = f.storage.transaction.bind(f.storage);
+  const readSnapshot = f.storage.readSnapshot.bind(f.storage);
   try {
     const ticket = await f.ticket();
     await transaction(f.project.id, async (tx) => {
@@ -410,8 +412,8 @@ it('batches dependency reads and refuses an overflowing mandatory question set',
     let ticketGets = 0;
     let questionQueries = 0;
     let overflow = false;
-    f.storage.transaction = (scope, work) =>
-      transaction(scope, async (tx) =>
+    f.storage.readSnapshot = (work) =>
+      readSnapshot(async (tx) =>
         work({
           ...tx,
           get: async (table, id) => {
@@ -440,7 +442,7 @@ it('batches dependency reads and refuses an overflowing mandatory question set',
       hasCode('GRAPH_LIMIT'),
     );
   } finally {
-    f.storage.transaction = transaction;
+    f.storage.readSnapshot = readSnapshot;
     await f.dispose();
   }
 });
