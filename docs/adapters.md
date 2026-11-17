@@ -19,6 +19,7 @@ The application owns workflow, permissions, review policy, graph validation, and
 - Claims have unique ticket ownership. Lease replacements change the token. Domain checks run inside the same transaction as the write.
 - Job leasing must be atomic across workers. Completion must match both lease token and revision so an old worker cannot remove a newer indexing job.
 - `workCandidates` returns ordered, potentially eligible tickets. Prefiltering in the adapter improves speed; the application still checks workflow eligibility inside the transaction.
+- `unansweredQuestions(projectId,ticketId,blocking,limit,offset)` returns only unanswered questions matching the exact blocking flag, ordered by creation time and ID. Multiple answers cannot duplicate results. Context reads and authorization use the project transaction reader after lock acquisition.
 - `find` supports equality, null, `in`, and `gt`, stable ordering, offset, and bounded limits. No arbitrary SQL crosses the interface.
 
 A non-SQL backend can implement these operations using its native transactions and conditional writes. A backend unable to supply the guarantees is not a compatible production adapter. Do not emulate a transaction by saving records one by one without atomic rollback.
@@ -64,4 +65,6 @@ registerAdapterContractTests('my backend', async () => {
 
 Run with Node's test runner against an isolated real backend. The suite checks rollback, claim races, retry deduplication, stale revisions and tokens, ordered events, search freshness, and job fencing. Add backend-specific failure and restoration tests before claiming production support.
 
-Endpoint aliases do not change embedding identity. Set `EMBEDDING_REVISION` to a new value when model weights or a hosted provider change without a model-name change; then rebuild the index.
+`indexVector` accepts an optional fourth exact-input SHA-256 hash. Optional `reuseVector` must atomically match profile/hash, reject newer revisions and archived documents, and invalidate coverage; adapters without it embed normally. Hash the raw `${title}\n${text}` input. Legacy nullable hashes are not backfilled without embedding.
+
+Endpoint identity contributes to the default profile. Set an explicit shared `EMBEDDING_SPACE_ID` only for actual aliases of the same embedding space; empty means unset. Change `EMBEDDING_REVISION` when weights change behind unchanged identity, then configure and rebuild. Production reference counting uses local `o200k_base`; applications may inject `countReferenceTokens(serialized)` for deterministic checks.

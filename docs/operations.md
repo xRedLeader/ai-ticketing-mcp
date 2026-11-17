@@ -12,7 +12,7 @@ Writes enqueue durable indexing jobs in the same storage transaction. The worker
 
 Set `EMBEDDING_PROVIDER=ollama` for `/api/embed`, or `openai` for a provider's `/v1/embeddings`-compatible endpoint. Configure the model, URL, dimensions, and optional API key. Hosted mode requires explicit URL/model/dimensions; vector dimensions must be 1–2000 for the supplied HNSW adapter.
 
-Only one embedding profile is active per process. The profile fingerprints provider, model, dimensions, explicit model revision, and chunking algorithm. After changing it, run `migrate` with schema-owner privileges to create its index, restart app/worker with the same configuration, then `reindex --actor ADMIN_ID --project PROJECT_ID`. Reindex also prepares the profile and therefore needs migration credentials. Old profiles cannot mix with the new one; semantic coverage is reported until rebuilding finishes. Existing inactive vector generations remain available for operator-managed cleanup and rollback.
+Only one embedding profile is active per process. Its identity covers provider, effective endpoint (or explicit shared-space ID), model, dimensions, revision, and chunking. Endpoint identity changes existing profile IDs: run `migrate` with schema-owner privileges, restart app/worker with matching configuration, then `reindex --actor ADMIN_ID --project PROJECT_ID` before expecting semantic readiness. Reindex also prepares the profile and needs migration credentials. Old indexes/vectors remain for operator-managed rollback; generations never mix. Nullable input hashes alone do not trigger a full backfill.
 
 Use `docker compose exec ollama ollama pull nomic-embed-text` to retry model installation. Raw artifact URLs are never fetched, and the server does not execute agent commands.
 
@@ -20,7 +20,7 @@ Use `docker compose exec ollama ollama pull nomic-embed-text` to retry model ins
 
 - `/healthz`: process liveness.
 - `/readyz`: storage and search schema connectivity.
-- `/metrics`: authenticated system-administrator-only Prometheus text metrics for requests, errors, cumulative request time, indexed documents, indexing errors, active/expired claims, review backlog, pending jobs, and indexing lag.
+- `/metrics`: authenticated system-administrator-only Prometheus metrics for requests/errors/time, indexing, active/expired claims, review backlog, pending jobs, and lag. Numeric counters also report validated tool-input reference tokens (SDK defaults may be materialized), canonical-envelope result tokens, accounting failures, provider `embed` invocations, document/query reuse, provider failures, and cache saturation. These are local reference counts, not billed tokens or exact wire/client costs. No content labels are collected.
 
 Readiness does not imply the embedding provider or identity provider is available; alert on authentication failures, indexing error increases, and growing job lag. HTTP logs include only method, recognized route, status, and duration. Tokens, database URLs, ticket bodies, and evidence are not logged.
 
@@ -55,6 +55,8 @@ The design targets p95 below 300 ms for ordinary operations and one second for r
 
 This is one team per deployment with project grants, not multi-tenant SaaS. Local DB credentials confer operator trust. Audit records and idempotency receipts are retained indefinitely. Indexing is eventual; a changed source is omitted from search until its new revision is indexed. Mean-pooled document embeddings trade passage precision for a compact index. A reviewer must validate evidence; the server verifies its presence and attribution, not its truth.
 
-Endpoint aliases do not change embedding identity. Set `EMBEDDING_REVISION` to a new value when model weights or a hosted provider change without a model-name change; then rebuild the index.
+Exact query embeddings coalesce in a 256-entry total pending/resolved cache. Successes live ten minutes; resolved LRU entries are evicted. If every entry is pending, new distinct queries use full-text fallback and report degradation. Documents reuse only exact input hashes within an immutable profile. `EMBEDDING_SPACE_ID` is optional; Compose passes it through without imposing a hosted-service identity. The local example matches Docker/localhost aliases of its single Ollama service.
+
+Run `npm run benchmark:protocol` with disposable `PROTOCOL_DATABASE_URL` or `TEST_DATABASE_URL`. It creates isolated schemas and uses the pinned six-workflow baseline, counting actual SDK catalogs/results/calls and separate canonical-envelope references. It checks per-role delivered requirements/checkpoint/evidence and fails below 40% aggregate savings, above 5,000 worker-catalog tokens, or on any workflow regression. Fixture setup is excluded; workflow retries and reconciliation are counted. Reports default to ignored `.local/protocol-benchmark-results.json`.
 
 Coverage reports include `observed_at` and may lag other workers by up to five seconds. Index writes invalidate the local coverage cache immediately. During upgrades, stop app/worker processes before applying migrations, then start the new versions together.

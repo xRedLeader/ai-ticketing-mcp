@@ -44,14 +44,16 @@ For real users and agents, follow [identity and client setup](docs/authenticatio
 
 ## The work loop
 
-1. `project_list` and `project_get` discover accessible projects and instructions.
-2. `work_next` finds eligible work; `work_claim` acquires it atomically.
-3. `ticket_context` returns requirements, blockers, the checkpoint, and relevant sources.
-4. `ticket_checkpoint` preserves progress; `work_heartbeat` renews ownership at least every three minutes.
-5. `ticket_submit` supplies passing evidence for every criterion.
-6. `ticket_review` approves or requests changes according to project policy.
+1. `project_list` discovers authorized projects; select worker (default), planner, reviewer, or full profile for the task.
+2. `work_claim` selects and claims work atomically, returning brief context with current requirements, instructions, policy, blockers, and credentials.
+3. Follow required omission references before resumed work or review. Use `ticket_context` for more detail and `ticket_history` for history.
+4. `ticket_checkpoint` persists progress and returns the next ticket revision. Heartbeat at least every three minutes.
+5. `ticket_submit` supplies passing evidence for every criterion using the latest returned revision.
+6. A reviewer reads current requirements and submission evidence, then uses `ticket_review` according to policy.
 
 Use a fresh `idempotency_key` for each logical mutation, reusing it only for an identical retry. Read the latest revision before edits and submission. A changed requirement revokes claims and invalidates affected approvals; an old worker cannot continue with its former token.
+
+Connect with `stdio --profile planner` or `/mcp?profile=reviewer`; OAuth tokens still target `/mcp`. Profiles select tools without changing permissions. Lists and mutation receipts are compact; fetch full current state through `ticket_get` or `project_get`. The [SDK maintenance example](examples/claim-maintenance.ts) heartbeats and polls changes every two minutes outside model turns, retaining keys across identical retries.
 
 Ticket references accept a UUID or readable key such as `CORE-42`. Project references use UUIDs. Full [tool and workflow behavior](docs/mcp.md) is documented separately.
 
@@ -78,6 +80,8 @@ npm test
 npm run test:integration
 npm run check
 npm run format:check
+# With a disposable database configured, check the frozen protocol benchmark.
+npm run benchmark:protocol
 ```
 
 Integration tests require a real database and fail clearly when it is not configured. They exercise claims, races, retries, stale workers, review policies, permissions, search freshness, and both MCP transports. See the [verification record](docs/verification.md) for measured results and [operations](docs/operations.md) for backup/restore, rebuilding search, and benchmarks.
