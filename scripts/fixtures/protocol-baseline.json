@@ -1,0 +1,1132 @@
+{
+  "version": 1,
+  "mode": "baseline",
+  "baseline_source": "a8cd3840cd098cd3107a0f1bc231cf5b5414fc09",
+  "source_commit": "a8cd3840cd098cd3107a0f1bc231cf5b5414fc09",
+  "scenario_contract_sha256": "31276d92fd46422eea503de7c36d757a84be4f6df0a39b75e2bd02b37a09add4",
+  "tokenizer": {
+    "package": "js-tiktoken",
+    "version": "1.0.21",
+    "encoding": "o200k_base",
+    "special_tokens": "ordinary text"
+  },
+  "node": "v24.22.3",
+  "fixture_isolation": "fresh schema in an explicitly supplied disposable database",
+  "representation": {
+    "scope": "Worker execution and an independent review over seeded projects; fixture setup and the declared external requirement/dependency changes are excluded on both versions.",
+    "discovery": "Each role opens one SDK connection per workflow and counts its name/description/inputSchema input catalog once.",
+    "calls": "Count every tool name/arguments object once and every complete SDK result once, including existing text/structured duplication. Do not separately count parsed children.",
+    "model_view": "Separate reference count uses the canonical success envelope once; no billing claim or output-schema discovery charge.",
+    "normalization": "Only declared generated metadata fields and their generated references: stable full-width UUIDs, ISO timestamps and same-length opaque tokens. Never normalize prose, requirements, evidence or checkpoint decisions.",
+    "polling": "Two virtual two-minute work intervals: heartbeat and changes polling outside model turns. No unchanged-context polling is added merely to increase savings.",
+    "latency": "Actual SDK call latency excludes harness token counting; workflow elapsed time includes client-side reference measurement. Deterministic embeddings and virtual maintenance intervals exclude model/provider delays.",
+    "baseline_worker": "project_list, project_get, work_next, work_claim, brief ticket_context, required follow-up reads, two heartbeat/change polls, checkpoint, submit.",
+    "candidate_worker": "project_list, atomic work_claim with brief context delivering project instructions and policy, required follow-up reads, two heartbeat/change polls, checkpoint, submit. Do not repeat project_get when the claim context already delivers its required contents.",
+    "acceptance": {
+      "worker_input_catalog_max_tokens": 5000,
+      "aggregate_min_reduction": 0.4,
+      "each_workflow_must_not_regress": true
+    }
+  },
+  "embedding_provider_invocations": {
+    "query_calls": 0,
+    "document_calls": 0
+  },
+  "workflows": [
+    {
+      "id": "short",
+      "roles": [
+        {
+          "role": "worker",
+          "catalog_tokens": 8015,
+          "discovery_sdk_result_tokens": 22632,
+          "tool_calls": 11
+        }
+      ],
+      "catalog_tokens": 8015,
+      "request_tokens": 990,
+      "sdk_result_tokens": 7009,
+      "model_result_tokens": 3383,
+      "protocol_tokens": 16014,
+      "model_view_tokens": 12388,
+      "mandatory_floor_tokens": 95,
+      "tool_round_trips": 11,
+      "latency_ms": {
+        "elapsed": 384.09,
+        "call_p50": 16.58,
+        "call_p95": 106.9,
+        "call_max": 106.9
+      },
+      "http_requests": {
+        "worker": 15
+      },
+      "delivered": {
+        "worker_requirements": true,
+        "worker_instructions_policy": true,
+        "worker_blockers_dependencies": true,
+        "worker_resume_decisions": true,
+        "reviewer_requirements": true,
+        "reviewer_submission_evidence": true
+      },
+      "calls": [
+        {
+          "role": "worker",
+          "operation": "project_list",
+          "duration_ms": 106.9,
+          "request_tokens": 10,
+          "sdk_result_tokens": 283,
+          "model_result_tokens": 133,
+          "request_sha256": "45e39b1028bdbca2769b0bbacd21dac2cd7b7056ee25a23457462ca165d3ecc4",
+          "result_sha256": "8d7e48804dd78a4837fa14ecdd19f6b22713ac249a3be191a560a7a38ea1c7b2",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "project_get",
+          "duration_ms": 16.32,
+          "request_tokens": 39,
+          "sdk_result_tokens": 720,
+          "model_result_tokens": 350,
+          "request_sha256": "a2391fd8a908d2da95959b2c2988bb9c51c01d015ac6c46b587a94d35eb17007",
+          "result_sha256": "deacaaa72c90b260806afe0bc54c30dbc53b88b64f3d75825ba077dd71e238d8",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_next",
+          "duration_ms": 14.46,
+          "request_tokens": 43,
+          "sdk_result_tokens": 440,
+          "model_result_tokens": 210,
+          "request_sha256": "d5d591ced6902a513e40a57d06af2f798db8e6dca0adbc9478226b17c59f22a2",
+          "result_sha256": "e8d413294b1c8eebacfb0e0bde6f9d32cc7a28dfb9889f52b2e9a426c4fda932",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_claim",
+          "duration_ms": 28.86,
+          "request_tokens": 94,
+          "sdk_result_tokens": 752,
+          "model_result_tokens": 366,
+          "request_sha256": "8ad73518bca4602bdc603e7228e9aed04041f97c6808b165b6a9e68d713a4fd4",
+          "result_sha256": "5ff07fa543018bf1c80fe56d75b8eef45b36b81f54bd2aecf6bbf69515a8ddde",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_context",
+          "duration_ms": 25.45,
+          "request_tokens": 70,
+          "sdk_result_tokens": 1084,
+          "model_result_tokens": 524,
+          "request_sha256": "048c8a0266735d6eaeccdd24232b11724528210aefed04babe5a5494369cf24d",
+          "result_sha256": "065278d85f457171f8273f9208c9a7f70cf0fae17b2c522bf2878f95ea2db56a",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_heartbeat",
+          "duration_ms": 16.58,
+          "request_tokens": 123,
+          "sdk_result_tokens": 347,
+          "model_result_tokens": 166,
+          "request_sha256": "86b9566edf385d073628caf6018e6118a6da97699c37627ca012592629aae58f",
+          "result_sha256": "4dd41a918b6b491522f3d6d971224391294e74a37e18374c17eaf7e821fb7302",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "changes_since",
+          "duration_ms": 8,
+          "request_tokens": 43,
+          "sdk_result_tokens": 675,
+          "model_result_tokens": 327,
+          "request_sha256": "3f7402c7d55d84d744d1c5f46b51d28bcf3e18ed61b884925924c6a62044561a",
+          "result_sha256": "ed189fbddc997d3ec19fa0db5abc14d17cde7e547724ed35a78c3cdc2dd847ed",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_heartbeat",
+          "duration_ms": 13.53,
+          "request_tokens": 120,
+          "sdk_result_tokens": 347,
+          "model_result_tokens": 166,
+          "request_sha256": "15aacee1a7631713dd90f3fdef9c738b544a643bc57ce7486bd3c59a440b13f9",
+          "result_sha256": "4dd41a918b6b491522f3d6d971224391294e74a37e18374c17eaf7e821fb7302",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "changes_since",
+          "duration_ms": 5.69,
+          "request_tokens": 43,
+          "sdk_result_tokens": 370,
+          "model_result_tokens": 176,
+          "request_sha256": "bcd658c204d09de98721c43406368d8bb005d05f559d106dcb4d6da3022c545e",
+          "result_sha256": "495e285d6dfa49684265abbd07e2e4358bb931550d561f62b4b436cacb405517",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_checkpoint",
+          "duration_ms": 17.3,
+          "request_tokens": 196,
+          "sdk_result_tokens": 895,
+          "model_result_tokens": 432,
+          "request_sha256": "be5f783b33011de95a1f5f48f7cf0cee60e8296be9735743d889db3ebb477227",
+          "result_sha256": "11d028b2a588cc67d433045a37306e5c59557badf3c20ecae9c50b45e0b2b9e5",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_submit",
+          "duration_ms": 23.65,
+          "request_tokens": 209,
+          "sdk_result_tokens": 1096,
+          "model_result_tokens": 533,
+          "request_sha256": "112769bfe32ef2974163609ad87cb74d09be149b0278c16f3548588584353c4b",
+          "result_sha256": "3daa75b82d21246a2957364057d18e67a1a6b9a35110e921e693e6ecd839862e",
+          "error": null
+        }
+      ]
+    },
+    {
+      "id": "long",
+      "roles": [
+        {
+          "role": "worker",
+          "catalog_tokens": 8015,
+          "discovery_sdk_result_tokens": 22632,
+          "tool_calls": 11
+        }
+      ],
+      "catalog_tokens": 8015,
+      "request_tokens": 990,
+      "sdk_result_tokens": 31285,
+      "model_result_tokens": 15521,
+      "protocol_tokens": 40290,
+      "model_view_tokens": 24526,
+      "mandatory_floor_tokens": 2118,
+      "tool_round_trips": 11,
+      "latency_ms": {
+        "elapsed": 305.13,
+        "call_p50": 14.28,
+        "call_p95": 91.4,
+        "call_max": 91.4
+      },
+      "http_requests": {
+        "worker": 15
+      },
+      "delivered": {
+        "worker_requirements": true,
+        "worker_instructions_policy": true,
+        "worker_blockers_dependencies": true,
+        "worker_resume_decisions": true,
+        "reviewer_requirements": true,
+        "reviewer_submission_evidence": true
+      },
+      "calls": [
+        {
+          "role": "worker",
+          "operation": "project_list",
+          "duration_ms": 91.4,
+          "request_tokens": 10,
+          "sdk_result_tokens": 283,
+          "model_result_tokens": 133,
+          "request_sha256": "45e39b1028bdbca2769b0bbacd21dac2cd7b7056ee25a23457462ca165d3ecc4",
+          "result_sha256": "d1cd00f86bad14b82d49757f98ca124f6ae301002342979357fe3b0686b193d9",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "project_get",
+          "duration_ms": 6.89,
+          "request_tokens": 39,
+          "sdk_result_tokens": 720,
+          "model_result_tokens": 350,
+          "request_sha256": "a2391fd8a908d2da95959b2c2988bb9c51c01d015ac6c46b587a94d35eb17007",
+          "result_sha256": "2c6dea05c60d127dd832fcd21cc7e4333e4103c5df013cbfec205c3b2541aa09",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_next",
+          "duration_ms": 10.45,
+          "request_tokens": 43,
+          "sdk_result_tokens": 4486,
+          "model_result_tokens": 2233,
+          "request_sha256": "d5d591ced6902a513e40a57d06af2f798db8e6dca0adbc9478226b17c59f22a2",
+          "result_sha256": "138e55e3562ac1d46a7f02d5602cf013e26454290a6ddc635cc8d49faecd3c67",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_claim",
+          "duration_ms": 19.07,
+          "request_tokens": 94,
+          "sdk_result_tokens": 4798,
+          "model_result_tokens": 2389,
+          "request_sha256": "8ad73518bca4602bdc603e7228e9aed04041f97c6808b165b6a9e68d713a4fd4",
+          "result_sha256": "6421037458b281bf3bf0063785609a8cd13f7beef081535320fc28db219ee0ec",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_context",
+          "duration_ms": 15.05,
+          "request_tokens": 70,
+          "sdk_result_tokens": 5130,
+          "model_result_tokens": 2547,
+          "request_sha256": "048c8a0266735d6eaeccdd24232b11724528210aefed04babe5a5494369cf24d",
+          "result_sha256": "bf462b35f41ebec7c565e479ed5d401fee059eefb0e7116500f32e5ee9b77907",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_heartbeat",
+          "duration_ms": 14.28,
+          "request_tokens": 123,
+          "sdk_result_tokens": 347,
+          "model_result_tokens": 166,
+          "request_sha256": "86b9566edf385d073628caf6018e6118a6da97699c37627ca012592629aae58f",
+          "result_sha256": "4dd41a918b6b491522f3d6d971224391294e74a37e18374c17eaf7e821fb7302",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "changes_since",
+          "duration_ms": 5.93,
+          "request_tokens": 43,
+          "sdk_result_tokens": 675,
+          "model_result_tokens": 327,
+          "request_sha256": "3f7402c7d55d84d744d1c5f46b51d28bcf3e18ed61b884925924c6a62044561a",
+          "result_sha256": "3977ac7364886d5c81d9872d865a991463f897301375cb2f34aebd69f39b60b6",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_heartbeat",
+          "duration_ms": 12.35,
+          "request_tokens": 120,
+          "sdk_result_tokens": 347,
+          "model_result_tokens": 166,
+          "request_sha256": "15aacee1a7631713dd90f3fdef9c738b544a643bc57ce7486bd3c59a440b13f9",
+          "result_sha256": "4dd41a918b6b491522f3d6d971224391294e74a37e18374c17eaf7e821fb7302",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "changes_since",
+          "duration_ms": 5.7,
+          "request_tokens": 43,
+          "sdk_result_tokens": 370,
+          "model_result_tokens": 176,
+          "request_sha256": "bcd658c204d09de98721c43406368d8bb005d05f559d106dcb4d6da3022c545e",
+          "result_sha256": "b69c9476eb10771c0bf648bc58cf459a47aa4c9a8d61293eb572d70073ddb956",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_checkpoint",
+          "duration_ms": 16.36,
+          "request_tokens": 196,
+          "sdk_result_tokens": 4941,
+          "model_result_tokens": 2455,
+          "request_sha256": "be5f783b33011de95a1f5f48f7cf0cee60e8296be9735743d889db3ebb477227",
+          "result_sha256": "47b2bd2326daf74d9822bde7164bd648748894d3b7521e9c963ca2dc0434a0c4",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_submit",
+          "duration_ms": 22.94,
+          "request_tokens": 209,
+          "sdk_result_tokens": 9188,
+          "model_result_tokens": 4579,
+          "request_sha256": "112769bfe32ef2974163609ad87cb74d09be149b0278c16f3548588584353c4b",
+          "result_sha256": "6b3cb7fbc5d51f22ed5a1fc91647aa84db72052e5f506d204ac7367f0c49d1b6",
+          "error": null
+        }
+      ]
+    },
+    {
+      "id": "history",
+      "roles": [
+        {
+          "role": "worker",
+          "catalog_tokens": 8015,
+          "discovery_sdk_result_tokens": 22632,
+          "tool_calls": 11
+        }
+      ],
+      "catalog_tokens": 8015,
+      "request_tokens": 990,
+      "sdk_result_tokens": 7469,
+      "model_result_tokens": 3607,
+      "protocol_tokens": 16474,
+      "model_view_tokens": 12612,
+      "mandatory_floor_tokens": 135,
+      "tool_round_trips": 11,
+      "latency_ms": {
+        "elapsed": 206.31,
+        "call_p50": 10.21,
+        "call_p95": 57.44,
+        "call_max": 57.44
+      },
+      "http_requests": {
+        "worker": 15
+      },
+      "delivered": {
+        "worker_requirements": true,
+        "worker_instructions_policy": true,
+        "worker_blockers_dependencies": true,
+        "worker_resume_decisions": true,
+        "reviewer_requirements": true,
+        "reviewer_submission_evidence": true
+      },
+      "calls": [
+        {
+          "role": "worker",
+          "operation": "project_list",
+          "duration_ms": 57.44,
+          "request_tokens": 10,
+          "sdk_result_tokens": 283,
+          "model_result_tokens": 133,
+          "request_sha256": "45e39b1028bdbca2769b0bbacd21dac2cd7b7056ee25a23457462ca165d3ecc4",
+          "result_sha256": "0d99167ae0dc1022c6d9a05ecf896e88eb1c7fcd05e35672908f2a2e4376a02a",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "project_get",
+          "duration_ms": 6.41,
+          "request_tokens": 39,
+          "sdk_result_tokens": 720,
+          "model_result_tokens": 350,
+          "request_sha256": "a2391fd8a908d2da95959b2c2988bb9c51c01d015ac6c46b587a94d35eb17007",
+          "result_sha256": "de370677ab66df3df53faf34a502fc91522190cde92832bdf5543d011c8d7b56",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_next",
+          "duration_ms": 9.42,
+          "request_tokens": 43,
+          "sdk_result_tokens": 440,
+          "model_result_tokens": 210,
+          "request_sha256": "d5d591ced6902a513e40a57d06af2f798db8e6dca0adbc9478226b17c59f22a2",
+          "result_sha256": "7f0c73731d2cd9ae98e9ff532478bbbe137576decc293754c077414f8d59b030",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_claim",
+          "duration_ms": 18.73,
+          "request_tokens": 94,
+          "sdk_result_tokens": 752,
+          "model_result_tokens": 366,
+          "request_sha256": "8ad73518bca4602bdc603e7228e9aed04041f97c6808b165b6a9e68d713a4fd4",
+          "result_sha256": "5c92513e07e680b343902ed0d1ee8ce3580a93d5489c605a4a2a18912d8a8ef0",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_context",
+          "duration_ms": 9.48,
+          "request_tokens": 70,
+          "sdk_result_tokens": 1534,
+          "model_result_tokens": 743,
+          "request_sha256": "048c8a0266735d6eaeccdd24232b11724528210aefed04babe5a5494369cf24d",
+          "result_sha256": "163d5d431690af0f590c317791d1651c5d35120077a6bfe8f39449683db75d01",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_heartbeat",
+          "duration_ms": 10.89,
+          "request_tokens": 120,
+          "sdk_result_tokens": 347,
+          "model_result_tokens": 166,
+          "request_sha256": "15aacee1a7631713dd90f3fdef9c738b544a643bc57ce7486bd3c59a440b13f9",
+          "result_sha256": "4dd41a918b6b491522f3d6d971224391294e74a37e18374c17eaf7e821fb7302",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "changes_since",
+          "duration_ms": 4.48,
+          "request_tokens": 43,
+          "sdk_result_tokens": 675,
+          "model_result_tokens": 327,
+          "request_sha256": "3f7402c7d55d84d744d1c5f46b51d28bcf3e18ed61b884925924c6a62044561a",
+          "result_sha256": "ecee71c245c46bc4364b95d979c7e5b6f0490d80ff1a0dd5813862f20c0fe62a",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_heartbeat",
+          "duration_ms": 10.21,
+          "request_tokens": 128,
+          "sdk_result_tokens": 347,
+          "model_result_tokens": 166,
+          "request_sha256": "33079257b4d9ffd7709e15ae5b8f2792d39cbd175af96cbefb6740807e4a478c",
+          "result_sha256": "4dd41a918b6b491522f3d6d971224391294e74a37e18374c17eaf7e821fb7302",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "changes_since",
+          "duration_ms": 4.28,
+          "request_tokens": 43,
+          "sdk_result_tokens": 370,
+          "model_result_tokens": 176,
+          "request_sha256": "bcd658c204d09de98721c43406368d8bb005d05f559d106dcb4d6da3022c545e",
+          "result_sha256": "3b1566859a16d5a57ffaa8970be3d8c95a1ed0a6040bfd71e966bab33d84b356",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_checkpoint",
+          "duration_ms": 12.24,
+          "request_tokens": 192,
+          "sdk_result_tokens": 893,
+          "model_result_tokens": 431,
+          "request_sha256": "b22756056ef33f6954209a165b7084a328d2aad69a323bddd2731bdd0112e44b",
+          "result_sha256": "1ec1dadc8192f50eb8e18253d5b1750ef1662e654d010f3a97e25a728ea70556",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_submit",
+          "duration_ms": 14.66,
+          "request_tokens": 208,
+          "sdk_result_tokens": 1108,
+          "model_result_tokens": 539,
+          "request_sha256": "e77a0a8ed48732fb031df9bce2b0dfef3ffee2b0567a3aba49835cd0100d649e",
+          "result_sha256": "5f825a82e3748639845f6cf451b7011940f37dd40f23a87c246f27aa47a7863c",
+          "error": null
+        }
+      ]
+    },
+    {
+      "id": "review",
+      "roles": [
+        {
+          "role": "worker",
+          "catalog_tokens": 8015,
+          "discovery_sdk_result_tokens": 22632,
+          "tool_calls": 11
+        },
+        {
+          "role": "reviewer",
+          "catalog_tokens": 8015,
+          "discovery_sdk_result_tokens": 22632,
+          "tool_calls": 5
+        }
+      ],
+      "catalog_tokens": 16030,
+      "request_tokens": 1301,
+      "sdk_result_tokens": 11261,
+      "model_result_tokens": 5441,
+      "protocol_tokens": 28592,
+      "model_view_tokens": 22772,
+      "mandatory_floor_tokens": 221,
+      "tool_round_trips": 16,
+      "latency_ms": {
+        "elapsed": 322.54,
+        "call_p50": 10.23,
+        "call_p95": 52.35,
+        "call_max": 52.35
+      },
+      "http_requests": {
+        "worker": 15,
+        "reviewer": 9
+      },
+      "delivered": {
+        "worker_requirements": true,
+        "worker_instructions_policy": true,
+        "worker_blockers_dependencies": true,
+        "worker_resume_decisions": true,
+        "reviewer_requirements": true,
+        "reviewer_submission_evidence": true
+      },
+      "calls": [
+        {
+          "role": "worker",
+          "operation": "project_list",
+          "duration_ms": 52.35,
+          "request_tokens": 10,
+          "sdk_result_tokens": 285,
+          "model_result_tokens": 134,
+          "request_sha256": "45e39b1028bdbca2769b0bbacd21dac2cd7b7056ee25a23457462ca165d3ecc4",
+          "result_sha256": "b2b1039515fdd8cfd5eea95e630d30ebe67b735a258cd777f594baae099bb466",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "project_get",
+          "duration_ms": 5.24,
+          "request_tokens": 39,
+          "sdk_result_tokens": 722,
+          "model_result_tokens": 351,
+          "request_sha256": "a2391fd8a908d2da95959b2c2988bb9c51c01d015ac6c46b587a94d35eb17007",
+          "result_sha256": "534972b9787c8da55d4a3f0862689b261162b204e610221b37762662e81d75a9",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_next",
+          "duration_ms": 7.97,
+          "request_tokens": 43,
+          "sdk_result_tokens": 440,
+          "model_result_tokens": 210,
+          "request_sha256": "d5d591ced6902a513e40a57d06af2f798db8e6dca0adbc9478226b17c59f22a2",
+          "result_sha256": "49c838ce2e030b23d93e75b4ef58859cbb6f2661742190c5f3807fbf4cf729e6",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_claim",
+          "duration_ms": 14.1,
+          "request_tokens": 94,
+          "sdk_result_tokens": 752,
+          "model_result_tokens": 366,
+          "request_sha256": "8ad73518bca4602bdc603e7228e9aed04041f97c6808b165b6a9e68d713a4fd4",
+          "result_sha256": "fffa74301291a89d634801d949c696bfcee1ec1b53127384959ed11adcd3336c",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_context",
+          "duration_ms": 8.72,
+          "request_tokens": 70,
+          "sdk_result_tokens": 1086,
+          "model_result_tokens": 525,
+          "request_sha256": "048c8a0266735d6eaeccdd24232b11724528210aefed04babe5a5494369cf24d",
+          "result_sha256": "ef79303bd8f53c2ef23556586838a71d26c8e5694241d286644bc93c784ab578",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_heartbeat",
+          "duration_ms": 14.23,
+          "request_tokens": 123,
+          "sdk_result_tokens": 347,
+          "model_result_tokens": 166,
+          "request_sha256": "86b9566edf385d073628caf6018e6118a6da97699c37627ca012592629aae58f",
+          "result_sha256": "4dd41a918b6b491522f3d6d971224391294e74a37e18374c17eaf7e821fb7302",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "changes_since",
+          "duration_ms": 4.78,
+          "request_tokens": 43,
+          "sdk_result_tokens": 675,
+          "model_result_tokens": 327,
+          "request_sha256": "3f7402c7d55d84d744d1c5f46b51d28bcf3e18ed61b884925924c6a62044561a",
+          "result_sha256": "c7a0ec757aaec0fb418946db98afcc0f030f4f362ce72b59861fc30ad9e31e0d",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_heartbeat",
+          "duration_ms": 10.23,
+          "request_tokens": 120,
+          "sdk_result_tokens": 347,
+          "model_result_tokens": 166,
+          "request_sha256": "15aacee1a7631713dd90f3fdef9c738b544a643bc57ce7486bd3c59a440b13f9",
+          "result_sha256": "4dd41a918b6b491522f3d6d971224391294e74a37e18374c17eaf7e821fb7302",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "changes_since",
+          "duration_ms": 4.1,
+          "request_tokens": 43,
+          "sdk_result_tokens": 370,
+          "model_result_tokens": 176,
+          "request_sha256": "bcd658c204d09de98721c43406368d8bb005d05f559d106dcb4d6da3022c545e",
+          "result_sha256": "18fba6b2e57899ab891163dc77e64038c1ab8bebdeccd2d504990494716c9c71",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_checkpoint",
+          "duration_ms": 12.02,
+          "request_tokens": 196,
+          "sdk_result_tokens": 895,
+          "model_result_tokens": 432,
+          "request_sha256": "be5f783b33011de95a1f5f48f7cf0cee60e8296be9735743d889db3ebb477227",
+          "result_sha256": "4059a48789372b2a42cbc0b0824877d4e46ee3d396956c8b054452a0c804df78",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_submit",
+          "duration_ms": 16.41,
+          "request_tokens": 209,
+          "sdk_result_tokens": 1054,
+          "model_result_tokens": 512,
+          "request_sha256": "112769bfe32ef2974163609ad87cb74d09be149b0278c16f3548588584353c4b",
+          "result_sha256": "55158d2a5840ac59d4a41f301aa48fafd2882d1b3b6ab5cde752541ec112983e",
+          "error": null
+        },
+        {
+          "role": "reviewer",
+          "operation": "project_list",
+          "duration_ms": 50.49,
+          "request_tokens": 10,
+          "sdk_result_tokens": 285,
+          "model_result_tokens": 134,
+          "request_sha256": "45e39b1028bdbca2769b0bbacd21dac2cd7b7056ee25a23457462ca165d3ecc4",
+          "result_sha256": "07f356ecd264dd18cd845f5fdaf1a4a9700d1ea5c8ce2ed5c54ef5650b57fef9",
+          "error": null
+        },
+        {
+          "role": "reviewer",
+          "operation": "project_get",
+          "duration_ms": 5.27,
+          "request_tokens": 39,
+          "sdk_result_tokens": 722,
+          "model_result_tokens": 351,
+          "request_sha256": "a2391fd8a908d2da95959b2c2988bb9c51c01d015ac6c46b587a94d35eb17007",
+          "result_sha256": "1dc6deef242462416c30bbd94088213b2747e7b51610454b7ab2d0a75cb81faa",
+          "error": null
+        },
+        {
+          "role": "reviewer",
+          "operation": "ticket_list",
+          "duration_ms": 5.35,
+          "request_tokens": 44,
+          "sdk_result_tokens": 442,
+          "model_result_tokens": 211,
+          "request_sha256": "770cbe49d9a37935c200bf55622da34bf5957c9629c122eb98ee2e53ecb96fe4",
+          "result_sha256": "d98abaf561c73d2b57deed255e1f618178e67a264d82560ae1cfc94ac866a7fe",
+          "error": null
+        },
+        {
+          "role": "reviewer",
+          "operation": "ticket_context",
+          "duration_ms": 8.4,
+          "request_tokens": 70,
+          "sdk_result_tokens": 1995,
+          "model_result_tokens": 969,
+          "request_sha256": "048c8a0266735d6eaeccdd24232b11724528210aefed04babe5a5494369cf24d",
+          "result_sha256": "154392f5a1e8d0866b6752dbd10cc9fa48023031c32dbffb943057a146479b81",
+          "error": null
+        },
+        {
+          "role": "reviewer",
+          "operation": "ticket_review",
+          "duration_ms": 17.65,
+          "request_tokens": 148,
+          "sdk_result_tokens": 844,
+          "model_result_tokens": 411,
+          "request_sha256": "e93e963c8c77b776ae99fadca2e2a868a93b357b865e148ddbbcad506788ad00",
+          "result_sha256": "71db0ab03d61a615ef295cb5f91739f8f8c407698fc5ed804712d7ff6465d92a",
+          "error": null
+        }
+      ]
+    },
+    {
+      "id": "blocked",
+      "roles": [
+        {
+          "role": "worker",
+          "catalog_tokens": 8015,
+          "discovery_sdk_result_tokens": 22632,
+          "tool_calls": 14
+        }
+      ],
+      "catalog_tokens": 8015,
+      "request_tokens": 1295,
+      "sdk_result_tokens": 10820,
+      "model_result_tokens": 5236,
+      "protocol_tokens": 20130,
+      "model_view_tokens": 14546,
+      "mandatory_floor_tokens": 95,
+      "tool_round_trips": 14,
+      "latency_ms": {
+        "elapsed": 261.16,
+        "call_p50": 13.44,
+        "call_p95": 51.89,
+        "call_max": 51.89
+      },
+      "http_requests": {
+        "worker": 18
+      },
+      "delivered": {
+        "worker_requirements": true,
+        "worker_instructions_policy": true,
+        "worker_blockers_dependencies": true,
+        "worker_resume_decisions": true,
+        "reviewer_requirements": true,
+        "reviewer_submission_evidence": true
+      },
+      "calls": [
+        {
+          "role": "worker",
+          "operation": "project_list",
+          "duration_ms": 51.89,
+          "request_tokens": 10,
+          "sdk_result_tokens": 283,
+          "model_result_tokens": 133,
+          "request_sha256": "45e39b1028bdbca2769b0bbacd21dac2cd7b7056ee25a23457462ca165d3ecc4",
+          "result_sha256": "3b6153063f4fd5d1799b0eb40835cc6edb2c199b99283bd0966b29dc672770a3",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "project_get",
+          "duration_ms": 5.11,
+          "request_tokens": 39,
+          "sdk_result_tokens": 720,
+          "model_result_tokens": 350,
+          "request_sha256": "a2391fd8a908d2da95959b2c2988bb9c51c01d015ac6c46b587a94d35eb17007",
+          "result_sha256": "01538521c132a1bae887dfb686ced44f0d737278ae9ff4a071e20d8ce751e2e0",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_list",
+          "duration_ms": 4.31,
+          "request_tokens": 43,
+          "sdk_result_tokens": 872,
+          "model_result_tokens": 423,
+          "request_sha256": "68f1afc5331f723b1f29667d46fac5e4aa1abb92d38ae76415fd6241cf7054ed",
+          "result_sha256": "a69b3d75b7fcc6b3d955fe1c7c8d1dd3e6d0b6a8fc9686acbb6befb522471ea4",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_claim",
+          "duration_ms": 8.7,
+          "request_tokens": 94,
+          "sdk_result_tokens": 278,
+          "model_result_tokens": 125,
+          "request_sha256": "f673ad09266e75f0670e53a291e95be7f887c56213f8a157bd5201b5cf8cad46",
+          "result_sha256": "3a62e7fbcbf80a1b688d9f6e779995ae800e513f1ceb1e73220327567b8a97ad",
+          "error": "DEPENDENCY_BLOCKED"
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_context",
+          "duration_ms": 10.85,
+          "request_tokens": 70,
+          "sdk_result_tokens": 1691,
+          "model_result_tokens": 823,
+          "request_sha256": "048c8a0266735d6eaeccdd24232b11724528210aefed04babe5a5494369cf24d",
+          "result_sha256": "92ca186fa608b66dc3c245793839efa2ded3e1582c0a0cb4b565bd31228fb38d",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_note",
+          "duration_ms": 13.97,
+          "request_tokens": 136,
+          "sdk_result_tokens": 824,
+          "model_result_tokens": 401,
+          "request_sha256": "4a0194771f780452d08ad6353c735f5e02669722e00e830b065c02f84bf127f3",
+          "result_sha256": "4368f9add64277dbf8b1ec4911350c9c3b5269dc9da92c28736dc67fc548a539",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_claim",
+          "duration_ms": 18.55,
+          "request_tokens": 97,
+          "sdk_result_tokens": 756,
+          "model_result_tokens": 368,
+          "request_sha256": "c724049f14ec3b39a6724df13fe750424997a659316624f588313a5c19cb69d3",
+          "result_sha256": "4deae736ed4b4d139bc720606a95d90ea5c9c95fa9af2e259ede2f50bd43dada",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_context",
+          "duration_ms": 13.44,
+          "request_tokens": 70,
+          "sdk_result_tokens": 1343,
+          "model_result_tokens": 653,
+          "request_sha256": "048c8a0266735d6eaeccdd24232b11724528210aefed04babe5a5494369cf24d",
+          "result_sha256": "d6b30b97f84a36d64f59571e524012b6fe7eca7b34bc4ec33987b2e02d6b18b1",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_heartbeat",
+          "duration_ms": 15.45,
+          "request_tokens": 124,
+          "sdk_result_tokens": 351,
+          "model_result_tokens": 168,
+          "request_sha256": "595b5148232093b2805c5204c5aeb6d87adebc9cfb25861e70b39a248b7523fc",
+          "result_sha256": "c31755bf10bfce66377d5045dedc0768f1a90e9c126eddef91ac595cb67ed6a7",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "changes_since",
+          "duration_ms": 6.02,
+          "request_tokens": 43,
+          "sdk_result_tokens": 1002,
+          "model_result_tokens": 489,
+          "request_sha256": "3f7402c7d55d84d744d1c5f46b51d28bcf3e18ed61b884925924c6a62044561a",
+          "result_sha256": "9b23d30d7a6cc310a2857883f60bd900c5061d6f82c8d9b12555ac41e2cfd5f5",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_heartbeat",
+          "duration_ms": 12.52,
+          "request_tokens": 127,
+          "sdk_result_tokens": 351,
+          "model_result_tokens": 168,
+          "request_sha256": "a753e5b615e8ce63f151e9def8a1f12a1db545fde4ba4e580c7e53a65ebe8c41",
+          "result_sha256": "c31755bf10bfce66377d5045dedc0768f1a90e9c126eddef91ac595cb67ed6a7",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "changes_since",
+          "duration_ms": 5.81,
+          "request_tokens": 43,
+          "sdk_result_tokens": 370,
+          "model_result_tokens": 176,
+          "request_sha256": "418c03c1548f88be94254387eeb65555b7840f42d6e36aa746b2b838d89f7469",
+          "result_sha256": "a24fcee17c5c0442a9f11ae85e444ca8cb1fe9a6f33e209898222b1e07e67dc2",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_checkpoint",
+          "duration_ms": 15.5,
+          "request_tokens": 193,
+          "sdk_result_tokens": 895,
+          "model_result_tokens": 432,
+          "request_sha256": "1c6e55ac601271ece9fb07288ac934519e39d0ff06521c9d817039ecba81a17b",
+          "result_sha256": "b668a3d80aef12c22d6530c4ffa04458b7d0810c422c3a76f7f8df67687affbe",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_submit",
+          "duration_ms": 20.83,
+          "request_tokens": 206,
+          "sdk_result_tokens": 1084,
+          "model_result_tokens": 527,
+          "request_sha256": "acdfff51b7a442a5b6e81b2a0dfcd07ef540468c42e638f9dfc08faf457789ee",
+          "result_sha256": "c87b4d60eb3cd67ccd0b42d94f78b0bf6be982956459fa1ab2253a051e4321ee",
+          "error": null
+        }
+      ]
+    },
+    {
+      "id": "requirements_change",
+      "roles": [
+        {
+          "role": "worker",
+          "catalog_tokens": 8015,
+          "discovery_sdk_result_tokens": 22632,
+          "tool_calls": 15
+        }
+      ],
+      "catalog_tokens": 8015,
+      "request_tokens": 1366,
+      "sdk_result_tokens": 10506,
+      "model_result_tokens": 5072,
+      "protocol_tokens": 19887,
+      "model_view_tokens": 14453,
+      "mandatory_floor_tokens": 96,
+      "tool_round_trips": 15,
+      "latency_ms": {
+        "elapsed": 253.81,
+        "call_p50": 9.58,
+        "call_p95": 51.65,
+        "call_max": 51.65
+      },
+      "http_requests": {
+        "worker": 19
+      },
+      "delivered": {
+        "worker_requirements": true,
+        "worker_instructions_policy": true,
+        "worker_blockers_dependencies": true,
+        "worker_resume_decisions": true,
+        "reviewer_requirements": true,
+        "reviewer_submission_evidence": true
+      },
+      "calls": [
+        {
+          "role": "worker",
+          "operation": "project_list",
+          "duration_ms": 51.65,
+          "request_tokens": 10,
+          "sdk_result_tokens": 283,
+          "model_result_tokens": 133,
+          "request_sha256": "45e39b1028bdbca2769b0bbacd21dac2cd7b7056ee25a23457462ca165d3ecc4",
+          "result_sha256": "9f30ed7ec984e1d3b37f118be03e870a066df94601ec6f5234ed7c418cd6e90c",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "project_get",
+          "duration_ms": 5.57,
+          "request_tokens": 39,
+          "sdk_result_tokens": 720,
+          "model_result_tokens": 350,
+          "request_sha256": "a2391fd8a908d2da95959b2c2988bb9c51c01d015ac6c46b587a94d35eb17007",
+          "result_sha256": "71bec928e35232c79c73f8dc9a8954d1ebc5fdb2661309970bfa297db7b248b1",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_next",
+          "duration_ms": 9.58,
+          "request_tokens": 43,
+          "sdk_result_tokens": 440,
+          "model_result_tokens": 210,
+          "request_sha256": "d5d591ced6902a513e40a57d06af2f798db8e6dca0adbc9478226b17c59f22a2",
+          "result_sha256": "5f0005799bd2f37fc472989bdb05dba6a762b3cfe5a0310c6172a58f64aace66",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_claim",
+          "duration_ms": 15.42,
+          "request_tokens": 94,
+          "sdk_result_tokens": 752,
+          "model_result_tokens": 366,
+          "request_sha256": "8ad73518bca4602bdc603e7228e9aed04041f97c6808b165b6a9e68d713a4fd4",
+          "result_sha256": "d97bbd4813d0eaf648e7087b88205a5c0407e1109e11421e77174d2f981201ed",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_context",
+          "duration_ms": 8.68,
+          "request_tokens": 70,
+          "sdk_result_tokens": 1084,
+          "model_result_tokens": 524,
+          "request_sha256": "048c8a0266735d6eaeccdd24232b11724528210aefed04babe5a5494369cf24d",
+          "result_sha256": "7f4508db700c5999c3f82b684e399eef61560b0657bf75b25e0be5884a0f33b8",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_heartbeat",
+          "duration_ms": 10.87,
+          "request_tokens": 123,
+          "sdk_result_tokens": 347,
+          "model_result_tokens": 166,
+          "request_sha256": "86b9566edf385d073628caf6018e6118a6da97699c37627ca012592629aae58f",
+          "result_sha256": "4dd41a918b6b491522f3d6d971224391294e74a37e18374c17eaf7e821fb7302",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_checkpoint",
+          "duration_ms": 6.52,
+          "request_tokens": 129,
+          "sdk_result_tokens": 110,
+          "model_result_tokens": 45,
+          "request_sha256": "55e115ccd34d5692c59af64d9f4a2e51800498f53931cd7a6547b44f70eb877a",
+          "result_sha256": "f5d78143735c37d7ba1c1921ba7f4aea9c8c01f8c0f7ef7e4886e59ec543e96e",
+          "error": "CLAIM_EXPIRED"
+        },
+        {
+          "role": "worker",
+          "operation": "changes_since",
+          "duration_ms": 4.54,
+          "request_tokens": 43,
+          "sdk_result_tokens": 958,
+          "model_result_tokens": 466,
+          "request_sha256": "3f7402c7d55d84d744d1c5f46b51d28bcf3e18ed61b884925924c6a62044561a",
+          "result_sha256": "423ff51bcb9f5b5b253df5c411d7e27f9c7ccbc5ac0e8daafe60298560bd4ecd",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_context",
+          "duration_ms": 8.01,
+          "request_tokens": 70,
+          "sdk_result_tokens": 937,
+          "model_result_tokens": 451,
+          "request_sha256": "048c8a0266735d6eaeccdd24232b11724528210aefed04babe5a5494369cf24d",
+          "result_sha256": "1107e1f49a45bc75c4d9cac3bc4d2ad74fb6e05e8e7b3eda596ddabcc0c2cc43",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_claim",
+          "duration_ms": 13.88,
+          "request_tokens": 97,
+          "sdk_result_tokens": 756,
+          "model_result_tokens": 368,
+          "request_sha256": "c724049f14ec3b39a6724df13fe750424997a659316624f588313a5c19cb69d3",
+          "result_sha256": "f219eb4b4c9cd89d8e88a07241ccc8c83c7a2cc329c3fd029060598f7c77bf8d",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_context",
+          "duration_ms": 8.64,
+          "request_tokens": 70,
+          "sdk_result_tokens": 1098,
+          "model_result_tokens": 531,
+          "request_sha256": "048c8a0266735d6eaeccdd24232b11724528210aefed04babe5a5494369cf24d",
+          "result_sha256": "c30a797d329e08e3569ecf215b34a14b418eeb0d1576a7b4d798abe1a0aa87c0",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "work_heartbeat",
+          "duration_ms": 10.2,
+          "request_tokens": 124,
+          "sdk_result_tokens": 351,
+          "model_result_tokens": 168,
+          "request_sha256": "595b5148232093b2805c5204c5aeb6d87adebc9cfb25861e70b39a248b7523fc",
+          "result_sha256": "c31755bf10bfce66377d5045dedc0768f1a90e9c126eddef91ac595cb67ed6a7",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "changes_since",
+          "duration_ms": 4.12,
+          "request_tokens": 43,
+          "sdk_result_tokens": 675,
+          "model_result_tokens": 327,
+          "request_sha256": "418c03c1548f88be94254387eeb65555b7840f42d6e36aa746b2b838d89f7469",
+          "result_sha256": "980847fe8c8bf4e658c2353bb3147e32e0ebee2da5180e771ce308ffc4dae5e0",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_checkpoint",
+          "duration_ms": 12.31,
+          "request_tokens": 195,
+          "sdk_result_tokens": 893,
+          "model_result_tokens": 431,
+          "request_sha256": "e1fa0bd041d1ba2e8850ec57038e7601ba929a760d1bb80b9d585df67e7fd508",
+          "result_sha256": "7389a05b6e96509837ea163c3b311c3094912d97e4d26d597ad47989b0592d52",
+          "error": null
+        },
+        {
+          "role": "worker",
+          "operation": "ticket_submit",
+          "duration_ms": 14.15,
+          "request_tokens": 216,
+          "sdk_result_tokens": 1102,
+          "model_result_tokens": 536,
+          "request_sha256": "2e8e6aea84e5789da23c3db774a02770c7f9644dea10484f22e5d65e869eae0f",
+          "result_sha256": "9c343a90d34ed2157820ce26cb5631c8c66fb01a88de193414daae80abcd3343",
+          "error": null
+        }
+      ]
+    }
+  ],
+  "total_protocol_tokens": 141387,
+  "total_model_view_tokens": 101297
+}

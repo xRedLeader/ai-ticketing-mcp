@@ -33,6 +33,7 @@
     "test:all": "npm run check && npm test && npm run test:integration",
     "commit:check": "node scripts/check-commits.mjs",
     "benchmark": "tsx scripts/benchmark.ts",
+    "benchmark:protocol": "tsx scripts/protocol-benchmark.ts",
     "walkthrough": "tsx scripts/walkthrough.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -50,6 +51,7 @@
     "@modelcontextprotocol/node": "^2.1.2",
     "@modelcontextprotocol/server": "^2.4.0",
     "jose": "^6.2.17",
+    "js-tiktoken": "1.0.21",
     "pg": "^8.23.1",
     "zod": "^4.6.7"
   },
