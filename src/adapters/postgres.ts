@@ -15,6 +15,7 @@ import {
   type SearchDocument,
   type SearchHit,
   type EmbeddingProfile,
+  type Note,
 } from '../contracts.js';
 
 const columns: Record<Table, string[]> = {
@@ -132,6 +133,18 @@ function repository(db: Executor): Transaction {
     return `"${key}"`;
   };
   return {
+    async unansweredQuestions(projectId, ticketId, blocking, limit, offset) {
+      ensure(
+        Number.isInteger(limit) && limit >= 1 && limit <= 10001 && Number.isInteger(offset) && offset >= 0,
+        'INVALID_QUERY',
+        'Question page limit must be 1–10001 and offset must be nonnegative.',
+      );
+      const result = await db.query(
+        `SELECT q.* FROM notes q WHERE q.project_id=$1 AND q.ticket_id=$2 AND q.kind='question' AND q.blocking=$3 AND NOT EXISTS(SELECT 1 FROM notes a WHERE a.project_id=q.project_id AND a.ticket_id=q.ticket_id AND a.answer_to=q.id AND a.kind='answer') ORDER BY q.created_at,q.id LIMIT $4 OFFSET $5`,
+        [projectId, ticketId, blocking, limit, offset],
+      );
+      return result.rows.map(decode) as unknown as Note[];
+    },
     async workCandidates(projectId, actorId, capabilities, labels, now, limit, offset) {
       const result = await db.query(
         `SELECT t.* FROM tickets t WHERE t.project_id=$1 AND t.status IN ('ready','in_progress') AND (t.assignee_id IS NULL OR t.assignee_id=$2) AND t.capabilities <@ $3::text[] AND t.labels @> $4::text[] AND NOT EXISTS(SELECT 1 FROM claims c WHERE c.ticket_id=t.id AND c.expires_at>$5) AND NOT EXISTS(SELECT 1 FROM links l JOIN tickets prerequisite ON prerequisite.id=l.source_id WHERE l.target_id=t.id AND l.kind='blocks' AND prerequisite.status<>'done') AND NOT EXISTS(SELECT 1 FROM notes q WHERE q.ticket_id=t.id AND q.kind='question' AND q.blocking AND NOT EXISTS(SELECT 1 FROM notes a WHERE a.answer_to=q.id AND a.kind='answer')) ORDER BY t.priority,t.created_at,t.id LIMIT $6 OFFSET $7`,
@@ -221,6 +234,9 @@ export class PostgresStorage implements StorageAdapter {
   }
   find<K extends Table>(table: K, query?: Query<Tables[K]>) {
     return this.reader.find(table, query);
+  }
+  unansweredQuestions(projectId: string, ticketId: string, blocking: boolean, limit: number, offset: number) {
+    return this.reader.unansweredQuestions(projectId, ticketId, blocking, limit, offset);
   }
   workCandidates(
     projectId: string,
@@ -390,13 +406,30 @@ export class PostgresSearch implements SearchAdapter {
     );
     this.invalidateCoverage(document.project_id);
   }
-  async indexVector(document: SearchDocument, profile: EmbeddingProfile, vector: number[]) {
+  async indexVector(
+    document: SearchDocument,
+    profile: EmbeddingProfile,
+    vector: number[],
+    inputHash?: string,
+  ) {
     const literal = vectorLiteral(vector, profile);
     await this.pool.query(
-      `INSERT INTO search_vectors(document_id,profile_id,revision,embedding) SELECT id,$2,$3,$4::vector FROM search_documents WHERE id=$1 AND revision=$3 AND NOT archived ON CONFLICT(document_id,profile_id) DO UPDATE SET revision=EXCLUDED.revision,embedding=EXCLUDED.embedding WHERE search_vectors.revision<=EXCLUDED.revision`,
-      [document.id, profile.id, document.revision, literal],
+      `INSERT INTO search_vectors(document_id,profile_id,revision,embedding,input_hash) SELECT id,$2,$3,$4::vector,$5 FROM search_documents WHERE id=$1 AND revision=$3 AND NOT archived ON CONFLICT(document_id,profile_id) DO UPDATE SET revision=EXCLUDED.revision,embedding=EXCLUDED.embedding,input_hash=EXCLUDED.input_hash WHERE search_vectors.revision<=EXCLUDED.revision`,
+      [document.id, profile.id, document.revision, literal, inputHash ?? null],
     );
     this.invalidateCoverage(document.project_id);
+  }
+  async reuseVector(
+    document: SearchDocument,
+    profile: EmbeddingProfile,
+    inputHash: string,
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE search_vectors v SET revision=$3 FROM search_documents d WHERE d.id=$1 AND d.id=v.document_id AND d.revision=$3 AND NOT d.archived AND v.profile_id=$2 AND v.input_hash=$4 AND v.revision<=$3`,
+      [document.id, profile.id, document.revision, inputHash],
+    );
+    this.invalidateCoverage(document.project_id);
+    return result.rowCount === 1;
   }
   async search(
     projectId: string,

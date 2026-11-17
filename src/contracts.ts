@@ -181,6 +181,13 @@ export interface Query<T> {
   offset?: number;
 }
 export interface Reader {
+  unansweredQuestions(
+    projectId: string,
+    ticketId: string,
+    blocking: boolean,
+    limit: number,
+    offset: number,
+  ): Promise<Note[]>;
   /** Ordered candidates; shared domain logic rechecks eligibility inside the transaction. */
   workCandidates(
     projectId: string,
@@ -239,7 +246,13 @@ export interface EmbeddingProfile {
 export interface SearchAdapter {
   configure(profile: EmbeddingProfile): Promise<void>;
   indexText(document: SearchDocument): Promise<void>;
-  indexVector(document: SearchDocument, profile: EmbeddingProfile, vector: number[]): Promise<void>;
+  indexVector(
+    document: SearchDocument,
+    profile: EmbeddingProfile,
+    vector: number[],
+    inputHash?: string,
+  ): Promise<void>;
+  reuseVector?(document: SearchDocument, profile: EmbeddingProfile, inputHash: string): Promise<boolean>;
   search(
     projectId: string,
     query: string,

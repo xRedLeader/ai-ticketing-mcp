@@ -9,11 +9,13 @@ export interface EmbeddingConfig {
   apiKey?: string;
   timeoutMs?: number;
   revision?: string;
+  spaceId?: string;
 }
 // shortcut: mean pooling loses passage precision; add chunk retrieval when relevance evaluations require it.
 export class HttpEmbeddings implements EmbeddingProvider {
   readonly profile: EmbeddingProfile;
-  constructor(private config: EmbeddingConfig) {
+  private readonly config: Readonly<EmbeddingConfig>;
+  constructor(config: EmbeddingConfig) {
     const url = new URL(config.url);
     ensure(
       ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password,
@@ -25,12 +27,30 @@ export class HttpEmbeddings implements EmbeddingProvider {
       'INVALID_CONFIG',
       'Embedding dimensions must be 1–2000.',
     );
-    this.profile = {
+    ensure(
+      config.spaceId === undefined || config.spaceId.trim().length > 0,
+      'INVALID_CONFIG',
+      'Embedding space ID cannot be empty.',
+    );
+    url.pathname = url.pathname.replace(/\/+$/, '');
+    url.hash = '';
+    this.config = Object.freeze({
+      ...config,
+      url: url.href,
+      timeoutMs: config.timeoutMs ?? 30000,
+      revision: config.revision ?? '1',
+      spaceId: config.spaceId?.trim(),
+    });
+    const endpoint = new URL(url);
+    endpoint.pathname =
+      endpoint.pathname.replace(/\/$/, '') + (config.provider === 'ollama' ? '/api/embed' : '/embeddings');
+    this.profile = Object.freeze({
       id: createHash('sha256')
         .update(
           JSON.stringify([
             config.provider,
-            config.revision ?? '1',
+            this.config.spaceId === undefined ? ['endpoint', endpoint.href] : ['space', this.config.spaceId],
+            this.config.revision,
             config.model,
             config.dimensions,
             'chunks-6000-mean-v1',
@@ -40,7 +60,7 @@ export class HttpEmbeddings implements EmbeddingProvider {
         .slice(0, 24),
       model: config.model,
       dimensions: config.dimensions,
-    };
+    });
   }
   async embed(text: string, purpose: 'query' | 'document') {
     const chunks = text.match(/[\s\S]{1,6000}/gu) ?? [''];
