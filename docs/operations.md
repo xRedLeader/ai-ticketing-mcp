@@ -20,7 +20,7 @@ Use `docker compose exec ollama ollama pull nomic-embed-text` to retry model ins
 
 - `/healthz`: process liveness.
 - `/readyz`: storage and search schema connectivity.
-- `/metrics`: authenticated system-administrator-only Prometheus metrics for requests/errors/time, indexing, active/expired claims, review backlog, pending jobs, and lag. Numeric counters also report validated tool-input reference tokens (SDK defaults may be materialized), canonical-envelope result tokens, accounting failures, provider `embed` invocations, document/query reuse, provider failures, and cache saturation. These are local reference counts, not billed tokens or exact wire/client costs. No content labels are collected.
+- `/metrics`: authenticated system-administrator-only Prometheus metrics for requests/errors/time, indexing, active/expired claims, review backlog, pending jobs, and lag. Numeric embedding counters report provider `embed` invocations, document/query reuse, provider failures, and cache saturation. Reference-token metric accounting is off by default; opt in with `REFERENCE_TOKEN_METRICS=true` to count validated tool inputs (SDK defaults may be materialized), canonical-envelope results, and accounting failures. Context budgets and excerpt limits always remain enforced. These are local reference counts, not billed tokens or exact wire/client costs. No content labels are collected.
 
 Readiness does not imply the embedding provider or identity provider is available; alert on authentication failures, indexing error increases, and growing job lag. HTTP logs include only method, recognized route, status, and duration. Tokens, database URLs, ticket bodies, and evidence are not logged.
 

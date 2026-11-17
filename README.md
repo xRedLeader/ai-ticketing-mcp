@@ -9,7 +9,7 @@ Headless ticketing built for agents: find useful work, claim it safely, recover 
 - Structured tickets with acceptance criteria, priorities, capabilities, parents, and blocking dependencies.
 - Atomic ten-minute claims, heartbeat renewal, stale-worker fencing, and retry-safe mutations.
 - Durable checkpoints, blocking questions, decisions, and artifact references.
-- One-call context with complete requirements, project instructions, prior work, and relevant knowledge.
+- One-call context with complete requirements, project instructions, prior work, and explicit retrieval references.
 - Self, independent-agent, or human verification policies. Independent review is the default.
 - Hybrid text/vector search, using local Ollama or a hosted OpenAI-compatible embedding provider.
 - Attributable events and durable polling cursors, without keeping an MCP connection alive.
@@ -53,7 +53,7 @@ For real users and agents, follow [identity and client setup](docs/authenticatio
 
 Use a fresh `idempotency_key` for each logical mutation, reusing it only for an identical retry. Read the latest revision before edits and submission. A changed requirement revokes claims and invalidates affected approvals; an old worker cannot continue with its former token.
 
-Connect with `stdio --profile planner` or `/mcp?profile=reviewer`; OAuth tokens still target `/mcp`. Profiles select tools without changing permissions. Lists and mutation receipts are compact; fetch full current state through `ticket_get` or `project_get`. The [SDK maintenance example](examples/claim-maintenance.ts) heartbeats and polls changes every two minutes outside model turns, retaining keys across identical retries.
+Connect with `stdio --profile planner` or `/mcp?profile=reviewer`; OAuth tokens still target `/mcp`. Profiles select tools without changing permissions. Lists and mutation receipts are compact; fetch full current state through `ticket_get` or `project_get`. Existing clients should review the [changed defaults](docs/mcp.md#changed-defaults). The [SDK maintenance example](examples/claim-maintenance.ts) renews ownership independently every two minutes and catches up change pages between model turns, retaining keys across identical retries.
 
 Ticket references accept a UUID or readable key such as `CORE-42`. Project references use UUIDs. Full [tool and workflow behavior](docs/mcp.md) is documented separately.
 

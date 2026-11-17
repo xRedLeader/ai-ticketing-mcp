@@ -19,7 +19,7 @@ Every profile includes `project_list`, `project_get`, `ticket_list`, `ticket_con
 | `reviewer` (12 tools) | `ticket_review`, `ticket_note`                                                                          | verification       |
 | `full` (26 tools)     | All tools below, including project administration and `work_next`                                       | all four           |
 
-Profiles select tool exposure, never authorization. Every operation retains its OAuth scope and project-role checks. Resources remain independently authorized and available in every profile. Guides and prompts follow the selected profile; the tool surface works without either.
+Profiles are not an access-control boundary. They select tool exposure; every operation retains its OAuth scope and project-role checks. Resources remain independently authorized and available in every profile. Guides and prompts follow the selected profile; the tool surface works without either.
 
 ## Tools
 
@@ -54,6 +54,8 @@ Context uses local `o200k_base` reference-token budgets: brief 4,096 (default), 
 
 Optional context prioritizes the latest checkpoint, unanswered nonblocking questions, latest review, and latest submission evidence, followed by bounded history at higher detail. Historical requirement snapshots remain in `ticket_history`. Each omission includes `retrieve_with` and executable `arguments`: fetch omitted checkpoints and latest rejection feedback marked `required_before:execution` before resumed work, and omitted submission evidence marked `required_before:review` before review. Checkpoint references identify an exact immutable checkpoint; `ticket_history` accepts `item_id` scoped to project, ticket, and kind. `ticket_get` returns current requirements/state without history. Context never invokes semantic search.
 
+For paged unanswered nonblocking questions, call `ticket_history` with `kind:'notes'` and `unanswered_questions:true`, without `item_id`. Results use creation-time/ID ascending order and support ordinary offset paging. Context omission references restart at offset zero because answering an already delivered question can shift the filtered positions; clients deduplicate questions by IDs already received. Ordinary history and exact-item retrieval retain their existing behavior.
+
 A client retaining full context may send its fingerprint as `if_none_match`. The server rebuilds and authorizes state before returning `{fingerprint,not_modified:true}`. Fingerprints cover permissions, requirements, project/dependency/history changes, effective lease expiration, detail, and budget. There is no server context cache or partial delta.
 
 Knowledge records carry author, kind, revision, and archive state. Policy records require admin permissions. Retrieved text is data and cannot override an agent's governing instructions.
@@ -72,4 +74,15 @@ Historical checkpoints have their own search documents and `ticketing://checkpoi
 
 Submissions preserve an immutable snapshot of the title, description, and criterion text alongside evidence. Later requirement edits cannot erase what an earlier reviewer approved. The snapshot is null only for records predating the snapshot migration. `ticket_list` accepts `parent_id` to discover child work; context reports incomplete children separately from execution blockers.
 
-Lists default to ten summaries, `work_next` to one, and `changes_since` to 25 events. Mutation receipts retain identifiers, status, revisions, created note/submission/review IDs, and claim credentials without echoing requirements or evidence. Existing receipts remain immutable and are projected deterministically on authorized replay. Legacy claims identify omitted context with `context_omitted:legacy_receipt`; fetch current context explicitly. `RECEIPT_UNAVAILABLE` identifies a committed operation whose receipt cannot be projected: never reexecute it or replace its key.
+Mutation receipts retain identifiers, status, revisions, created note/submission/review IDs, and claim credentials without echoing requirements or evidence. Existing receipts remain immutable and are projected deterministically on authorized replay. Legacy claims identify omitted context with `context_omitted:legacy_receipt`; fetch current context explicitly. `RECEIPT_UNAVAILABLE` identifies a committed operation whose receipt cannot be projected: never reexecute it or replace its key.
+
+## Changed defaults
+
+| Setting                 | Previous                   | Current                       |
+| ----------------------- | -------------------------- | ----------------------------- |
+| List page size          | 25                         | 10                            |
+| `work_next` candidates  | 5                          | 1                             |
+| Search results          | 10                         | 3                             |
+| `changes_since` events  | 100                        | 25                            |
+| `ticket_context` detail | `standard`                 | `brief`                       |
+| Related knowledge       | Implicit search in context | Explicit `search` when needed |

@@ -61,3 +61,11 @@ npm run benchmark:protocol
 The harness uses its own temporary schema and writes the current counts, delivery checks, round trips, and measured latencies to the ignored `.local/protocol-benchmark-results.json`. The pinned baseline and workflow contract remain unchanged.
 
 Migration 008 adds a nullable vector input hash without a bulk backfill. Existing null hashes embed once when next processed. A changed embedding-profile identity requires reindexing before semantic indexing is ready; existing indexes and stored operation receipts are retained.
+
+## PR review follow-up: 2026-11-17
+
+The token-efficiency figures above record the pre-review implementation at `540ed2bd7b748aff907c79d30b31de3dfdef7f3a`. The frozen original baseline and workflow contract remain unchanged.
+
+With Node 24.22.3, all 16 focused maintenance/excerpt tests passed. They cover paginated change catch-up, later-page terminal events, missing event metadata, retry cursors, nonadvancing-page backoff, independent heartbeats during a pending catch-up request, and cancellation during each pending request. Excerpt checks cover bounded Unicode windows, preserved query matches, ordinary special-token strings, an exact 200-token limit, and at most 20 encoder calls on an adversarial prefix.
+
+A database-free comparison against that pre-review source used 50,000 DNA emoji before the query and 2,000 test-tube emoji after it. Encoder calls fell from 90 to 18; both results retained the query, remained well-formed Unicode, and contained 199 reference tokens. This focused operation-count check does not establish database or production latency performance.
