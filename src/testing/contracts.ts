@@ -48,12 +48,13 @@ export async function fixture(adapters: ContractAdapters, policy: Policy = 'inde
   await storage.transaction('catalog', async (tx) => {
     for (const person of [admin, worker, other, reviewer, outsider]) await tx.put('actors', person);
   });
-  const project = (await app.execute(admin.id, 'project_create', {
+  const createdProject = (await app.execute(admin.id, 'project_create', {
     key: 'T' + randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase(),
     name: 'Contract test',
     policy,
     idempotency_key: randomUUID(),
   })) as Project;
+  const project = (await storage.get('projects', createdProject.id))!;
   for (const [person, role] of [
     [worker, 'contributor'],
     [other, 'contributor'],
@@ -67,8 +68,8 @@ export async function fixture(adapters: ContractAdapters, policy: Policy = 'inde
     });
   const call = async (actorId: string, operation: any, input: Record<string, unknown> = {}) =>
     app.execute(actorId, operation, { project_id: project.id, idempotency_key: randomUUID(), ...input });
-  const ticket = async (overrides: Record<string, unknown> = {}) =>
-    (
+  const ticket = async (overrides: Record<string, unknown> = {}) => {
+    const created = (
       (await call(worker.id, 'tickets_create', {
         tickets: [
           {
@@ -81,6 +82,8 @@ export async function fixture(adapters: ContractAdapters, policy: Policy = 'inde
         ],
       })) as { tickets: Ticket[] }
     ).tickets[0]!;
+    return (await storage.get('tickets', created.id))!;
+  };
   const read = async (id: string) =>
     app.execute(worker.id, 'ticket_get', { project_id: project.id, ticket_id: id }) as Promise<any>;
   const claim = async (id?: string, actorId = worker.id) =>
@@ -158,7 +161,8 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
         ticket_id: ticket.id,
         detail: 'brief',
       })) as any;
-      assert.ok(!context.next_actions.includes('work_claim'));
+      assert.equal(context.claim.actor_id, winner.value.claim.actor_id);
+      assert.equal(context.claim.token, undefined);
     });
     check('atomically distributes next work to concurrent agents', async (f) => {
       for (let i = 0; i < 16; i++) await f.ticket();

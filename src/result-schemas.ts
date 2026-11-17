@@ -111,6 +111,66 @@ const blocker = z.object({ code: z.string(), reference: id, message: z.string() 
 const visibleClaim = z
   .object({ actor_id: id, expires_at: timestamp, expired: z.boolean(), token: id.optional() })
   .nullable();
+const projectSummary = project.omit({
+  instructions: true,
+  ticket_seq: true,
+  event_seq: true,
+  created_at: true,
+});
+const ticketSummary = ticket.omit({
+  description: true,
+  created_by: true,
+  created_at: true,
+  updated_at: true,
+});
+const ticketReceipt = ticket.pick({
+  id: true,
+  project_id: true,
+  key: true,
+  status: true,
+  revision: true,
+  requirements_revision: true,
+});
+const noteReceipt = note.pick({
+  id: true,
+  project_id: true,
+  ticket_id: true,
+  kind: true,
+  ticket_revision: true,
+  created_at: true,
+});
+const retrieval = z.object({
+  tool: z.string(),
+  arguments: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])),
+});
+const omission = z.object({
+  section: z.string(),
+  retrieve_with: z.string(),
+  arguments: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])),
+  revision: z.number().optional(),
+  required_before: z.enum(['execution', 'review']).optional(),
+});
+const context = z.discriminatedUnion('not_modified', [
+  z.object({ fingerprint: z.string(), not_modified: z.literal(true) }),
+  z.object({
+    fingerprint: z.string(),
+    not_modified: z.literal(false),
+    ticket,
+    criteria: z.array(criterion),
+    project_instructions: z.object({ text: z.string(), authority: z.string() }),
+    approval_policy: z.enum(['self', 'independent', 'human']),
+    blockers: z.array(blocker),
+    completion_blockers: z.array(blocker),
+    dependencies: z.array(link.extend({ ticket: ticketSummary.nullable() })),
+    claim: visibleClaim,
+    untrusted_content_notice: z.string(),
+    omitted: z.array(omission),
+    latest_checkpoint: note.nullable().optional(),
+    open_questions: z.array(note).optional(),
+    reviews: z.array(review).optional(),
+    submissions: z.array(submission.omit({ requirements_snapshot: true })).optional(),
+  }),
+]);
 const search = z.object({
   results: z.array(
     z.object({
@@ -121,6 +181,7 @@ const search = z.object({
       excerpt: z.string(),
       score: z.number(),
       resource_uri: z.string(),
+      retrieval,
       untrusted_content: z.boolean(),
     }),
   ),
@@ -129,33 +190,24 @@ const search = z.object({
   index_consistency: z.literal('eventual'),
 });
 export const resultSchemas: Record<Operation, z.ZodType> = {
-  project_list: z.object({ projects: z.array(project) }),
+  project_list: z.object({ projects: z.array(projectSummary) }),
   project_get: z.object({
     project,
     members: z.array(member.extend({ name: z.string(), kind: z.enum(['human', 'agent']) })),
   }),
-  project_create: project,
-  project_update: project,
+  project_create: projectSummary,
+  project_update: projectSummary,
   member_set: member,
-  tickets_create: z.object({ tickets: z.array(ticket) }),
-  ticket_list: z.object({ tickets: z.array(ticket) }),
-  ticket_update: ticket,
-  ticket_transition: ticket,
+  tickets_create: z.object({ tickets: z.array(ticketReceipt) }),
+  ticket_list: z.object({ tickets: z.array(ticketSummary) }),
+  ticket_update: ticketReceipt,
+  ticket_transition: ticketReceipt,
   ticket_get: z.object({
     ticket,
     criteria: z.array(criterion),
     links: z.array(link),
-    notes: z.array(note),
-    submissions: z.array(submission),
-    reviews: z.array(review),
     claim: visibleClaim,
     blockers: z.array(blocker),
-    history: z.object({
-      notes_limit: z.number(),
-      submissions_limit: z.number(),
-      reviews_limit: z.number(),
-      retrieve_with: z.string(),
-    }),
   }),
   ticket_history: z.object({ items: z.array(z.union([note, submission, review])) }),
   ticket_link: z.object({
@@ -164,35 +216,45 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
     kind: z.enum(['blocks', 'related']),
     action: z.enum(['add', 'remove']),
   }),
-  work_next: z.object({ tickets: z.array(ticket) }),
-  work_claim: z.object({ ticket, claim }),
-  work_heartbeat: claim,
-  work_release: ticket,
-  ticket_checkpoint: z.object({ ticket, checkpoint: note }),
-  ticket_note: z.object({ ticket, note }),
-  ticket_submit: z.object({ ticket, submission }),
-  ticket_review: z.object({ ticket, review }),
-  ticket_context: z.object({
-    ticket,
-    criteria: z.array(criterion),
-    project_instructions: z.object({ text: z.string(), authority: z.string() }),
-    approval_policy: z.enum(['self', 'independent', 'human']),
-    blockers: z.array(blocker),
-    completion_blockers: z.array(blocker),
-    dependencies: z.array(link),
-    claim: visibleClaim,
-    next_actions: z.array(z.string()),
-    untrusted_content_notice: z.string(),
-    omitted: z.array(z.object({ section: z.string(), retrieve_with: z.string() })),
-    latest_checkpoint: note.nullable().optional(),
-    open_questions: z.array(note).optional(),
-    reviews: z.array(review).optional(),
-    submissions: z.array(submission).optional(),
-    related_knowledge: search.optional(),
+  work_next: z.object({ tickets: z.array(ticketSummary) }),
+  work_claim: z.object({
+    ticket: ticketReceipt,
+    claim,
+    context: context.optional(),
+    context_omitted: z.enum(['requested', 'legacy_receipt']).optional(),
+    context_ref: retrieval.optional(),
   }),
+  work_heartbeat: claim,
+  work_release: ticketReceipt,
+  ticket_checkpoint: z.object({ ticket: ticketReceipt, checkpoint: noteReceipt }),
+  ticket_note: z.object({ ticket: ticketReceipt, note: noteReceipt }),
+  ticket_submit: z.object({
+    ticket: ticketReceipt,
+    submission: submission.pick({
+      id: true,
+      project_id: true,
+      ticket_id: true,
+      requirements_revision: true,
+      ticket_revision: true,
+      created_at: true,
+    }),
+  }),
+  ticket_review: z.object({
+    ticket: ticketReceipt,
+    review: review.pick({
+      id: true,
+      project_id: true,
+      ticket_id: true,
+      submission_id: true,
+      decision: true,
+      ticket_revision: true,
+      created_at: true,
+    }),
+  }),
+  ticket_context: context,
   search,
   knowledge_get: knowledge,
-  knowledge_write: knowledge,
+  knowledge_write: knowledge.omit({ body: true }),
   checkpoint_get: note,
   changes_since: z.object({
     events: z.array(

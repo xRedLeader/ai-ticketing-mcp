@@ -157,7 +157,7 @@ it('requires every criterion and all child work before completion', async () => 
       detail: 'brief',
     })) as any;
     assert.equal(context.completion_blockers[0].reference, child.id);
-    assert.ok(!context.next_actions.includes('ticket_submit'));
+    assert.equal(Object.hasOwn(context, 'next_actions'), false);
     const children = (await f.app.execute(f.worker.id, 'ticket_list', {
       project_id: f.project.id,
       parent_id: parent.id,
@@ -232,11 +232,15 @@ it('prevents cross-project reads and stale or archived search results', async ()
       kind: 'decision',
     })) as any;
     await f.app.indexOnce(1000);
+    const currentDoc = (await f.app.execute(f.worker.id, 'knowledge_get', {
+      project_id: f.project.id,
+      knowledge_id: doc.id,
+    })) as any;
     await f.call(f.worker.id, 'knowledge_write', {
       knowledge_id: doc.id,
       expected_revision: doc.revision,
       title: doc.title,
-      body: doc.body,
+      body: currentDoc.body,
       kind: doc.kind,
       archived: true,
     });
@@ -290,12 +294,13 @@ it('makes ticket creation batches atomic and preserves full requirements in cont
     );
     const list = (await f.app.execute(f.worker.id, 'ticket_list', { project_id: f.project.id })) as any;
     assert.equal(list.tickets.length, 0);
-    const ticket = await f.ticket({ description: 'x'.repeat(16000), criteria: ['y'.repeat(1000)] });
+    const ticket = await f.ticket({ description: 'x '.repeat(8000), criteria: ['y '.repeat(499) + 'yy'] });
     await assert.rejects(
       f.app.execute(f.worker.id, 'ticket_context', {
         project_id: f.project.id,
         ticket_id: ticket.id,
         detail: 'brief',
+        max_tokens: 512,
       }),
       hasCode('CONTEXT_TOO_LARGE'),
     );

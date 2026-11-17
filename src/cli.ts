@@ -10,6 +10,7 @@ import { createHttpServer } from './http.js';
 import { createMcpServer } from './mcp.js';
 import { DomainError, ensure, type Actor } from './contracts.js';
 import type { Operation } from './schemas.js';
+import { parseMcpProfile } from './profiles.js';
 
 const { positionals, values } = parseArgs({
   allowPositionals: true,
@@ -21,6 +22,7 @@ const { positionals, values } = parseArgs({
     kind: { type: 'string' },
     admin: { type: 'boolean' },
     project: { type: 'string' },
+    profile: { type: 'string' },
     operation: { type: 'string' },
     input: { type: 'string' },
     'input-file': { type: 'string' },
@@ -39,7 +41,7 @@ async function input() {
 async function main() {
   if (command === 'help') {
     process.stdout.write(
-      `ai-ticketing commands:\n  migrate                 Apply migrations and prepare the configured search profile\n  actor --issuer --subject --name --kind [--admin]   Register an identity (trusted operator)\n  call --actor ID --operation NAME --input-file FILE   Execute as a trusted local operator\n  call --url URL --token-env ACCESS_TOKEN --operation NAME --input-file FILE   Authenticated remote call\n  serve                   Serve authenticated HTTP MCP\n  stdio                   Local MCP (requires ACTOR_ID; trusted operator)\n  worker [--once]          Process durable indexing jobs\n  reindex --actor ID --project ID   Rebuild project search indexes\n  inspect --actor ID --project ID   Inspect project and queue metrics\n\nUse --input JSON instead of --input-file for short inputs. Secrets belong in environment variables.\n`,
+      `ai-ticketing commands:\n  migrate                 Apply migrations and prepare the configured search profile\n  actor --issuer --subject --name --kind [--admin]   Register an identity (trusted operator)\n  call --actor ID --operation NAME --input-file FILE   Execute as a trusted local operator\n  call --url URL --token-env ACCESS_TOKEN --operation NAME --input-file FILE   Authenticated remote call\n  serve                   Serve authenticated HTTP MCP\n  stdio [--profile NAME]  Local MCP; worker (default), planner, reviewer, full (requires ACTOR_ID)\n  worker [--once]          Process durable indexing jobs\n  reindex --actor ID --project ID   Rebuild project search indexes\n  inspect --actor ID --project ID   Inspect project and queue metrics\n\nUse --input JSON instead of --input-file for short inputs. Secrets belong in environment variables.\n`,
     );
     return;
   }
@@ -141,10 +143,14 @@ async function main() {
     if (command === 'stdio') {
       ensure(actorId, 'INVALID_CONFIG', 'ACTOR_ID is required for trusted local stdio.');
       await app.actor(actorId);
-      const server = createMcpServer(app, {
-        actorId,
-        scopes: new Set(['ticketing:read', 'ticketing:write']),
-      });
+      const server = createMcpServer(
+        app,
+        {
+          actorId,
+          scopes: new Set(['ticketing:read', 'ticketing:write']),
+        },
+        parseMcpProfile(values.profile),
+      );
       await server.connect(new StdioServerTransport());
       keepAlive = true;
       const shutdown = async () => {

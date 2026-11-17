@@ -4,6 +4,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { createRuntime } from '../src/runtime.js';
 import { createMcpServer } from '../src/mcp.js';
 import type { Actor } from '../src/contracts.js';
+import type { McpProfile } from '../src/profiles.js';
 
 try {
   process.loadEnvFile();
@@ -14,11 +15,15 @@ process.env.DATABASE_URL ??= `postgresql://ticketing_app:${process.env.APP_DB_PA
 if (process.env.EMBEDDING_URL === 'http://ollama:11434') process.env.EMBEDDING_URL = 'http://127.0.0.1:11434';
 const app = createRuntime();
 const clients: Client[] = [];
-async function connect(actor: Actor) {
-  const server = createMcpServer(app, {
-    actorId: actor.id,
-    scopes: new Set(['ticketing:read', 'ticketing:write']),
-  });
+async function connect(actor: Actor, profile: McpProfile) {
+  const server = createMcpServer(
+    app,
+    {
+      actorId: actor.id,
+      scopes: new Set(['ticketing:read', 'ticketing:write']),
+    },
+    profile,
+  );
   const client = new Client({ name: actor.name, version: '1.0.0' });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -44,7 +49,9 @@ try {
   await app.storage.transaction('catalog', async (tx) => {
     for (const actor of identities) await tx.put('actors', actor);
   });
-  const [operator, builder, verifier] = await Promise.all(identities.map(connect));
+  const [operator, builder, verifier] = await Promise.all(
+    identities.map((actor, index) => connect(actor, (['full', 'worker', 'reviewer'] as const)[index]!)),
+  );
   const project = await call(operator!, 'project_create', {
     key: 'DEMO' + randomUUID().slice(0, 6).toUpperCase(),
     name: 'Two-agent walkthrough',
@@ -61,7 +68,7 @@ try {
       role,
       idempotency_key: randomUUID(),
     });
-  const created = await call(builder!, 'tickets_create', {
+  const created = await call(operator!, 'tickets_create', {
     project_id: project.id,
     idempotency_key: randomUUID(),
     tickets: [
@@ -79,7 +86,7 @@ try {
     ticket_id: ticket.id,
     idempotency_key: randomUUID(),
   });
-  await call(builder!, 'ticket_checkpoint', {
+  const checkpoint = await call(builder!, 'ticket_checkpoint', {
     project_id: project.id,
     ticket_id: ticket.id,
     claim_token: claimed.claim.token,
@@ -88,12 +95,12 @@ try {
     remaining: ['Independent review'],
     references: ['https://github.com/xRedLeader/ai-ticketing-mcp/blob/main/docs/mcp.md'],
   });
-  const current = await call(builder!, 'ticket_get', { project_id: project.id, ticket_id: ticket.id });
+  const current = claimed.context;
   const submitted = await call(builder!, 'ticket_submit', {
     project_id: project.id,
     ticket_id: ticket.id,
     claim_token: claimed.claim.token,
-    expected_revision: current.ticket.revision,
+    expected_revision: checkpoint.ticket.revision,
     idempotency_key: randomUUID(),
     summary: 'Workflow documentation covers both requirements.',
     evidence: current.criteria.map((criterion: any) => ({
@@ -103,11 +110,17 @@ try {
       references: ['https://github.com/xRedLeader/ai-ticketing-mcp/blob/main/docs/mcp.md'],
     })),
   });
+  const reviewContext = await call(verifier!, 'ticket_context', {
+    project_id: project.id,
+    ticket_id: ticket.id,
+  });
+  for (const omitted of reviewContext.omitted)
+    if (omitted.required_before === 'review') await call(verifier!, omitted.retrieve_with, omitted.arguments);
   const review = await call(verifier!, 'ticket_review', {
     project_id: project.id,
     ticket_id: ticket.id,
     submission_id: submitted.submission.id,
-    expected_revision: submitted.ticket.revision,
+    expected_revision: reviewContext.ticket.revision,
     idempotency_key: randomUUID(),
     decision: 'approve',
     feedback:
@@ -128,7 +141,7 @@ try {
         status: review.ticket.status,
         checkpoint: context.latest_checkpoint?.body,
         verification: 'Independent MCP identity',
-        search: context.related_knowledge?.degraded ?? 'semantic index ready',
+        indexed_jobs_processed: app.metrics.indexed,
       },
       null,
       2,

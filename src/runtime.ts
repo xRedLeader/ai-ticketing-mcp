@@ -25,6 +25,7 @@ export function createRuntime(env: NodeJS.ProcessEnv = process.env) {
     dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 768),
     apiKey: env.EMBEDDING_API_KEY,
     revision: env.EMBEDDING_REVISION ?? '1',
+    spaceId: env.EMBEDDING_SPACE_ID?.trim() || undefined,
     timeoutMs: Number(env.EMBEDDING_TIMEOUT_MS ?? 30000),
   });
   return createApplication({ storage, search, embeddings });

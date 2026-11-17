@@ -7,7 +7,8 @@ const ticket = { ...project, ticket_id: ref };
 const mutation = { idempotency_key: z.string().min(8).max(128) };
 const revision = { expected_revision: z.int().positive() };
 const labels = z.array(text.max(80)).max(30);
-const page = { limit: z.int().min(1).max(100).default(25), offset: z.int().min(0).max(1_000_000).default(0) };
+const page = { limit: z.int().min(1).max(100).default(10), offset: z.int().min(0).max(1_000_000).default(0) };
+const maxTokens = z.int().min(512).max(32768);
 const criteria = z.array(text.max(1000)).min(1).max(50);
 const ticketFields = {
   title: text.max(300),
@@ -71,7 +72,12 @@ export const schemas = {
     .strict(),
   ticket_get: z.object(ticket).strict(),
   ticket_history: z
-    .object({ ...ticket, ...page, kind: z.enum(['notes', 'submissions', 'reviews']).default('notes') })
+    .object({
+      ...ticket,
+      ...page,
+      kind: z.enum(['notes', 'submissions', 'reviews']).default('notes'),
+      item_id: id.optional(),
+    })
     .strict(),
   ticket_list: z
     .object({
@@ -121,7 +127,7 @@ export const schemas = {
       capabilities: labels.default([]),
       labels: labels.default([]),
       mode: z.enum(['execution', 'review']).default('execution'),
-      limit: z.int().min(1).max(25).default(5),
+      limit: z.int().min(1).max(25).default(1),
     })
     .strict(),
   work_claim: z
@@ -131,6 +137,8 @@ export const schemas = {
       ticket_id: ref.optional(),
       capabilities: labels.default([]),
       labels: labels.default([]),
+      include_context: z.boolean().default(true),
+      max_tokens: maxTokens.default(4096),
     })
     .strict(),
   work_heartbeat: z.object({ ...ticket, ...mutation, claim_token: id }).strict(),
@@ -177,13 +185,18 @@ export const schemas = {
     })
     .strict(),
   ticket_context: z
-    .object({ ...ticket, detail: z.enum(['brief', 'standard', 'full']).default('standard') })
+    .object({
+      ...ticket,
+      detail: z.enum(['brief', 'standard', 'full']).default('brief'),
+      max_tokens: maxTokens.optional(),
+      if_none_match: text.max(128).optional(),
+    })
     .strict(),
   search: z
     .object({
       ...project,
       query: text.max(1000),
-      limit: z.int().min(1).max(100).default(10),
+      limit: z.int().min(1).max(100).default(3),
       kind: z.enum(['ticket', 'knowledge', 'checkpoint']).optional(),
       status: z.enum(['backlog', 'ready', 'in_progress', 'in_review', 'done', 'cancelled']).optional(),
       labels: labels.default([]),
@@ -207,7 +220,7 @@ export const schemas = {
     .object({
       ...project,
       cursor: z.int().nonnegative().default(0),
-      limit: z.int().min(1).max(100).default(100),
+      limit: z.int().min(1).max(100).default(25),
     })
     .strict(),
 };

@@ -7,6 +7,7 @@ import {
 import { DomainError, ensure } from './contracts.js';
 import { createMcpServer, type Principal } from './mcp.js';
 import type { Application } from './application.js';
+import { parseMcpProfile } from './profiles.js';
 
 export interface HttpConfig {
   publicUrl: string;
@@ -53,7 +54,8 @@ export function createHttpServer(app: Application, config: HttpConfig) {
   let active = 0;
   const server = createServer(async (req, res) => {
     const start = performance.now();
-    const path = new URL(req.url ?? '/', url).pathname;
+    const requestUrl = new URL(req.url ?? '/', url);
+    const path = requestUrl.pathname;
     res.on('finish', () =>
       process.stderr.write(
         JSON.stringify({
@@ -120,7 +122,7 @@ export function createHttpServer(app: Application, config: HttpConfig) {
           'FORBIDDEN',
           'Metrics require system administrator access.',
         );
-        const metrics = { ...app.metrics, ...(await app.storage.metrics()) };
+        const metrics = { ...app.metrics, ...app.embeddings.metrics, ...(await app.storage.metrics()) };
         res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
         res.end(
           Object.entries(metrics)
@@ -129,6 +131,9 @@ export function createHttpServer(app: Application, config: HttpConfig) {
         );
         return;
       }
+      const profiles = requestUrl.searchParams.getAll('profile');
+      ensure(profiles.length <= 1, 'INVALID_INPUT', 'Specify profile only once.');
+      const profile = parseMcpProfile(profiles[0]);
       if (req.method !== 'POST') {
         res.setHeader('Allow', 'POST');
         json(res, 405, {
@@ -143,7 +148,7 @@ export function createHttpServer(app: Application, config: HttpConfig) {
         'Content-Type must be application/json.',
       );
       const parsed = await body(req);
-      const mcp = createMcpServer(app, principal);
+      const mcp = createMcpServer(app, principal, profile);
       const transport = new NodeStreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,

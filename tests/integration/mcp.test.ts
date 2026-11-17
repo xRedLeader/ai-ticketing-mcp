@@ -8,6 +8,7 @@ import { setup } from './helpers.js';
 import { createHttpServer } from '../../src/http.js';
 import { createAuthenticator } from '../../src/auth.js';
 import { randomUUID } from 'node:crypto';
+import { profileOperations, type McpProfile } from '../../src/profiles.js';
 
 it('serves authenticated SDK HTTP clients, resources, prompts, scopes, and discovery', async () => {
   const f = await setup();
@@ -70,11 +71,12 @@ it('serves authenticated SDK HTTP clients, resources, prompts, scopes, and disco
     const badOrigin = await fetch(`${base}/healthz`, { headers: { Origin: 'https://evil.example' } });
     assert.equal(badOrigin.status, 403);
     await client.connect(
-      new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+      new StreamableHTTPClientTransport(new URL(`${base}/mcp?profile=full`), {
         requestInit: { headers: { Authorization: `Bearer ${await token()}` } },
       }),
     );
     const tools = await client.listTools();
+    assert.equal(tools.tools.length, 26);
     assert.ok(tools.tools.some((tool) => tool.name === 'ticket_context'));
     assert.ok(tools.tools.every((tool) => tool.inputSchema && tool.outputSchema));
     const created = await client.callTool({
@@ -125,31 +127,40 @@ it('serves authenticated SDK HTTP clients, resources, prompts, scopes, and disco
 
 it('serves local stdio clients without writing non-protocol data to stdout', async () => {
   const f = await setup();
-  const client = new Client({ name: 'stdio-integration', version: '1.0.0' });
   const env = Object.fromEntries(
     Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
   );
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: ['--import', 'tsx', 'src/cli.ts', 'stdio'],
-    env: { ...env, DATABASE_URL: process.env.TEST_DATABASE_URL!, ACTOR_ID: f.worker.id },
-    stderr: 'pipe',
-  });
-  let stderr = '';
-  transport.stderr?.on('data', (chunk) => {
-    stderr += String(chunk);
-  });
   try {
-    await client.connect(transport);
-    const result = await client.callTool({ name: 'project_list', arguments: {} });
-    assert.equal((result.structuredContent as any).ok, true);
-    assert.ok(
-      (result.structuredContent as any).data.projects.some((project: any) => project.id === f.project.id),
-    );
-  } catch (error) {
-    throw new Error(`stdio failed: ${stderr}`, { cause: error });
+    for (const profile of [undefined, 'worker', 'planner', 'reviewer', 'full'] as const) {
+      const client = new Client({ name: 'stdio-integration', version: '1.0.0' });
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: ['--import', 'tsx', 'src/cli.ts', 'stdio', ...(profile ? ['--profile', profile] : [])],
+        env: { ...env, DATABASE_URL: process.env.TEST_DATABASE_URL!, ACTOR_ID: f.worker.id },
+        stderr: 'pipe',
+      });
+      let stderr = '';
+      transport.stderr?.on('data', (chunk) => {
+        stderr += String(chunk);
+      });
+      try {
+        await client.connect(transport);
+        assert.deepEqual(
+          (await client.listTools()).tools.map((tool) => tool.name).sort(),
+          [...profileOperations[(profile ?? 'worker') as McpProfile]].sort(),
+        );
+        const result = await client.callTool({ name: 'project_list', arguments: {} });
+        assert.equal((result.structuredContent as any).ok, true);
+        assert.ok(
+          (result.structuredContent as any).data.projects.some((project: any) => project.id === f.project.id),
+        );
+      } catch (error) {
+        throw new Error(`stdio ${profile ?? 'default'} failed: ${stderr}`, { cause: error });
+      } finally {
+        await client.close();
+      }
+    }
   } finally {
-    await client.close();
     await f.dispose();
   }
 });
