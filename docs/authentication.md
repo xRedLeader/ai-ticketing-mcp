@@ -39,12 +39,4 @@ Set `OAUTH_ISSUER`, `OAUTH_AUDIENCE`, and `PUBLIC_URL`. The server reads OpenID 
 
 ## Production HTTPS
 
-The included Keycloak profile defaults to local development. For public hosting:
-
-- Set `PUBLIC_URL=https://tickets.example.com`, `OAUTH_AUDIENCE=https://tickets.example.com/mcp`, `KEYCLOAK_PUBLIC_URL=https://login.example.com`, and `OAUTH_ISSUER=https://login.example.com/realms/ticketing`.
-- Set `TICKETING_DOMAIN`, `LOGIN_DOMAIN`, and `ALLOWED_ORIGIN_HOSTS` to the intended hostnames.
-- Update the Keycloak `ticketing:read` scope's audience mapper to the exact production MCP URL. An already imported realm must be updated in Keycloak; changing the template does not overwrite it.
-- Run `docker compose -f compose.yaml -f deploy/compose.production.yaml --profile auth --profile local-ai up -d --build` with DNS pointing to the host. The override switches Keycloak out of development mode and supplies a Caddy TLS proxy.
-- Keep database, embedding, and identity-provider management ports private. The default published service ports bind to loopback. Caddy is the public entry point.
-
-The public HTTPS deployment requires operator-owned domains and DNS; the local quickstart does not publish a service to the Internet.
+Follow the [production HTTPS runbook](production-https.md) for the included Caddy and Keycloak deployment. It includes a secret-safe preflight, exact issuer/audience setup for new and existing realms, DNS/firewall checks, SDK smoke checks, and certificate renewal/recovery. TLS terminates at Caddy; individual MCP tools remain transport-independent.
