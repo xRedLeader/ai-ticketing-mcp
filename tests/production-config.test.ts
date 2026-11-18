@@ -80,6 +80,9 @@ it('checks exact production identities, assigned realm audience, private ports a
     assert.equal(errors.join('').includes('private-secret'), false);
   }
   const stale = structuredClone(realm);
+  stale.attributes = { frontendUrl: 'http://localhost:8080' };
+  assert.ok(checkProductionConfig(env, compose, stale).some((s: string) => s.startsWith('Keycloak issuer:')));
+  delete stale.attributes;
   stale.clientScopes[0].protocolMappers[0].config['included.custom.audience'] = 'http://localhost:3000/mcp';
   assert.ok(checkProductionConfig(env, compose, stale).some((s: string) => s.startsWith('Keycloak realm:')));
   stale.clientScopes = realm.clientScopes;

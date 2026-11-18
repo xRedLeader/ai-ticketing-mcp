@@ -54,6 +54,10 @@ export function checkProductionConfig(env, compose, realm) {
     'OAUTH_JWKS_URL: use the private bundled Keycloak JWKS endpoint for this deployment.',
   );
   if (realm) {
+    fail(
+      !realm.attributes?.frontendUrl || realm.attributes.frontendUrl === env.KEYCLOAK_PUBLIC_URL,
+      'Keycloak issuer: clear the realm Frontend URL override or set it to exactly KEYCLOAK_PUBLIC_URL, then export the current realm again.',
+    );
     const scope = realm.clientScopes?.find((s) => s.name === 'ticketing:read');
     const mapper = scope?.protocolMappers?.find(
       (m) =>
