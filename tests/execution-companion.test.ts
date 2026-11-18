@@ -4,8 +4,19 @@ import { randomUUID } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { ExecutionJob, ExecutionOutcome } from '../src/contracts.js';
-import { ExecutionRecipeRegistry, EXECUTION_TIMEOUT_MS } from '../src/execution-recipes.js';
+import type {
+  ExecutionAttempt,
+  ExecutionController,
+  ExecutionJob,
+  ExecutionObservation,
+  ExecutionOutcome,
+  ExecutionReconciliation,
+} from '../src/contracts.js';
+import {
+  ExecutionRecipeRegistry,
+  EXECUTION_TIMEOUT_MS,
+  MAX_EXECUTION_RECIPE_BYTES,
+} from '../src/execution-recipes.js';
 import { ExecutionCompanion, type ExecutionApplication } from '../src/execution-companion.js';
 import { HostCapacity } from '../src/host-capacity.js';
 
@@ -52,7 +63,73 @@ async function fixture(script: string, extra: Record<string, unknown> = {}) {
     error_code: null,
   };
   const events: string[] = [];
+  let controller: ExecutionController | null = null;
+  let generation = 1;
+  const attempt: ExecutionAttempt = {
+    id: randomUUID(),
+    project_id: project,
+    run_id: job.id,
+    previous_attempt_id: null,
+    ordinal: 1,
+    process_token: randomUUID(),
+    created_at: job.created_at,
+  };
+  let observed: ExecutionObservation | null = null;
+  const state = (): ExecutionReconciliation => ({
+    run: { ...job },
+    attempt,
+    observation: observed,
+    state: ['succeeded', 'failed'].includes(job.status)
+      ? 'completed'
+      : observed?.kind === 'running'
+        ? 'running'
+        : 'unresolved',
+    next_step: observed?.next_step ?? (job.status === 'reserved' ? 'dispatch' : 'inspect_launch'),
+  });
   const app: ExecutionApplication = {
+    async acquireExecutionController() {
+      if (controller) return null;
+      controller = {
+        id: 'execution',
+        owner_id: 'test',
+        token: randomUUID(),
+        generation: ++generation,
+        expires_at: new Date(Date.now() + 60000).toISOString(),
+      };
+      return controller;
+    },
+    async heartbeatExecutionController() {
+      return true;
+    },
+    async releaseExecutionController() {
+      controller = null;
+    },
+    async listExecutionReconciliations(_actor, _project, ids) {
+      return ids?.includes(job.id) || (!ids && ['reserved', 'running'].includes(job.status)) ? [state()] : [];
+    },
+    async adoptExecutionRun() {
+      job.reservation_token = randomUUID();
+      return state();
+    },
+    async observeExecutionRun(_actor, _project, _id, _token, _attempt, _process, fence, identity, kind) {
+      observed = {
+        id: randomUUID(),
+        project_id: project,
+        run_id: job.id,
+        attempt_id: attempt.id,
+        sequence: (observed?.sequence ?? 0) + 1,
+        controller_generation: fence.generation,
+        kind,
+        next_step: kind === 'running' ? 'wait_for_result' : 'inspect_side_effects',
+        process_identity: identity,
+        outcome: null,
+        created_at: new Date().toISOString(),
+      };
+      return true;
+    },
+    async recoverExecutionRun(actor, project, id, token, _attempt, _process, outcome, fence) {
+      return app.settleExecutionRun(actor, project, id, token, outcome, fence);
+    },
     async listExecutionRuns() {
       return job.status === 'queued' ? [{ ...job }] : [];
     },
@@ -105,6 +182,8 @@ async function fixture(script: string, extra: Record<string, unknown> = {}) {
     capacity,
     options,
     events,
+    artifactDirectory: () => join(options.artifacts_directory, job.id, attempt.id),
+    attempt,
     job: () => job,
     async dispose() {
       capacity.close();
@@ -181,7 +260,7 @@ it('executes once with exact environment, bounded separate logs and authentic ex
     ]);
     assert.equal(results.filter(Boolean).length, 1);
     const job = f.job(),
-      directory = join(f.options.artifacts_directory, job.id);
+      directory = f.artifactDirectory();
     assert.equal(job.status, 'failed');
     assert.equal(job.exit_code, 7);
     assert.equal(job.error_code, null);
@@ -192,7 +271,7 @@ it('executes once with exact environment, bounded separate logs and authentic ex
     assert.ok((await readFile(join(directory, 'stdout.log'), 'utf8')).startsWith('approved:absent\n'));
     assert.deepEqual(
       job.artifacts,
-      ['stdout', 'stderr', 'result'].map((name) => `execution:${job.id}:${name}`),
+      ['stdout', 'stderr', 'result'].map((name) => `execution:${job.id}:${f.attempt.id}:${name}`),
     );
     const result = JSON.parse(await readFile(join(directory, 'result.json'), 'utf8'));
     assert.equal(result.exit_code, 7);
@@ -213,9 +292,7 @@ it('fails closed on unverified timeout, retaining the direct-child observation a
     await assert.rejects(new ExecutionCompanion(f.options).runOnce(), /termination was not verified/);
     assert.equal(f.job().status, 'running');
     assert.equal(f.capacity.inspect('host').occupied.script, 1);
-    const result = JSON.parse(
-      await readFile(join(f.options.artifacts_directory, f.job().id, 'result.json'), 'utf8'),
-    );
+    const result = JSON.parse(await readFile(join(f.artifactDirectory(), 'result.json'), 'utf8'));
     assert.equal(result.error_code, 'TIMEOUT');
     assert.equal(result.cleanup_verified, false);
     assert.ok(result.signal !== null || result.exit_code !== null);
@@ -226,6 +303,42 @@ it('fails closed on unverified timeout, retaining the direct-child observation a
   }
 });
 
+it('transfers recipes above 256 KiB without persisting secrets and rejects the shared input bound before dispatch', async () => {
+  const env = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`APPROVED_${i}`, 'x'.repeat(16_384)]));
+  const f = await fixture('', { env });
+  try {
+    const recipe = f.recipes.get('fixture', f.metadata.fingerprint, f.options.project_id);
+    assert.ok(Buffer.byteLength(JSON.stringify(recipe)) > 262_144);
+    assert.ok(Buffer.byteLength(JSON.stringify(recipe)) <= MAX_EXECUTION_RECIPE_BYTES);
+    await new ExecutionCompanion(f.options).runOnce();
+    assert.ok(['succeeded', 'failed'].includes(f.job().status));
+    assert.equal(f.capacity.inspect('host').occupied.script, 0);
+    const manifest = JSON.parse(await readFile(join(f.artifactDirectory(), 'manifest.json'), 'utf8'));
+    assert.deepEqual(Object.keys(manifest).sort(), [
+      'attempt_id',
+      'process_token',
+      'recipe_fingerprint',
+      'run_id',
+    ]);
+    assert.throws(
+      () =>
+        new ExecutionRecipeRegistry({
+          ...f.config,
+          recipes: [
+            {
+              ...f.config.recipes[0],
+              env: Object.fromEntries(
+                Array.from({ length: 80 }, (_, i) => [`TOO_LARGE_${i}`, 'x'.repeat(32_768)]),
+              ),
+            },
+          ],
+        }),
+      /exceeds 2 MiB/,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
 it('a changed registry fails before host admission or native spawn', async () => {
   const f = await fixture('process.exitCode = 0');
   try {
@@ -271,9 +384,7 @@ it('retains local exact results and occupied capacity if the durable terminal fe
     await assert.rejects(new ExecutionCompanion(f.options).runOnce(), /result could not be fenced/);
     assert.equal(f.job().status, 'running');
     assert.equal(f.capacity.inspect('host').occupied.script, 1);
-    const result = JSON.parse(
-      await readFile(join(f.options.artifacts_directory, f.job().id, 'result.json'), 'utf8'),
-    );
+    const result = JSON.parse(await readFile(join(f.artifactDirectory(), 'result.json'), 'utf8'));
     assert.equal(result.exit_code, 0);
     assert.equal(result.cleanup_verified, true);
     assert.equal(await new ExecutionCompanion(f.options).runOnce(), false);
@@ -298,9 +409,7 @@ it('retains durable terminal result across the capacity release gap and permits 
     const takeover = f.capacity.takeOver('host', f.job().id, entry.lease!.generation, 'trusted-operator');
     assert.equal(takeover.start_allowed, false);
     assert.equal(takeover.execution_token, originalToken);
-    const result = JSON.parse(
-      await readFile(join(f.options.artifacts_directory, f.job().id, 'result.json'), 'utf8'),
-    );
+    const result = JSON.parse(await readFile(join(f.artifactDirectory(), 'result.json'), 'utf8'));
     reconcile(takeover.lease, {
       source: 'trusted-operator-terminal-verification',
       execution_token: takeover.execution_token!,

@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { ensure } from './contracts.js';
 
 export const EXECUTION_TIMEOUT_MS = 30 * 60_000;
+export const MAX_EXECUTION_RECIPE_BYTES = 2 * 1024 * 1024;
 const identifier = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/);
 const count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const recipeSchema = z.strictObject({
@@ -144,7 +145,7 @@ export class ExecutionRecipeRegistry {
           cwd,
           project_ids: [...new Set(recipe.project_ids)].sort(),
         };
-        return Object.freeze({
+        const pinned = Object.freeze({
           ...normalized,
           argv: Object.freeze([...recipe.argv]),
           env: Object.freeze({ ...recipe.env }),
@@ -152,6 +153,12 @@ export class ExecutionRecipeRegistry {
           resources: Object.freeze({ ...recipe.resources }),
           fingerprint: createHash('sha256').update(canonical(normalized)).digest('hex'),
         });
+        ensure(
+          Buffer.byteLength(JSON.stringify(pinned)) <= MAX_EXECUTION_RECIPE_BYTES,
+          'INVALID_CONFIG',
+          'Normalized execution recipe exceeds 2 MiB.',
+        );
+        return pinned;
       }),
     );
   }

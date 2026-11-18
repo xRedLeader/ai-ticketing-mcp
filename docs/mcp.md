@@ -21,7 +21,7 @@ Every profile includes `project_list`, `project_get`, `ticket_list`, `ticket_con
 
 Profiles are not an access-control boundary. They select tool exposure; every operation retains its OAuth scope and project-role checks. Resources remain independently authorized and available in every profile. Guides and prompts follow the selected profile; the tool surface works without either.
 
-Use the [execution companion](execution-companion.md) to configure registered scripts, submit a durable run with `run_submit`, and retrieve its checkpoint, continuation, and outcome with `run_get`.
+Use the [execution companion](execution-companion.md) to configure registered scripts, submit a durable run with `run_submit`, and retrieve its checkpoint, continuation, outcome, and reconciliation state/next safe step with `run_get`.
 
 ## Tools
 

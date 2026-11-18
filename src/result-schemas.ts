@@ -309,7 +309,17 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
     status: z.literal('queued'),
     retrieval,
   }),
-  run_get: z.object({ run: executionJob, continuation, checkpoint: note, stale: z.boolean() }),
+  run_get: z.object({
+    run: executionJob,
+    continuation,
+    checkpoint: note,
+    stale: z.boolean(),
+    reconciliation: z.object({
+      state: z.enum(['queued', 'running', 'completed', 'unresolved']),
+      next_step: z.enum(['dispatch', 'inspect_launch', 'wait_for_result', 'inspect_side_effects', 'none']),
+      attempt_id: id.nullable(),
+    }),
+  }),
   ticket_github_refresh: z.object({
     ticket: ticketReceipt,
     github_evidence: githubEvidenceSchema.pick({

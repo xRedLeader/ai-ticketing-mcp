@@ -38,6 +38,29 @@ const knowledgeColumns = [
   'updated_at',
 ];
 const columns: Record<Table, string[]> = {
+  execution_controllers: ['id', 'owner_id', 'token', 'generation', 'expires_at'],
+  execution_attempts: [
+    'id',
+    'project_id',
+    'run_id',
+    'previous_attempt_id',
+    'ordinal',
+    'process_token',
+    'created_at',
+  ],
+  execution_observations: [
+    'id',
+    'project_id',
+    'run_id',
+    'attempt_id',
+    'sequence',
+    'controller_generation',
+    'kind',
+    'next_step',
+    'process_identity',
+    'outcome',
+    'created_at',
+  ],
   execution_jobs: [
     'id',
     'project_id',
@@ -195,6 +218,8 @@ const columns: Record<Table, string[]> = {
   ],
 };
 const jsonColumns = new Set([
+  'process_identity',
+  'outcome',
   'artifacts',
   'completion_condition',
   'metadata',
@@ -239,6 +264,10 @@ function repository(db: Executor): Transaction {
     return `"${key}"`;
   };
   return {
+    async lockExecutionController() {
+      const result = await db.query("SELECT * FROM execution_controllers WHERE id='execution' FOR UPDATE");
+      return result.rows[0] ? (decode(result.rows[0]) as unknown as Tables['execution_controllers']) : null;
+    },
     async compareExecutionRun(previous, next) {
       ensure(
         previous.id === next.id && previous.project_id === next.project_id,
@@ -369,7 +398,9 @@ function repository(db: Executor): Transaction {
         table === 'github_evidence' ||
         table === 'outbound_deliveries' ||
         table === 'knowledge_revisions' ||
-        table === 'execution_jobs'
+        table === 'execution_jobs' ||
+        table === 'execution_attempts' ||
+        table === 'execution_observations'
           ? ''
           : ` ON CONFLICT(id) DO UPDATE SET ${names
               .filter((name) => name !== '"id"')
@@ -383,7 +414,13 @@ function repository(db: Executor): Transaction {
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
       ensure(
-        table !== 'execution_jobs' && table !== 'continuations',
+        ![
+          'execution_jobs',
+          'continuations',
+          'execution_attempts',
+          'execution_observations',
+          'execution_controllers',
+        ].includes(table),
         'IMMUTABLE_EXECUTION',
         'Execution history cannot be deleted.',
       );

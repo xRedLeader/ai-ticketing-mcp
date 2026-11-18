@@ -250,6 +250,49 @@ export interface Continuation {
   created_at: string;
   settled_at: string | null;
 }
+export interface ExecutionControllerFence {
+  token: string;
+  generation: number;
+}
+export interface ExecutionController extends ExecutionControllerFence {
+  id: string;
+  owner_id: string;
+  expires_at: string;
+}
+/** Identity and predecessor never change, including after controller replacement. */
+export interface ExecutionAttempt {
+  id: string;
+  project_id: string;
+  run_id: string;
+  previous_attempt_id: string | null;
+  ordinal: number;
+  process_token: string;
+  created_at: string;
+}
+export interface ExecutionProcessIdentity {
+  pid: number;
+  start_marker: string;
+}
+export interface ExecutionObservation {
+  id: string;
+  project_id: string;
+  run_id: string;
+  attempt_id: string;
+  sequence: number;
+  controller_generation: number;
+  kind: 'reserved' | 'dispatching' | 'running' | 'completed' | 'unresolved';
+  next_step: 'dispatch' | 'inspect_launch' | 'wait_for_result' | 'inspect_side_effects' | 'none';
+  process_identity: ExecutionProcessIdentity | null;
+  outcome: ExecutionOutcome | null;
+  created_at: string;
+}
+export interface ExecutionReconciliation {
+  run: ExecutionJob;
+  attempt: ExecutionAttempt | null;
+  observation: ExecutionObservation | null;
+  state: 'queued' | 'running' | 'completed' | 'unresolved';
+  next_step: ExecutionObservation['next_step'];
+}
 export interface OutboundDelivery {
   id: string;
   event_id: string;
@@ -276,6 +319,9 @@ export interface WebhookTarget {
   send(delivery: OutboundDelivery): Promise<{ error_code: string } | undefined>;
 }
 export interface Tables {
+  execution_controllers: ExecutionController;
+  execution_attempts: ExecutionAttempt;
+  execution_observations: ExecutionObservation;
   execution_jobs: ExecutionJob;
   continuations: Continuation;
   outbound_deliveries: OutboundDelivery;
@@ -327,6 +373,8 @@ export interface Reader {
   find<K extends Table>(table: K, query?: Query<Tables[K]>): Promise<Tables[K][]>;
 }
 export interface Transaction extends Reader {
+  /** Locks the store-wide controller until transaction commit, including on PostgreSQL. */
+  lockExecutionController?(): Promise<ExecutionController | null>;
   /** Optional durable execution capability; updates only the exact prior ownership/state. */
   compareExecutionRun?(previous: ExecutionJob, next: ExecutionJob): Promise<boolean>;
   put<K extends Table>(table: K, value: Tables[K]): Promise<void>;

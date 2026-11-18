@@ -6,7 +6,7 @@ The optional companion runs operator-registered finite foreground scripts in a s
 
 Recipes, executables, script files, workspaces, environment and artifact directory are operator-owned. Register only finite foreground work that waits for its children, never detaches/backgrounds work, and never escapes the supervisor. This is a trusted local execution boundary, not an OS sandbox for untrusted scripts. A normal exit, including a nonzero exit, is authoritative under this contract. CPU/memory declarations are HostCapacity admission estimates, not OS resource enforcement.
 
-Timeout, cancellation and lost ownership attempt to terminate the direct child through Node's child handle. A child handle cannot prove the whole process tree stopped. Such executions, and exits observed with an external/native signal, remain running/reserved in the application and occupied/reconciling in HostCapacity even when the direct child's exit was observed. There is no bare-PID `taskkill`, automatic rerun or automatic lease release. OS containment and restart reconciliation belong to SELF-9.
+Timeout, cancellation and lost ownership attempt to terminate the direct child through Node's child handle. A child handle cannot prove the whole process tree stopped. Such executions, and exits observed with an external/native signal, remain running/reserved in the application and occupied/reconciling in HostCapacity even when the direct child's exit was observed. There is no bare-PID `taskkill`, automatic rerun or automatic lease release. Restart reconciliation preserves these unresolved executions. OS process-tree containment is not provided: a natural foreground exit relies on the registered recipe contract, and `cleanup_verified` is not independent OS tree proof.
 
 Set `EXECUTION_RECIPES_FILE` to an **absolute** operator-owned JSON file for both the MCP service and companion. Restart both when changing registration. Example:
 
@@ -31,7 +31,7 @@ Set `EXECUTION_RECIPES_FILE` to an **absolute** operator-owned JSON file for bot
 
 The registry resolves real paths, requires an absolute native executable, rejects shell scripts/Windows command files, and restricts cwd to configured workspace roots. It freezes fixed argv and an exact explicit environment: the child inherits **none** of the companion's environment. There is no shell, interpolation, ticket-supplied argv, model-supplied environment or command text. Scripts needing other programs must use operator-approved absolute paths or explicitly configured environment values. Windows environment keys cannot differ only in case.
 
-Timeout defaults to 30 minutes and cannot exceed it. Each stdout/stderr file defaults to 1 MiB, with a configured maximum of 16 MiB each. Both pipes continue draining after the retained byte limit, so truncation does not deadlock the child. Recipe IDs are at most 80 characters. The SHA-256 fingerprint covers normalized registration, including argv, cwd, environment, limits and project allowlist. It does not hash executable/script contents: the operator must protect those files and bump registration when changing their meaning. Changing/removing a recipe does not silently redirect an already submitted job; it fails before spawn.
+The registry file is bounded to 1 MiB; each normalized recipe and its private supervisor input are bounded to 2 MiB, checked before dispatch. Timeout defaults to 30 minutes and cannot exceed it. Each stdout/stderr file defaults to 1 MiB, with a configured maximum of 16 MiB each. Both pipes continue draining after the retained byte limit, so truncation does not deadlock the child. Recipe IDs are at most 80 characters. The SHA-256 fingerprint covers normalized registration, including argv, cwd, environment, limits and project allowlist. It does not hash executable/script contents: the operator must protect those files and bump registration when changing their meaning. Changing/removing a recipe does not silently redirect an already submitted job; it fails before spawn.
 
 ## Starting the process
 
@@ -46,40 +46,54 @@ For PostgreSQL, omit `--sqlite` and supply the normal storage environment. The c
 
 All dispatchers on the physical host must share the same local HostCapacity SQLite file **and host ID**. A missing host gets the existing two-script/two-agent defaults. Preconfigure immutable host limits through `HostCapacity.configureHost` if required. Separate host files/IDs cannot coordinate physical capacity.
 
-The ordering is application reservation CAS, HostCapacity admission, application start CAS, ownership recheck, native spawn. Concurrent companions cannot both reserve the same job. Admission uses an exact script queue ID filter and cannot steal agent work or another script; if the next eligible script belongs to another dispatcher, it waits rather than bypassing the existing ordering. Ordinary unfiltered SELF-29 admission is unchanged. A companion processes one job at a time. Capacity admission waits at most 30 seconds; exhaustion records `CAPACITY_TIMEOUT` with no spawn and cancels its queued capacity entry. The wait and normal idle checks are asynchronous, at most one second apart. Application and capacity heartbeats keep their independent fences live.
+The companion acquires one store-wide controller lease before inspecting or dispatching work. Its 60-second lease renews at most every 10 seconds. Companions for other projects in the same store wait for that controller to release or expire; each invocation processes at most one new job. A permanent controller singleton is locked in the same transaction as run acknowledgment and continuation publication, including the first acquisition. Expired controllers, old reservation tokens, and mismatched immutable attempt/process tokens cannot publish through a replacement. Once the store has used a controller, unfenced legacy direct writes are rejected.
+
+Dispatch persists an immutable attempt and its reservation, admits host capacity, records dispatch intent, then starts a separate bounded supervisor. Each attempt has an immutable process token and append-only observations. Recovery rotates the reservation token while retaining the original attempt ID and observations. No recovery path dispatches that attempt again. Claim expiry/replacement prevents new running acknowledgments and normal owner settlement; a verified recovered result is still retained, with a failed `STALE_AUTHORITY` continuation when current claims, requirements or blockers no longer authorize it.
+
+Capacity admission waits at most 30 seconds, with asynchronous checks at most one second apart. Exhaustion cancels its queued entry and records a pre-start failure. Admission uses the exact script queue ID and never takes another script or agent job. Application/controller and capacity heartbeats retain independent ownership fences. Lease expiry alone never releases an occupied host slot.
 
 ## Results and files
 
-For verified normal completion, fsynced separate logs and `result.json` precede the durable application terminal result, which precedes capacity release. Exact exit codes and signals are retained, including nonzero/native Windows exit codes. Continuation success uses the submitted expected exit code; an exit result does not itself accept a ticket or resume a model. The authorized exact `run_get` response carries bounded references such as:
+A detached supervisor receives the immutable approved recipe once through a private stdin pipe. Recipe environment, arguments and cwd are not persisted in recovery manifests. The native script still receives only its explicit registered environment. Closing or crashing the controller does not stop the supervisor's bounded timeout, log capture or result journal.
+
+For normal foreground completion, fsynced logs and `result.json` precede the durable application outcome, which precedes capacity release. Exact exit codes and signals are retained, including native Windows exit codes. Continuation success uses the submitted exit condition and fresh authority; it does not accept a ticket or resume a model. Authorized `run_get` returns bounded opaque references:
 
 ```text
-execution:<run UUID>:stdout
-execution:<run UUID>:stderr
-execution:<run UUID>:result
+execution:<run UUID>:<attempt UUID>:stdout
+execution:<run UUID>:<attempt UUID>:stderr
+execution:<run UUID>:<attempt UUID>:result
 ```
 
-These are opaque references, not MCP-visible arbitrary file paths. With `--artifacts ROOT`, the private files are exactly:
+With `--artifacts ROOT`, private write-once files live under `ROOT/<run UUID>/<attempt UUID>/`:
 
-```text
-ROOT/<run UUID>/execution.json
-ROOT/<run UUID>/stdout.log
-ROOT/<run UUID>/stderr.log
-ROOT/<run UUID>/result.json
-```
+- `manifest.json`: run/attempt identity, process token and recipe fingerprint only.
+- `supervisor.json`, `dispatch.json`, `process.json`: durable supervisor identity, launch intent and native process acknowledgment. Process identity includes PID plus an OS start marker; a bare PID is never sufficient.
+- `stdout.log`, `stderr.log`, `result.json`: bounded logs and authoritative direct-child outcome, timing, truncation and cleanup observation.
+- `cancel.json`: an optional bounded cancellation request to the supervisor.
 
-`execution.json` links the run/recipe fingerprint and original fenced capacity lease. `result.json` retains PID, start/end times, direct-child exit/signal/error, retained byte counts, truncation flags and `cleanup_verified`. Files/directories are created exclusively and never overwritten by retry. Restrict OS permissions/ACLs: raw logs may contain secrets. File modes are requested on platforms that support them; configure Windows ACLs separately.
+Restrict artifact directories with OS permissions/ACLs; logs may contain secrets and the process token is a trusted recovery credential. Requested file modes apply where supported; configure Windows ACLs separately. Older accepted execution installations retain their original `ROOT/<run UUID>/execution.json` and result/log layout; matching legacy journals are inspected without launching another attempt.
 
-`cleanup_verified:false` preserves an authentic **direct-child observation only**, not a terminal application result or proof of tree termination. The application run remains running and capacity remains occupied. If close itself is not observed within 15 seconds after a termination attempt, the companion fails closed without inventing an exit result. `execution.json` and whatever logs were captured remain available to the operator. Retrieval of log bodies/ranges through authorized MCP is SELF-15; SELF-7 exposes references and exact run metadata only.
+Timeout, cancellation, native signals and unverified cleanup retain occupied capacity and an unresolved run even if the direct child is known to have exited. If direct-child close is not observed within 15 seconds after attempted termination, the supervisor exits without inventing a completion. A normal exit is authoritative only under the finite foreground recipe contract above. Retrieving log bodies/ranges through MCP remains separate work; this companion exposes references and exact run metadata.
 
-## Crash gaps and trusted reconciliation
+## Restart and the next safe step
 
-Application storage and host capacity are different stores. A process crash can leave a reserved/running job and an occupied or queued capacity entry. Restart discovers new queued application jobs only; it never reclaims, requeues, respawns or releases an abandoned reservation. A crash after terminal application commit but before capacity release leaves the exact terminal result available through `run_get` and an occupied slot. A crash before that commit may leave only local observations, even if the process really exited. SELF-9 must finish application crash recovery; do not report these cases as already handled.
+`run_get.reconciliation` exposes `state` (`queued`, `running`, `completed`, `unresolved`), `attempt_id`, and `next_step` through both PostgreSQL and SQLite. The trusted `listExecutionReconciliations` API provides the same state together with the immutable attempt and latest observation. Restart inspects at most 100 active runs plus 100 occupied host entries per pass; unchanged observations do not append rows on every poll.
 
-For a **terminal application run** whose matching `result.json` has `cleanup_verified:true`, an operator can finish the terminal-before-release gap without launching anything:
+| Durable evidence                                            | Recovery action / next step                                                                                    |
+| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Reserved attempt, before dispatch intent                    | Close as `RECOVERED_NOT_DISPATCHED`; cancel/release only its proven unstarted entry. Never relaunch it.        |
+| Dispatch intent without launch/result evidence              | `unresolved`; inspect launch and side effects. Missing journal or acknowledgment cannot prove non-execution.   |
+| Matching live PID **and OS start marker**                   | `running`; `wait_for_result`. A missing or reused PID leaves side effects unresolved.                          |
+| Matching fsynced result with foreground cleanup observation | Replay the exact outcome, recheck continuation authority, then release the matching host slot.                 |
+| Terminal application outcome before capacity release        | Compare the result journal with the exact stored outcome and release its occupied slot without executing work. |
+| Missing, partial, mismatched result or unverified cleanup   | `unresolved`; `inspect_side_effects`, preserving pending continuation, attempt history and occupied capacity.  |
 
-1. Stop/fence the old companion. Read the exact authorized `run_get`; verify terminal status, run/project IDs, recipe fingerprint, exit/signal/error and artifact references against the private files. Verify the finite foreground recipe completed under the host contract. Do not infer termination from lease expiry or a missing/reused PID.
-2. Open the shared `HostCapacity` file with its trusted local API. Locate the exact entry with `queue_id === run.id`, `run_id === run.id`, matching `project_id`, `kind === 'script'`, and state `running`/`reconciling`. Compare its lease to `execution.json` and retain the immutable `execution_token`.
-3. Fence the old owner with `takeOver(hostId, run.id, entry.lease.generation, operatorOwnerId)`. This returns a new lease and the **same original execution token**, with `start_allowed:false`.
-4. Call `reconcile` with that new lease and the preserved token, `source:'trusted-operator-terminal-verification'`, `observed_at:result.finished_at`, `state:'terminated'`, and `script_result:{outcome, runtime_ms:result.finished_at-result.started_at}`. Use `outcome:'succeeded'` for exit 0 without error, otherwise `'failed'`. This releases only the verified matching capacity entry.
+The initial dispatch state can expose `inspect_launch`; after inspecting ambiguous evidence the next step is `inspect_side_effects`. The result journal can outlive the controller: actual crash tests cover dispatch, launch acknowledgment and completion-before-database-settlement on both adapters. Completion without a durable journal remains unresolved even if a side effect appears to have happened.
 
-If the application is still reserved/running, cleanup is unverified, files disagree, ownership was lost, or a process/tree could still exist, leave it occupied and retain the evidence for SELF-9/operator investigation. `never_started` requires independent proof that no spawn occurred; a crash between admission and start is not that proof. No MCP/client assertion, timeout or stale lease authorizes release.
+For manual investigation, fence the old controller, inspect exact authorized run/project/attempt IDs and recipe fingerprint, verify process start identity and descendants, and inspect external side effects using their own durable identifiers. Preserve the original observations. Only authoritative matching completion/cleanup evidence permits trusted application recovery and `HostCapacity.takeOver` / `reconcile` with its unchanged original execution token. Neither chat assertions, lease expiry nor PID disappearance authorize `never_started`, capacity release or a fresh run. Any new explicit submission requires the operator to resolve the previous attempt's side effects first; this implementation never retries automatically.
+
+## Controlled upgrade
+
+Stop the MCP runtime/worker and companion, take a consistent backup including SQLite WAL state, migrate with schema-owner privileges, rebuild, then restart and reconnect clients. Do not hot-reload this stack into an old process: the earlier project-memory migration rebuilds a SQLite table, and new adapters require the recovery schema.
+
+Migration identity is the complete filename in `schema_migrations`, not a unique numeric prefix. Preserve the accepted `013_project_memory.sql` / `014_execution_runs.sql` (SQLite `005_project_memory.sql` / `006_execution_runs.sql`) alongside main's independent `013_review_fixes.sql` (SQLite `005_review_fixes.sql`). Their exact names and bytes are retained so either already-applied history upgrades once without replaying ALTERs or losing data. Recovery appends PostgreSQL `015_execution_recovery.sql` and SQLite `007_execution_recovery.sql`. Both adapters test main-first and accepted-stack-first upgrade histories, preserving existing tickets, claims, checkpoints, receipts and runs.

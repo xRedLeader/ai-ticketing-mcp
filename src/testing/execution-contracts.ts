@@ -163,57 +163,50 @@ export function registerExecutionContractTests(
       );
     },
   );
-  check(
-    'runs an accepted job after claim expiry and fences duplicate reservations and terminal writes',
-    async (f) => {
-      const receipt = await f.submit();
-      f.clock.now = new Date(f.clock.now.getTime() + 11 * 60_000);
-      assert.deepEqual(
-        (await f.app.listExecutionRuns(f.admin.id, f.project.id)).map((run) => run.id),
-        [receipt.run_id],
-      );
-      const reservations = await Promise.all(
-        [1, 2].map(() => f.app.reserveExecutionRun(f.admin.id, f.project.id, receipt.run_id, 60_000)),
-      );
-      assert.equal(reservations.filter(Boolean).length, 1);
-      const run = reservations.find(Boolean)!;
-      assert.equal(
-        await f.app.startExecutionRun(f.admin.id, f.project.id, run.id, randomUUID(), 60_000),
-        null,
-      );
-      assert.ok(
-        await f.app.startExecutionRun(f.admin.id, f.project.id, run.id, run.reservation_token!, 60_000),
-      );
-      assert.equal(
-        await f.app.settleExecutionRun(f.admin.id, f.project.id, run.id, randomUUID(), outcome),
-        false,
-      );
-      assert.equal(
-        await f.app.heartbeatExecutionRun(f.admin.id, f.project.id, run.id, run.reservation_token!, 60_000),
-        true,
-      );
-      assert.equal(
-        await f.app.settleExecutionRun(f.admin.id, f.project.id, run.id, run.reservation_token!, outcome),
-        true,
-      );
-      assert.equal(
-        await f.app.settleExecutionRun(f.admin.id, f.project.id, run.id, run.reservation_token!, outcome),
-        true,
-      );
-      assert.equal(
-        await f.app.settleExecutionRun(f.admin.id, f.project.id, run.id, run.reservation_token!, {
-          ...outcome,
-          exit_code: 1,
-        }),
-        false,
-      );
-      const view = await f.get(run.id);
-      assert.equal(view.run.status, 'succeeded');
-      assert.equal(view.continuation.status, 'satisfied');
-      assert.deepEqual(view.run.artifacts, outcome.artifacts);
-      assert.deepEqual(await f.submit(), receipt);
-    },
-  );
+  check('fences duplicate reservations and terminal writes while the claim is current', async (f) => {
+    const receipt = await f.submit();
+    assert.deepEqual(
+      (await f.app.listExecutionRuns(f.admin.id, f.project.id)).map((run) => run.id),
+      [receipt.run_id],
+    );
+    const reservations = await Promise.all(
+      [1, 2].map(() => f.app.reserveExecutionRun(f.admin.id, f.project.id, receipt.run_id, 60_000)),
+    );
+    assert.equal(reservations.filter(Boolean).length, 1);
+    const run = reservations.find(Boolean)!;
+    assert.equal(await f.app.startExecutionRun(f.admin.id, f.project.id, run.id, randomUUID(), 60_000), null);
+    assert.ok(
+      await f.app.startExecutionRun(f.admin.id, f.project.id, run.id, run.reservation_token!, 60_000),
+    );
+    assert.equal(
+      await f.app.settleExecutionRun(f.admin.id, f.project.id, run.id, randomUUID(), outcome),
+      false,
+    );
+    assert.equal(
+      await f.app.heartbeatExecutionRun(f.admin.id, f.project.id, run.id, run.reservation_token!, 60_000),
+      true,
+    );
+    assert.equal(
+      await f.app.settleExecutionRun(f.admin.id, f.project.id, run.id, run.reservation_token!, outcome),
+      true,
+    );
+    assert.equal(
+      await f.app.settleExecutionRun(f.admin.id, f.project.id, run.id, run.reservation_token!, outcome),
+      true,
+    );
+    assert.equal(
+      await f.app.settleExecutionRun(f.admin.id, f.project.id, run.id, run.reservation_token!, {
+        ...outcome,
+        exit_code: 1,
+      }),
+      false,
+    );
+    const view = await f.get(run.id);
+    assert.equal(view.run.status, 'succeeded');
+    assert.equal(view.continuation.status, 'satisfied');
+    assert.deepEqual(view.run.artifacts, outcome.artifacts);
+    assert.deepEqual(await f.submit(), receipt);
+  });
   check(
     'preserves an authoritative result after requirements change and fails only its continuation',
     async (f) => {
@@ -348,7 +341,7 @@ export function registerExecutionContractTests(
           })) as any
         ).note.id;
       const answer = (answerTo: string) =>
-        f.call(f.worker.id, 'ticket_note', {
+        f.call(f.other.id, 'ticket_note', {
           ticket_id: f.ticket.id,
           kind: 'answer',
           body: 'Resolved.',

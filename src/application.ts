@@ -27,6 +27,12 @@ import {
   type ExecutionRecipeRegistration,
   type ExecutionJob,
   type ExecutionOutcome,
+  type ExecutionController,
+  type ExecutionControllerFence,
+  type ExecutionAttempt,
+  type ExecutionObservation,
+  type ExecutionProcessIdentity,
+  type ExecutionReconciliation,
   type Continuation,
   validateGitHubConfiguration,
 } from './contracts.js';
@@ -691,6 +697,7 @@ export class Application {
       ticket.requirements_revision === run.requirements_revision &&
       claim?.project_id === run.project_id &&
       claim.token === run.claim_token &&
+      claim.expires_at > this.timestamp() &&
       claim.actor_id === run.actor_id &&
       (!ticket.assignee_id || ticket.assignee_id === run.actor_id) &&
       (actor?.system_admin || (member && ['contributor', 'admin'].includes(member.role)))
@@ -736,6 +743,296 @@ export class Application {
     return new Date(this.now().getTime() + leaseMs).toISOString();
   }
   /** Trusted companion API; these methods are deliberately absent from the MCP catalog. */
+  async acquireExecutionController(
+    actorId: string,
+    projectId: string,
+    ownerId: string,
+    leaseMs: number,
+  ): Promise<ExecutionController | null> {
+    const expiresAt = this.executionLease(leaseMs);
+    ensure(
+      typeof ownerId === 'string' && ownerId.length > 0 && ownerId.length <= 200,
+      'INVALID_INPUT',
+      'Controller owner must be bounded.',
+    );
+    return this.storage.transaction('execution-controller', async (tx) => {
+      await this.access(tx, await this.actor(actorId, tx), projectId, ['admin']);
+      ensure(
+        tx.lockExecutionController,
+        'UNSUPPORTED_EXECUTION_RUNS',
+        'Storage does not support controller fencing.',
+      );
+      const previous = await tx.lockExecutionController();
+      if (previous && previous.expires_at > this.timestamp()) return null;
+      const next: ExecutionController = {
+        id: 'execution',
+        owner_id: ownerId,
+        token: randomUUID(),
+        generation: (previous?.generation ?? 0) + 1,
+        expires_at: expiresAt,
+      };
+      ensure(
+        Number.isSafeInteger(next.generation) && next.generation <= 2147483647,
+        'CONFLICT',
+        'Controller generation exhausted.',
+      );
+      await tx.put('execution_controllers', next);
+      return next;
+    });
+  }
+  async heartbeatExecutionController(
+    actorId: string,
+    projectId: string,
+    controller: ExecutionControllerFence,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const expiresAt = this.executionLease(leaseMs);
+    return this.storage.transaction('execution-controller', async (tx) => {
+      await this.access(tx, await this.actor(actorId, tx), projectId, ['admin']);
+      if (!(await this.currentExecutionController(tx, controller))) return false;
+      const current = (await tx.get('execution_controllers', 'execution'))!;
+      await tx.put('execution_controllers', { ...current, expires_at: expiresAt });
+      return true;
+    });
+  }
+  async releaseExecutionController(
+    actorId: string,
+    projectId: string,
+    controller: ExecutionControllerFence,
+  ): Promise<void> {
+    await this.storage.transaction('execution-controller', async (tx) => {
+      await this.access(tx, await this.actor(actorId, tx), projectId, ['admin']);
+      if (!(await this.currentExecutionController(tx, controller))) return;
+      const current = (await tx.get('execution_controllers', 'execution'))!;
+      await tx.put('execution_controllers', { ...current, expires_at: this.timestamp() });
+    });
+  }
+  private async currentExecutionController(tx: Transaction, controller?: ExecutionControllerFence) {
+    ensure(
+      tx.lockExecutionController,
+      'UNSUPPORTED_EXECUTION_RUNS',
+      'Storage does not support controller fencing.',
+    );
+    const current = await tx.lockExecutionController();
+    ensure(current, 'INVALID_REFERENCE', 'Execution controller singleton is missing.');
+    // The permanently locked singleton serializes legacy calls with the first acquisition too.
+    if (current.owner_id === 'unclaimed' && current.generation === 1) return !controller;
+    return (
+      !!controller &&
+      current.token === controller.token &&
+      current.generation === controller.generation &&
+      current.expires_at > this.timestamp()
+    );
+  }
+  private async executionClaimCurrent(reader: Reader, run: ExecutionJob) {
+    const claim = await reader.get('claims', run.ticket_id);
+    return (
+      claim?.token === run.claim_token &&
+      claim.actor_id === run.actor_id &&
+      claim.expires_at > this.timestamp()
+    );
+  }
+  private async executionAttempt(reader: Reader, runId: string) {
+    return (await reader.find('execution_attempts', { where: { run_id: runId }, limit: 1 }))[0] ?? null;
+  }
+  private async latestExecutionObservation(reader: Reader, attempt: ExecutionAttempt) {
+    return (
+      (
+        await reader.find('execution_observations', {
+          where: { attempt_id: attempt.id },
+          order: [{ field: 'sequence', direction: 'desc' }],
+          limit: 1,
+        })
+      )[0] ?? null
+    );
+  }
+  private async observeExecution(
+    tx: Transaction,
+    run: ExecutionJob,
+    attempt: ExecutionAttempt,
+    controller: ExecutionControllerFence | undefined,
+    kind: ExecutionObservation['kind'],
+    nextStep: ExecutionObservation['next_step'],
+    identity?: ExecutionProcessIdentity | null,
+    outcome: ExecutionOutcome | null = null,
+  ) {
+    const previous = await this.latestExecutionObservation(tx, attempt);
+    const observation: ExecutionObservation = {
+      id: randomUUID(),
+      project_id: run.project_id,
+      run_id: run.id,
+      attempt_id: attempt.id,
+      sequence: (previous?.sequence ?? 0) + 1,
+      controller_generation: controller?.generation ?? 0,
+      kind,
+      next_step: nextStep,
+      process_identity: identity === undefined ? (previous?.process_identity ?? null) : identity,
+      outcome,
+      created_at: this.timestamp(),
+    };
+    await tx.put('execution_observations', observation);
+    return observation;
+  }
+  private async executionReconciliation(reader: Reader, run: ExecutionJob): Promise<ExecutionReconciliation> {
+    const attempt = await this.executionAttempt(reader, run.id);
+    const observation = attempt ? await this.latestExecutionObservation(reader, attempt) : null;
+    const completed = ['succeeded', 'failed'].includes(run.status);
+    const state = completed
+      ? 'completed'
+      : run.status === 'queued'
+        ? 'queued'
+        : observation?.kind === 'running'
+          ? 'running'
+          : 'unresolved';
+    return {
+      run,
+      attempt,
+      observation,
+      state,
+      next_step: completed
+        ? 'none'
+        : (observation?.next_step ?? (run.status === 'queued' ? 'dispatch' : 'inspect_launch')),
+    };
+  }
+  async listExecutionReconciliations(
+    actorId: string,
+    projectId: string,
+    runIds?: string[],
+  ): Promise<ExecutionReconciliation[]> {
+    ensure(
+      !runIds || (runIds.length <= 100 && runIds.every((id) => uuid.test(id))),
+      'INVALID_INPUT',
+      'Provide at most 100 run identifiers.',
+    );
+    return this.storage.readSnapshot(async (reader) => {
+      await this.access(reader, await this.actor(actorId, reader), projectId, ['admin']);
+      const runs = await reader.find('execution_jobs', {
+        where: {
+          project_id: projectId,
+          ...(runIds
+            ? { id: { in: runIds } }
+            : { status: { in: ['reserved', 'running'] as ExecutionJob['status'][] } }),
+        },
+        order: [
+          { field: 'created_at', direction: 'asc' },
+          { field: 'id', direction: 'asc' },
+        ],
+        limit: 100,
+      });
+      const states: ExecutionReconciliation[] = [];
+      for (const run of runs) states.push(await this.executionReconciliation(reader, run));
+      return states;
+    });
+  }
+  /** Transfer observation rights only. An adopted attempt is never dispatched again. */
+  async adoptExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    controller: ExecutionControllerFence,
+    leaseMs: number,
+  ): Promise<ExecutionReconciliation | null> {
+    const lockedUntil = this.executionLease(leaseMs);
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (
+        !(await this.currentExecutionController(tx, controller)) ||
+        !['reserved', 'running'].includes(run.status)
+      )
+        return null;
+      let attempt = await this.executionAttempt(tx, run.id);
+      if (!attempt) {
+        attempt = {
+          id: randomUUID(),
+          project_id: projectId,
+          run_id: runId,
+          previous_attempt_id: null,
+          ordinal: 1,
+          process_token: randomUUID(),
+          created_at: this.timestamp(),
+        };
+        await tx.put('execution_attempts', attempt);
+      }
+      const previous = await this.latestExecutionObservation(tx, attempt);
+      const next = { ...run, reservation_token: randomUUID(), locked_until: lockedUntil };
+      if (!(await tx.compareExecutionRun!(run, next))) return null;
+      if (!previous)
+        await this.observeExecution(tx, next, attempt, controller, 'unresolved', 'inspect_launch');
+      return this.executionReconciliation(tx, next);
+    });
+  }
+  async observeExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    token: string,
+    attemptId: string,
+    processToken: string,
+    controller: ExecutionControllerFence,
+    identity: ExecutionProcessIdentity | null,
+    state: 'running' | 'unresolved',
+  ): Promise<boolean> {
+    ensure(
+      identity === null ||
+        (Number.isSafeInteger(identity.pid) &&
+          identity.pid > 0 &&
+          typeof identity.start_marker === 'string' &&
+          identity.start_marker.length > 0 &&
+          identity.start_marker.length <= 200),
+      'INVALID_INPUT',
+      'Provide a bounded process identity.',
+    );
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (
+        !(await this.currentExecutionController(tx, controller)) ||
+        run.reservation_token !== token ||
+        !run.locked_until ||
+        run.locked_until <= this.timestamp() ||
+        !['reserved', 'running'].includes(run.status)
+      )
+        return false;
+      const attempt = await this.executionAttempt(tx, runId);
+      if (
+        !attempt ||
+        attempt.id !== attemptId ||
+        attempt.process_token !== processToken ||
+        (state === 'running' && !(await this.executionClaimCurrent(tx, run)))
+      )
+        return false;
+      const previous = await this.latestExecutionObservation(tx, attempt);
+      if (previous?.kind === state && digest(previous.process_identity) === digest(identity)) return true;
+      await this.observeExecution(
+        tx,
+        run,
+        attempt,
+        controller,
+        state,
+        state === 'running' ? 'wait_for_result' : 'inspect_side_effects',
+        identity,
+      );
+      return true;
+    });
+  }
+  async recoverExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    token: string,
+    attemptId: string,
+    processToken: string,
+    outcome: ExecutionOutcome,
+    controller: ExecutionControllerFence,
+  ): Promise<boolean> {
+    // Attempt credentials are immutable; the rotating reservation and controller fence authorize replay.
+    const attempt = await this.storage.get('execution_attempts', attemptId);
+    if (
+      !attempt ||
+      attempt.run_id !== runId ||
+      attempt.project_id !== projectId ||
+      attempt.process_token !== processToken
+    )
+      return false;
+    return this.settleExecutionRun(actorId, projectId, runId, token, outcome, controller, true);
+  }
   async listExecutionRuns(actorId: string, projectId: string): Promise<ExecutionJob[]> {
     ensure(uuid.test(projectId), 'INVALID_INPUT', 'Project identifier must be a UUID.');
     ensure(
@@ -771,17 +1068,35 @@ export class Application {
     projectId: string,
     runId: string,
     leaseMs: number,
+    controller?: ExecutionControllerFence,
   ): Promise<ExecutionJob | null> {
     const lockedUntil = this.executionLease(leaseMs);
     return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
-      if (run.status !== 'queued' || !(await this.executionAuthority(tx, run))) return null;
+      if (
+        !(await this.currentExecutionController(tx, controller)) ||
+        run.status !== 'queued' ||
+        !(await this.executionAuthority(tx, run))
+      )
+        return null;
       const next: ExecutionJob = {
         ...run,
         status: 'reserved',
         reservation_token: randomUUID(),
         locked_until: lockedUntil,
       };
-      return (await tx.compareExecutionRun!(run, next)) ? next : null;
+      if (!(await tx.compareExecutionRun!(run, next))) return null;
+      const attempt: ExecutionAttempt = {
+        id: randomUUID(),
+        project_id: projectId,
+        run_id: runId,
+        previous_attempt_id: null,
+        ordinal: 1,
+        process_token: randomUUID(),
+        created_at: this.timestamp(),
+      };
+      await tx.put('execution_attempts', attempt);
+      await this.observeExecution(tx, next, attempt, controller, 'reserved', 'dispatch');
+      return next;
     });
   }
   async startExecutionRun(
@@ -790,10 +1105,12 @@ export class Application {
     runId: string,
     token: string,
     leaseMs: number,
+    controller?: ExecutionControllerFence,
   ): Promise<ExecutionJob | null> {
     const lockedUntil = this.executionLease(leaseMs);
     return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
       if (
+        !(await this.currentExecutionController(tx, controller)) ||
         run.status !== 'reserved' ||
         run.reservation_token !== token ||
         !run.locked_until ||
@@ -810,7 +1127,11 @@ export class Application {
         started_at: this.timestamp(),
         locked_until: lockedUntil,
       };
-      return (await tx.compareExecutionRun!(run, next)) ? next : null;
+      if (!(await tx.compareExecutionRun!(run, next))) return null;
+      const attempt = await this.executionAttempt(tx, runId);
+      if (attempt)
+        await this.observeExecution(tx, next, attempt, controller, 'dispatching', 'inspect_launch');
+      return next;
     });
   }
   async heartbeatExecutionRun(
@@ -819,10 +1140,13 @@ export class Application {
     runId: string,
     token: string,
     leaseMs: number,
+    controller?: ExecutionControllerFence,
   ): Promise<boolean> {
     const lockedUntil = this.executionLease(leaseMs);
     return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
       if (
+        !(await this.currentExecutionController(tx, controller)) ||
+        (controller && !(await this.executionClaimCurrent(tx, run))) ||
         !['reserved', 'running'].includes(run.status) ||
         run.reservation_token !== token ||
         !run.locked_until ||
@@ -838,6 +1162,8 @@ export class Application {
     runId: string,
     token: string,
     outcome: ExecutionOutcome,
+    controller?: ExecutionControllerFence,
+    recovery = false,
   ): Promise<boolean> {
     ensure(
       (outcome.exit_code === null ||
@@ -862,7 +1188,12 @@ export class Application {
       error_code: outcome.error_code,
     };
     return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
-      if (run.reservation_token !== token) return false;
+      if (
+        !(await this.currentExecutionController(tx, controller)) ||
+        run.reservation_token !== token ||
+        (!recovery && controller && !(await this.executionClaimCurrent(tx, run)))
+      )
+        return false;
       if (['succeeded', 'failed'].includes(run.status))
         return (
           digest({
@@ -888,6 +1219,9 @@ export class Application {
         finished_at: finishedAt,
       };
       if (!(await tx.compareExecutionRun!(run, next))) return false;
+      const attempt = await this.executionAttempt(tx, runId);
+      if (attempt)
+        await this.observeExecution(tx, next, attempt, controller, 'completed', 'none', undefined, result);
       const continuation = await tx.get('continuations', run.continuation_id);
       ensure(
         continuation?.project_id === projectId && continuation.run_id === run.id,
@@ -1743,7 +2077,18 @@ export class Application {
           'INVALID_REFERENCE',
           'Execution checkpoint or continuation is missing.',
         );
-        return { run, continuation, checkpoint, stale: !(await this.executionAuthority(reader, run)) };
+        const recovery = await this.executionReconciliation(reader, run);
+        return {
+          run,
+          continuation,
+          checkpoint,
+          stale: !(await this.executionAuthority(reader, run)),
+          reconciliation: {
+            state: recovery.state,
+            next_step: recovery.next_step,
+            attempt_id: recovery.attempt?.id ?? null,
+          },
+        };
       });
     if (operation === 'ticket_context') {
       const snapshot = await this.storage.readSnapshot(async (reader) => {

@@ -1,12 +1,22 @@
 import { randomUUID } from 'node:crypto';
-import { spawn, type ChildProcess } from 'node:child_process';
-import { closeSync, fsyncSync, mkdirSync, openSync, realpathSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdirSync, realpathSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Application } from './application.js';
-import { ensure, type ExecutionJob } from './contracts.js';
-import { HostCapacity, type HostCapacityLease } from './host-capacity.js';
-import { ExecutionRecipeRegistry, type ExecutionRecipe } from './execution-recipes.js';
+import {
+  ensure,
+  type ExecutionControllerFence,
+  type ExecutionOutcome,
+  type ExecutionProcessIdentity,
+  type ExecutionReconciliation,
+} from './contracts.js';
+import { HostCapacity } from './host-capacity.js';
+import { ExecutionRecipeRegistry } from './execution-recipes.js';
+import { durableExecutionFile, executionProcessIdentity, readExecutionFile } from './execution-journal.js';
+import type { ExecutionManifest } from './execution-supervisor.js';
 
 export type ExecutionApplication = Pick<
   Application,
@@ -15,6 +25,13 @@ export type ExecutionApplication = Pick<
   | 'startExecutionRun'
   | 'heartbeatExecutionRun'
   | 'settleExecutionRun'
+  | 'acquireExecutionController'
+  | 'heartbeatExecutionController'
+  | 'releaseExecutionController'
+  | 'listExecutionReconciliations'
+  | 'adoptExecutionRun'
+  | 'observeExecutionRun'
+  | 'recoverExecutionRun'
 >;
 export interface ExecutionCompanionOptions {
   application: ExecutionApplication;
@@ -26,31 +43,22 @@ export interface ExecutionCompanionOptions {
   artifacts_directory: string;
 }
 const LEASE_MS = 60_000;
-const HEARTBEAT_MS = 10_000;
-const CAPACITY_WAIT_MS = 30_000;
-type Terminal = {
-  exit_code: number | null;
-  signal: string | null;
-  error_code: string | null;
-  artifacts: string[];
+type ResultJournal = ExecutionOutcome & {
+  run_id: string;
+  attempt_id?: string;
+  process_token?: string;
+  recipe_fingerprint: string;
+  started_at: number;
+  finished_at: number;
+  cleanup_verified: boolean;
+  spawned?: boolean;
 };
 
-function durableFile(path: string, value: unknown) {
-  const fd = openSync(path, 'wx', 0o600);
-  try {
-    writeFileSync(fd, JSON.stringify(value) + '\n');
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-}
-
-/** Separate operator process: no MCP transport, model provider, retry or abandoned-execution takeover. */
+/** One renewable controller per store; recovered attempts are inspected, never relaunched. */
 export class ExecutionCompanion {
   private readonly owner = randomUUID();
   private readonly directory: string;
   private readonly heartbeatMs: number;
-
   constructor(private readonly options: ExecutionCompanionOptions) {
     ensure(
       isAbsolute(options.artifacts_directory),
@@ -59,325 +67,454 @@ export class ExecutionCompanion {
     );
     mkdirSync(options.artifacts_directory, { recursive: true, mode: 0o700 });
     this.directory = realpathSync(options.artifacts_directory);
-    // All companions for this physical host must use the same immutable capacity configuration/file.
     this.heartbeatMs = Math.max(
       1,
-      Math.min(HEARTBEAT_MS, Math.floor(options.capacity.inspect(options.host_id).config.lease_ms / 3)),
+      Math.min(10_000, Math.floor(options.capacity.inspect(options.host_id).config.lease_ms / 3)),
     );
   }
-
-  /** Runs at most one queued job; reservations are never reclaimed or relaunched after a crash. */
   async runOnce(signal?: AbortSignal): Promise<boolean> {
     const { application: app, actor_id: actor, project_id: project, capacity, host_id: host } = this.options;
     signal?.throwIfAborted();
-    const candidates = await app.listExecutionRuns(actor, project);
-    for (const candidate of candidates) {
-      const job = await app.reserveExecutionRun(actor, project, candidate.id, LEASE_MS);
-      if (!job) continue;
-      const token = job.reservation_token!;
-      let recipe: ExecutionRecipe;
-      try {
-        recipe = this.options.recipes.get(job.recipe_id, job.recipe_fingerprint, project);
-      } catch {
-        await app.settleExecutionRun(actor, project, job.id, token, {
-          exit_code: null,
-          signal: null,
-          artifacts: [],
-          error_code: 'RECIPE_UNAVAILABLE',
-        });
-        return true;
-      }
-      try {
-        capacity.enqueue(host, {
-          queue_id: job.id,
-          run_id: job.id,
-          project_id: project,
-          kind: 'script',
-          resources: { ...recipe.resources },
-          timeout_ms: recipe.timeout_ms,
-          created_at: Date.parse(job.created_at),
-        });
-      } catch (error) {
-        await app.settleExecutionRun(actor, project, job.id, token, {
-          exit_code: null,
-          signal: null,
-          artifacts: [],
-          error_code: 'CAPACITY_REJECTED',
-        });
-        throw error;
-      }
-      let admission: ReturnType<HostCapacity['claimNext']>;
-      const capacityDeadline = Date.now() + CAPACITY_WAIT_MS;
-      while (true) {
-        admission = capacity.claimNext(host, this.owner, { kind: 'script', queue_ids: [job.id] });
-        if (admission.admitted) break;
-        if (
-          signal?.aborted ||
-          Date.now() >= capacityDeadline ||
-          !(await app.heartbeatExecutionRun(actor, project, job.id, token, LEASE_MS))
-        ) {
-          capacity.cancel(host, job.id);
-          await app.settleExecutionRun(actor, project, job.id, token, {
-            exit_code: null,
-            signal: null,
-            artifacts: [],
-            error_code: Date.now() >= capacityDeadline ? 'CAPACITY_TIMEOUT' : 'NOT_STARTED',
-          });
-          return true;
-        }
-        await delay(1000);
-      }
-      const lease = admission.lease,
-        executionToken = admission.request.execution_token!;
-      let spawned = false,
-        settled = false;
-      const observedAt = () => Date.now();
-      try {
-        const started = await app.startExecutionRun(actor, project, job.id, token, LEASE_MS);
-        if (!started) {
-          const stored = await app.settleExecutionRun(actor, project, job.id, token, {
-            exit_code: null,
-            signal: null,
-            artifacts: [],
-            error_code: 'NOT_STARTED',
-          });
-          if (stored)
-            capacity.reconcile(lease, {
-              source: 'execution-companion',
-              execution_token: executionToken,
-              observed_at: observedAt(),
-              state: 'never_started',
-              script_result: { outcome: 'cancelled', runtime_ms: 0 },
-            });
-          return true;
-        }
-        const outcome = await this.execute(started, recipe, lease, signal, () => {
-          spawned = true;
-        });
-        // Persist authentic outcome before releasing the separately stored host slot.
-        const stored = await app.settleExecutionRun(actor, project, job.id, token, outcome.result);
-        settled = stored;
-        ensure(stored, 'CONFLICT', 'Execution result could not be fenced; host capacity remains occupied.');
-        capacity.reconcile(lease, {
-          source: 'execution-companion',
-          execution_token: executionToken,
-          observed_at: outcome.finished_at,
-          state: outcome.spawned ? 'terminated' : 'never_started',
-          script_result: {
-            outcome: outcome.spawned
-              ? outcome.result.exit_code === 0 && !outcome.result.error_code
-                ? 'succeeded'
-                : 'failed'
-              : 'cancelled',
-            runtime_ms: outcome.spawned ? outcome.runtime_ms : 0,
+    const controller = await app.acquireExecutionController(actor, project, this.owner, LEASE_MS);
+    if (!controller) return false;
+    let owned = true,
+      busy = false;
+    const heartbeat = setInterval(() => {
+      if (busy) return;
+      busy = true;
+      void app
+        .heartbeatExecutionController(actor, project, controller, LEASE_MS)
+        .then(
+          (ok) => {
+            owned &&= ok;
           },
+          () => {
+            owned = false;
+          },
+        )
+        .finally(() => {
+          busy = false;
         });
-        return true;
-      } catch (error) {
-        // A crash or lost fence is not evidence that an admitted process stopped.
-        if (!spawned && !settled) {
-          const stored = await app.settleExecutionRun(actor, project, job.id, token, {
-            exit_code: null,
-            signal: null,
-            artifacts: [],
-            error_code: 'NOT_STARTED',
-          });
-          if (stored)
-            capacity.reconcile(lease, {
-              source: 'execution-companion',
-              execution_token: executionToken,
-              observed_at: observedAt(),
-              state: 'never_started',
-              script_result: { outcome: 'cancelled', runtime_ms: 0 },
-            });
-        }
-        throw error;
+    }, this.heartbeatMs);
+    try {
+      const recovery = await app.listExecutionReconciliations(actor, project);
+      const occupied = capacity
+        .inspect(host)
+        .entries.filter((entry) => ['running', 'reconciling'].includes(entry.state));
+      const terminal = occupied.length
+        ? await app.listExecutionReconciliations(
+            actor,
+            project,
+            occupied.slice(0, 100).map((entry) => entry.queue_id),
+          )
+        : [];
+      for (const original of [
+        ...new Map([...recovery, ...terminal].map((value) => [value.run.id, value])).values(),
+      ]) {
+        if (!owned) return false;
+        await this.reconcile(original, controller);
       }
+      for (const candidate of await app.listExecutionRuns(actor, project)) {
+        if (!owned) return false;
+        const job = await app.reserveExecutionRun(actor, project, candidate.id, LEASE_MS, controller);
+        if (!job) continue;
+        const token = job.reservation_token!;
+        let recipe;
+        try {
+          recipe = this.options.recipes.get(job.recipe_id, job.recipe_fingerprint, project);
+        } catch {
+          await app.settleExecutionRun(
+            actor,
+            project,
+            job.id,
+            token,
+            { exit_code: null, signal: null, artifacts: [], error_code: 'RECIPE_UNAVAILABLE' },
+            controller,
+          );
+          return true;
+        }
+        try {
+          capacity.enqueue(host, {
+            queue_id: job.id,
+            run_id: job.id,
+            project_id: project,
+            kind: 'script',
+            resources: { ...recipe.resources },
+            timeout_ms: recipe.timeout_ms,
+            created_at: Date.parse(job.created_at),
+          });
+        } catch (error) {
+          await app.settleExecutionRun(
+            actor,
+            project,
+            job.id,
+            token,
+            { exit_code: null, signal: null, artifacts: [], error_code: 'CAPACITY_REJECTED' },
+            controller,
+          );
+          throw error;
+        }
+        const capacityDeadline = Date.now() + 30_000;
+        let admission: ReturnType<HostCapacity['claimNext']>;
+        while (true) {
+          admission = capacity.claimNext(host, this.owner, { kind: 'script', queue_ids: [job.id] });
+          if (admission.admitted) break;
+          if (
+            !owned ||
+            signal?.aborted ||
+            Date.now() >= capacityDeadline ||
+            !(await app.heartbeatExecutionRun(actor, project, job.id, token, LEASE_MS, controller))
+          ) {
+            capacity.cancel(host, job.id);
+            await app.settleExecutionRun(
+              actor,
+              project,
+              job.id,
+              token,
+              { exit_code: null, signal: null, artifacts: [], error_code: 'NOT_STARTED' },
+              controller,
+            );
+            return true;
+          }
+          await delay(1000);
+        }
+        const started = await app.startExecutionRun(actor, project, job.id, token, LEASE_MS, controller);
+        if (!started) {
+          const stored = await app.settleExecutionRun(
+            actor,
+            project,
+            job.id,
+            token,
+            { exit_code: null, signal: null, artifacts: [], error_code: 'NOT_STARTED' },
+            controller,
+          );
+          if (stored)
+            this.releaseCapacity(job.id, {
+              started_at: 0,
+              finished_at: Date.now(),
+              spawned: false,
+              exit_code: null,
+              error_code: 'NOT_STARTED',
+            });
+          return true;
+        }
+        const state = (await app.listExecutionReconciliations(actor, project, [job.id]))[0]!;
+        ensure(state.attempt, 'INVALID_REFERENCE', 'Execution attempt is missing.');
+        const directory = join(this.directory, job.id, state.attempt.id);
+        mkdirSync(directory, { recursive: true, mode: 0o700 });
+        const manifest: ExecutionManifest = {
+          run_id: job.id,
+          attempt_id: state.attempt.id,
+          process_token: state.attempt.process_token,
+          recipe_fingerprint: recipe.fingerprint,
+        };
+        durableExecutionFile(join(directory, 'manifest.json'), manifest);
+        let supervisor = fileURLToPath(new URL('./execution-supervisor.js', import.meta.url));
+        if (!existsSync(supervisor)) supervisor = supervisor.replace(/\.js$/, '.ts');
+        const args = supervisor.endsWith('.ts')
+          ? [
+              '--import',
+              pathToFileURL(createRequire(import.meta.url).resolve('tsx')).href,
+              supervisor,
+              directory,
+            ]
+          : [supervisor, directory];
+        const child = spawn(process.execPath, args, {
+          detached: true,
+          windowsHide: true,
+          stdio: ['pipe', 'ignore', 'ignore'],
+        });
+        child.stdin!.on('error', () => {
+          /* Broken launch input is ambiguous; reconciliation retains the attempt. */
+        });
+        child.stdin!.end(JSON.stringify(recipe));
+        let supervisorExited = false;
+        child.once('exit', () => {
+          supervisorExited = true;
+        });
+        const spawned = await new Promise<boolean>((resolve) => {
+          child.once('spawn', () => resolve(true));
+          child.once('error', () => resolve(false));
+        });
+        child.unref();
+        if (!spawned) {
+          const stored = await app.settleExecutionRun(
+            actor,
+            project,
+            job.id,
+            token,
+            { exit_code: null, signal: null, artifacts: [], error_code: 'SPAWN_FAILED' },
+            controller,
+          );
+          if (stored)
+            this.releaseCapacity(job.id, {
+              started_at: 0,
+              finished_at: Date.now(),
+              spawned: false,
+              exit_code: null,
+              error_code: 'SPAWN_FAILED',
+            });
+          return true;
+        }
+        const deadline = Date.now() + recipe.timeout_ms + 20_000;
+        let renewedAt = Date.now(),
+          acknowledged = false;
+        while (Date.now() <= deadline) {
+          if (!owned) throw new Error('Execution controller ownership lost; reconciliation is required.');
+          if (signal?.aborted && !existsSync(join(directory, 'cancel.json')))
+            durableExecutionFile(join(directory, 'cancel.json'), { reason: 'CANCELLED' });
+          const result = this.result(state, directory);
+          if (result) {
+            ensure(
+              result.cleanup_verified,
+              'CONFLICT',
+              'Process tree termination was not verified; host capacity remains occupied.',
+            );
+            const stored = await app.recoverExecutionRun(
+              actor,
+              project,
+              job.id,
+              token,
+              state.attempt.id,
+              state.attempt.process_token,
+              this.outcome(result),
+              controller,
+            );
+            ensure(
+              stored,
+              'CONFLICT',
+              'Execution result could not be fenced; host capacity remains occupied.',
+            );
+            this.releaseCapacity(job.id, result);
+            return true;
+          }
+          if (supervisorExited) break;
+          if (!acknowledged) {
+            const identity = this.liveIdentity(state, directory);
+            if (identity)
+              acknowledged = await app.observeExecutionRun(
+                actor,
+                project,
+                job.id,
+                token,
+                state.attempt.id,
+                state.attempt.process_token,
+                controller,
+                identity,
+                'running',
+              );
+          }
+          if (Date.now() - renewedAt >= this.heartbeatMs) {
+            const ok = await app.heartbeatExecutionRun(actor, project, job.id, token, LEASE_MS, controller);
+            if (!ok && !existsSync(join(directory, 'cancel.json')))
+              durableExecutionFile(join(directory, 'cancel.json'), { reason: 'OWNERSHIP_LOST' });
+            capacity.heartbeat(admission.lease);
+            renewedAt = Date.now();
+          }
+          await delay(100);
+        }
+        await app.observeExecutionRun(
+          actor,
+          project,
+          job.id,
+          token,
+          state.attempt.id,
+          state.attempt.process_token,
+          controller,
+          null,
+          'unresolved',
+        );
+        throw new Error('Execution result is unresolved; inspect launch and side effects before retry.');
+      }
+      return false;
+    } finally {
+      clearInterval(heartbeat);
+      await app.releaseExecutionController(actor, project, controller);
     }
-    return false;
   }
-
+  private outcome(result: ExecutionOutcome): ExecutionOutcome {
+    return {
+      exit_code: result.exit_code,
+      signal: result.signal,
+      artifacts: result.artifacts,
+      error_code: result.error_code,
+    };
+  }
+  private journal(directory: string, name: string): any {
+    try {
+      return readExecutionFile(join(directory, name));
+    } catch {
+      return null;
+    }
+  }
+  private matches(state: ExecutionReconciliation, journal: any) {
+    return (
+      journal?.run_id === state.run.id &&
+      journal.recipe_fingerprint === state.run.recipe_fingerprint &&
+      journal.attempt_id === state.attempt?.id &&
+      journal.process_token === state.attempt?.process_token
+    );
+  }
+  private result(state: ExecutionReconciliation, directory: string): ResultJournal | null {
+    const result = this.journal(directory, 'result.json');
+    if (!this.matches(state, result) || !this.validResult(result)) return null;
+    return result;
+  }
+  private validResult(result: any): result is ResultJournal {
+    return (
+      !!result &&
+      typeof result.cleanup_verified === 'boolean' &&
+      Number.isSafeInteger(result.started_at) &&
+      Number.isSafeInteger(result.finished_at) &&
+      result.started_at <= result.finished_at &&
+      result.finished_at <= Date.now() &&
+      (result.exit_code === null ||
+        (Number.isSafeInteger(result.exit_code) &&
+          result.exit_code >= -2147483648 &&
+          result.exit_code <= 4294967295)) &&
+      (result.signal === null ||
+        (typeof result.signal === 'string' && result.signal.length > 0 && result.signal.length <= 80)) &&
+      (result.error_code === null ||
+        (typeof result.error_code === 'string' && /^[A-Z0-9_]{1,80}$/.test(result.error_code))) &&
+      Array.isArray(result.artifacts) &&
+      result.artifacts.length <= 50 &&
+      result.artifacts.every(
+        (value: unknown) => typeof value === 'string' && value.length > 0 && value.length <= 2000,
+      ) &&
+      (result.exit_code !== null || result.signal !== null || result.error_code !== null)
+    );
+  }
+  private liveIdentity(state: ExecutionReconciliation, directory: string): ExecutionProcessIdentity | null {
+    for (const name of ['process.json', 'supervisor.json']) {
+      const journal = this.journal(directory, name);
+      if (!this.matches(state, journal) || !journal.identity) continue;
+      const current = executionProcessIdentity(journal.identity.pid);
+      if (current?.start_marker === journal.identity.start_marker) return current;
+    }
+    return null;
+  }
+  private async reconcile(original: ExecutionReconciliation, controller: ExecutionControllerFence) {
+    const { application: app, actor_id: actor, project_id: project, capacity, host_id: host } = this.options;
+    if (original.state === 'completed') {
+      const directory = original.attempt
+        ? join(this.directory, original.run.id, original.attempt.id)
+        : join(this.directory, original.run.id);
+      const result =
+        (original.attempt ? this.result(original, directory) : null) ?? this.legacyResult(original);
+      if (
+        result?.cleanup_verified &&
+        JSON.stringify(this.outcome(result)) === JSON.stringify(this.outcome(original.run))
+      )
+        this.releaseCapacity(original.run.id, result);
+      return;
+    }
+    const state = await app.adoptExecutionRun(actor, project, original.run.id, controller, LEASE_MS);
+    if (!state?.attempt) return;
+    const directory = join(this.directory, state.run.id, state.attempt.id);
+    const result = this.result(state, directory) ?? this.legacyResult(state);
+    if (result?.cleanup_verified) {
+      if (
+        await app.recoverExecutionRun(
+          actor,
+          project,
+          state.run.id,
+          state.run.reservation_token!,
+          state.attempt.id,
+          state.attempt.process_token,
+          this.outcome(result),
+          controller,
+        )
+      )
+        this.releaseCapacity(state.run.id, result);
+      return;
+    }
+    if (state.next_step === 'dispatch') {
+      const outcome = {
+        exit_code: null,
+        signal: null,
+        artifacts: [],
+        error_code: 'RECOVERED_NOT_DISPATCHED',
+      };
+      if (
+        await app.recoverExecutionRun(
+          actor,
+          project,
+          state.run.id,
+          state.run.reservation_token!,
+          state.attempt.id,
+          state.attempt.process_token,
+          outcome,
+          controller,
+        )
+      ) {
+        const entry = capacity.inspect(host).entries.find((entry) => entry.queue_id === state.run.id);
+        if (entry?.state === 'queued') capacity.cancel(host, state.run.id);
+        else
+          this.releaseCapacity(state.run.id, {
+            ...outcome,
+            started_at: 0,
+            finished_at: Date.now(),
+            spawned: false,
+          });
+      }
+      return;
+    }
+    const identity = result ? null : this.liveIdentity(state, directory);
+    await app.observeExecutionRun(
+      actor,
+      project,
+      state.run.id,
+      state.run.reservation_token!,
+      state.attempt.id,
+      state.attempt.process_token,
+      controller,
+      identity,
+      identity ? 'running' : 'unresolved',
+    );
+  }
+  private legacyResult(state: ExecutionReconciliation): ResultJournal | null {
+    const directory = join(this.directory, state.run.id);
+    const execution = this.journal(directory, 'execution.json'),
+      result = this.journal(directory, 'result.json');
+    if (
+      execution?.run_id !== state.run.id ||
+      execution.recipe_fingerprint !== state.run.recipe_fingerprint ||
+      result?.run_id !== state.run.id ||
+      result.recipe_fingerprint !== state.run.recipe_fingerprint ||
+      !this.validResult(result) ||
+      result.cleanup_verified !== true ||
+      (state.attempt && existsSync(join(directory, state.attempt.id, 'manifest.json')))
+    )
+      return null;
+    return { ...result, spawned: result.error_code !== 'SPAWN_FAILED' };
+  }
+  private releaseCapacity(
+    runId: string,
+    result: Pick<ResultJournal, 'started_at' | 'finished_at' | 'exit_code' | 'error_code' | 'spawned'>,
+  ) {
+    const { capacity, host_id: host } = this.options;
+    const entry = capacity.inspect(host).entries.find((entry) => entry.queue_id === runId);
+    if (!entry?.lease || !['running', 'reconciling'].includes(entry.state)) return;
+    const takeover = capacity.takeOver(host, runId, entry.lease.generation, this.owner);
+    capacity.reconcile(takeover.lease, {
+      source: 'execution-companion-recovery',
+      execution_token: takeover.execution_token!,
+      observed_at: result.finished_at,
+      state: result.spawned === false ? 'never_started' : 'terminated',
+      script_result: {
+        outcome:
+          result.spawned === false
+            ? 'cancelled'
+            : result.exit_code === 0 && !result.error_code
+              ? 'succeeded'
+              : 'failed',
+        runtime_ms: result.spawned === false ? 0 : result.finished_at - result.started_at,
+      },
+    });
+  }
   async run(signal?: AbortSignal) {
     while (!signal?.aborted) {
       if (!(await this.runOnce(signal))) await delay(1000, undefined, { signal });
     }
   }
-
-  private async execute(
-    job: ExecutionJob,
-    recipe: ExecutionRecipe,
-    lease: HostCapacityLease,
-    signal: AbortSignal | undefined,
-    onSpawn: () => void,
-  ) {
-    const { application: app, capacity, actor_id: actor, project_id: project } = this.options;
-    const directory = join(this.directory, job.id);
-    mkdirSync(directory, { mode: 0o700 });
-    const stdout = openSync(join(directory, 'stdout.log'), 'wx', 0o600);
-    let stderr: number;
-    try {
-      stderr = openSync(join(directory, 'stderr.log'), 'wx', 0o600);
-    } catch (error) {
-      closeSync(stdout);
-      throw error;
-    }
-    const started = Date.now(),
-      bytes = { stdout: 0, stderr: 0 },
-      truncated = { stdout: false, stderr: false };
-    let child: ChildProcess | undefined,
-      spawned = false,
-      terminalObserved = false,
-      errorCode: string | null = null;
-    let stopping: Promise<boolean> | undefined,
-      cleanupVerified = true,
-      heartbeatBusy = false;
-    let timeout: NodeJS.Timeout | undefined,
-      heartbeat: NodeJS.Timeout | undefined,
-      cleanupDeadline: NodeJS.Timeout | undefined;
-    let rejectUnverified: ((reason: Error) => void) | undefined;
-    const stop = (reason: string) => {
-      if (terminalObserved) return;
-      errorCode ??= reason;
-      if (!child || stopping) return;
-      stopping = terminateTree(child);
-      void stopping.then(
-        (verified) => {
-          cleanupVerified = verified;
-        },
-        () => {
-          cleanupVerified = false;
-        },
-      );
-      cleanupDeadline = setTimeout(() => {
-        child?.unref();
-        child?.stdout?.destroy();
-        child?.stderr?.destroy();
-        rejectUnverified?.(
-          new Error('Process termination was not observed; host capacity remains occupied.'),
-        );
-      }, 15_000);
-    };
-    const abort = () => stop('CANCELLED');
-    try {
-      durableFile(join(directory, 'execution.json'), {
-        run_id: job.id,
-        recipe_id: recipe.id,
-        recipe_fingerprint: recipe.fingerprint,
-        capacity_lease: lease,
-        started_at: started,
-      });
-      ensure(
-        await app.heartbeatExecutionRun(actor, project, job.id, job.reservation_token!, LEASE_MS),
-        'CONFLICT',
-        'Execution ownership expired before spawn.',
-      );
-      capacity.heartbeat(lease);
-      signal?.throwIfAborted();
-      child = spawn(recipe.executable, [...recipe.argv], {
-        cwd: recipe.cwd,
-        env: { ...recipe.env },
-        shell: false,
-        windowsHide: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      const terminal = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-        (resolve, reject) => {
-          rejectUnverified = reject;
-          child!.once('spawn', () => {
-            spawned = true;
-            onSpawn();
-          });
-          child!.on('error', () => {
-            errorCode ??= spawned ? 'PROCESS_ERROR' : 'SPAWN_FAILED';
-          });
-          child!.once('close', (code, closeSignal) => {
-            terminalObserved = true;
-            resolve({ code, signal: closeSignal });
-          });
-        },
-      );
-      const capture = (stream: 'stdout' | 'stderr', fd: number) => (chunk: Buffer) => {
-        const length = Math.min(chunk.length, Math.max(0, recipe.max_log_bytes - bytes[stream]));
-        try {
-          if (length) writeFileSync(fd, chunk.subarray(0, length));
-        } catch {
-          stop('LOG_WRITE_FAILED');
-        }
-        bytes[stream] += length;
-        if (length < chunk.length) truncated[stream] = true;
-      };
-      child.stdout!.on('data', capture('stdout', stdout));
-      child.stderr!.on('data', capture('stderr', stderr));
-      child.stdout!.on('error', () => stop('LOG_READ_FAILED'));
-      child.stderr!.on('error', () => stop('LOG_READ_FAILED'));
-      timeout = setTimeout(() => stop('TIMEOUT'), recipe.timeout_ms);
-      heartbeat = setInterval(() => {
-        if (heartbeatBusy) return;
-        heartbeatBusy = true;
-        void (async () => {
-          try {
-            if (!(await app.heartbeatExecutionRun(actor, project, job.id, job.reservation_token!, LEASE_MS)))
-              return stop('OWNERSHIP_LOST');
-            if (terminalObserved) return;
-            capacity.heartbeat(lease);
-          } catch {
-            stop('OWNERSHIP_LOST');
-          } finally {
-            heartbeatBusy = false;
-          }
-        })();
-      }, this.heartbeatMs);
-      signal?.addEventListener('abort', abort, { once: true });
-      if (signal?.aborted) abort();
-      const observed = await terminal;
-      if (observed.signal !== null) cleanupVerified = false;
-      if (stopping) {
-        try {
-          cleanupVerified = await stopping;
-        } catch {
-          cleanupVerified = false;
-        }
-      }
-      fsyncSync(stdout);
-      fsyncSync(stderr);
-      const finished = Date.now();
-      const result: Terminal = {
-        exit_code: spawned ? observed.code : null,
-        signal: observed.signal,
-        error_code: errorCode,
-        artifacts: ['stdout', 'stderr', 'result'].map((name) => `execution:${job.id}:${name}`),
-      };
-      durableFile(join(directory, 'result.json'), {
-        run_id: job.id,
-        recipe_fingerprint: recipe.fingerprint,
-        pid: child.pid ?? null,
-        started_at: started,
-        finished_at: finished,
-        ...result,
-        bytes,
-        truncated,
-        cleanup_verified: cleanupVerified,
-      });
-      ensure(
-        cleanupVerified,
-        'CONFLICT',
-        'Process tree termination was not verified; host capacity remains occupied.',
-      );
-      return { result, spawned, finished_at: finished, runtime_ms: finished - started };
-    } finally {
-      if (timeout) clearTimeout(timeout);
-      if (heartbeat) clearInterval(heartbeat);
-      if (cleanupDeadline) clearTimeout(cleanupDeadline);
-      signal?.removeEventListener('abort', abort);
-      closeSync(stdout);
-      closeSync(stderr);
-    }
-  }
-}
-
-async function terminateTree(child: ChildProcess): Promise<boolean> {
-  if (!child.pid) return true;
-  // shortcut: a direct-child handle cannot prove tree termination; SELF-9 needs OS containment before release.
-  child.kill('SIGKILL');
-  return false;
 }

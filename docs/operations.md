@@ -6,6 +6,8 @@
 
 Do not run automatic migrations from every HTTP process. Compose runs an explicit migration job before application and worker startup. For another backend, use its adapter-owned migration operation.
 
+The durable execution stack requires a controlled migration and restart/reconnect of all runtimes and companions; see [execution recovery upgrades](execution-companion.md#controlled-upgrade). Migration identity is the full filename: preserve both accepted project-memory/execution filenames and main's independent review-fixes filenames even when numeric prefixes coincide. Backups and restore verification include runs, continuations, controller ownership, immutable attempts and observations.
+
 ## SQLite local operation
 
 Select `STORAGE_ADAPTER=sqlite` and `SQLITE_PATH` for the persistent file, or use the CLI's `--sqlite PATH` convenience flag. SQLite stdio bootstraps its schema automatically. `EMBEDDING_PROVIDER=none` avoids external inference; SQLite search always uses FTS5 and explicitly reports full-text-only capability. SQLite stdio drains its durable indexing queue with one in-flight background indexOnce call and awaits it during shutdown; no separate worker is needed. PostgreSQL and HTTP deployments keep the existing worker command.

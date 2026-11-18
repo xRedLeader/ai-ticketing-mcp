@@ -6,6 +6,29 @@ import pg from 'pg';
 import { PostgresStorage, PostgresSearch } from '../../src/adapters/postgres.js';
 import { createApplication } from '../../src/application.js';
 import { fixture, testEmbeddings } from '../../src/testing/contracts.js';
+import { registerExecutionUpgradeContractTests } from '../../src/testing/execution-upgrade-contracts.js';
+registerExecutionUpgradeContractTests('PostgreSQL', 'postgres', async () => {
+  assert.ok(process.env.TEST_DATABASE_URL, 'TEST_DATABASE_URL required.');
+  const bootstrap = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+  const schema = `history_${randomUUID().replaceAll('-', '')}`;
+  await bootstrap.query(`CREATE SCHEMA "${schema}"`);
+  const url = new URL(process.env.TEST_DATABASE_URL);
+  url.searchParams.set('options', `-c search_path=${schema},public`);
+  const storage = new PostgresStorage(url.href),
+    search = new PostgresSearch(storage.pool);
+  return {
+    storage,
+    search,
+    async sql(text: string) {
+      await storage.pool.query(text);
+    },
+    async dispose() {
+      await storage.close();
+      await bootstrap.query(`DROP SCHEMA "${schema}" CASCADE`);
+      await bootstrap.end();
+    },
+  };
+});
 
 it('adds PostgreSQL execution storage without changing existing checkpoints, claims or retry receipts', async () => {
   assert.ok(process.env.TEST_DATABASE_URL, 'TEST_DATABASE_URL is required.');
