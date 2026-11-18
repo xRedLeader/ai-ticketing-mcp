@@ -180,7 +180,7 @@ function reservations(state: State) {
 
 /** Optional single-host companion. All processes sharing a run must use the same local SQLite file. */
 export class UsageBudget {
-  private readonly db: DatabaseSync;
+  protected readonly db: DatabaseSync;
 
   constructor(path: string) {
     ensure(path.trim() && path !== ':memory:', 'INVALID_INPUT', 'A durable local ledger path is required.');
@@ -205,7 +205,8 @@ export class UsageBudget {
     this.db.close();
   }
 
-  private transaction<T>(operation: () => T): T {
+  protected transaction<T>(operation: () => T): T {
+    if (this.db.isTransaction) return operation();
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const result = operation();
@@ -217,7 +218,7 @@ export class UsageBudget {
     }
   }
 
-  private read(runId: string): State {
+  protected read(runId: string): State {
     const row = this.db.prepare('SELECT state FROM usage_budget_runs WHERE id=?').get(id.parse(runId));
     ensure(row, 'NOT_FOUND', 'Usage run not found.');
     return JSON.parse(row.state as string) as State;
@@ -227,6 +228,27 @@ export class UsageBudget {
     this.db
       .prepare('UPDATE usage_budget_runs SET state=? WHERE id=?')
       .run(JSON.stringify(state), state.config.run_id);
+  }
+
+  protected parseAdmission(input: UsageBudgetAdmission) {
+    return admissionSchema.parse(input);
+  }
+
+  protected budgetReasons(runId: string, request: ReturnType<UsageBudget['parseAdmission']>) {
+    const state = this.read(runId),
+      used = reservations(state),
+      limits = state.config.limits;
+    const reasons = attention(state);
+    if (used.attempts >= limits.max_attempts) reasons.push('attempt_limit');
+    if (used.provider_tokens + request.allowance.provider_tokens > limits.max_provider_tokens)
+      reasons.push('provider_token_limit');
+    if (used.runtime_ms + request.allowance.runtime_ms > limits.max_runtime_ms) reasons.push('runtime_limit');
+    if (
+      limits.max_cost_usd_micros !== null &&
+      used.cost_usd_micros + request.allowance.cost_usd_micros! > limits.max_cost_usd_micros
+    )
+      reasons.push('cost_limit');
+    return reasons;
   }
 
   createRun(input: UsageBudgetRun) {
@@ -285,19 +307,7 @@ export class UsageBudget {
           'A retry must identify a settled attempt for the same work and role.',
         );
       }
-      const used = reservations(state);
-      const limits = state.config.limits;
-      const reasons = attention(state);
-      if (used.attempts >= limits.max_attempts) reasons.push('attempt_limit');
-      if (used.provider_tokens + request.allowance.provider_tokens > limits.max_provider_tokens)
-        reasons.push('provider_token_limit');
-      if (used.runtime_ms + request.allowance.runtime_ms > limits.max_runtime_ms)
-        reasons.push('runtime_limit');
-      if (
-        limits.max_cost_usd_micros !== null &&
-        used.cost_usd_micros + request.allowance.cost_usd_micros! > limits.max_cost_usd_micros
-      )
-        reasons.push('cost_limit');
+      const reasons = this.budgetReasons(runId, request);
       if (reasons.length) {
         state.attention = [...new Set(reasons)];
         this.save(state);

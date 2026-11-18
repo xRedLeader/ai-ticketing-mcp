@@ -2,6 +2,8 @@
 
 `UsageBudget` is a deterministic companion for a trusted local dispatcher. It does not call a model, retry work, claim tickets, or add MCP tools. It uses its own private SQLite file and does not change the ticketing database. Build with `npm run build`; the callable entry points are `dist/usage-budget.js` and `node dist/usage-budget-cli.js`. Node 24+ is required.
 
+For shared host agent/script limits and fair project dispatch, use the optional [host capacity companion](host-capacity.md), which commits agent capacity and these usage reservations in the same transaction.
+
 Every process dispatching a particular run must share the **same local file**. Admission uses SQLite `BEGIN IMMEDIATE`, a five-second busy timeout, WAL, and full synchronous commits. A lock/open/commit error fails the call and must prevent dispatch. This supports concurrent processes on one host; network filesystems, multiple hosts, distributed quotas, and overall executor capacity are outside this capability. The host must protect the ledger and its directory with its normal account permissions; file mode requests do not configure Windows ACLs.
 
 Create a run before unattended work. `work` freezes the planned ticket/requirements-revision identities, including work that never starts. Limits and project identity cannot be changed by reopening the file or replaying creation. Defaults are six admitted invocations and a 15-minute maximum allowance per invocation. The token budget is mandatory. Runtime defaults to six times 15 minutes. Monetary enforcement is optional (`null`); it never implies that unknown cost is zero.
