@@ -1,5 +1,28 @@
 # Verification record
 
+## PR #2 review follow-up: 2026-11-18
+
+`npm run benchmark:claims` was run against a new disposable PostgreSQL 17.12 database on the local Docker host, using Node 24.22.3 on Windows (32 available logical CPUs, 31.14 GiB host RAM). Application/database resources were not constrained to the earlier 4-vCPU/8-GB target. This measurement used the PR #2 worktree based on `10da326`, with the new benchmark; CI attaches a fresh report to each tested commit.
+
+Each case used three bursts of eight simultaneous claims and eight heartbeats in one project: 24 samples per operation, 96 measured claims and 96 heartbeats overall. Fixtures, pool/tokenizer warmup, replay checks, and assertions were outside the measured intervals. These are application calls with real PostgreSQL I/O, excluding MCP/HTTP transport and embedding inference. The large fixture uses 50 criteria containing deterministic SHA-256 strings to exercise high-entropy context and storage; it is not a representative compression ratio for ordinary prose.
+
+| Case                            | Claim p95 | Heartbeat p95 | Median response tokens | Mean logical receipt result | Mean stored receipt result |
+| ------------------------------- | --------: | ------------: | ---------------------: | --------------------------: | -------------------------: |
+| Claim only, modest requirements |  141.9 ms |      149.2 ms |                    258 |                       542 B |                      585 B |
+| Embedded brief context          |  202.2 ms |      185.2 ms |                  1,502 |                     6,560 B |                    1,589 B |
+| Claim only, large requirements  |  142.9 ms |      135.9 ms |                    254 |                       542 B |                      585 B |
+| Embedded large context          |  377.8 ms |      335.9 ms |                 24,203 |                    47,945 B |                   48,881 B |
+
+The embedded-large case **missed the ordinary 300 ms p95 target** for both operations. All calls succeeded; assertions checked response budgets, persisted live ownership, lease extension, identical receipt replay, and no extra receipts on retry. Latencies include query/pool/lock waits and packing, not isolated lock-hold measurements. This small single-process burst test does not establish sustained-load capacity or SQLite performance. It supports retaining atomic claims while documenting the cost and the existing claim-only option, not claiming that contention is eliminated.
+
+At an illustrative 10,000 claims/day for 365 days, the stored result data alone projects to 1.99 GiB for claim-only receipts, 5.40 GiB for this repetitive brief fixture, and 166.16 GiB for the high-entropy large fixture. These estimates exclude row/index overhead, non-claim receipts, WAL, backups, and replicas. Receipt retention remains indefinite; the [capacity procedure and thresholds](operations.md#claim-contention-and-receipt-capacity) require measuring the actual content mix and daily table/disk growth. No deletion or post-commit packing change was introduced.
+
+The [release notes](release-notes.md) now collect required custom-adapter methods, MCP behavior changes, embedding reindex requirements, and pending migrations, including changes already merged in PR #1.
+
+Local validation also passed all 162 existing tests (110 unit/SQLite and 52 PostgreSQL), the frozen protocol benchmark, application and benchmark TypeScript checks, production build, formatting, and credential scanning. Published CI status must be checked for the final PR head rather than inferred from an earlier review or this local run.
+
+## Original functional verification: 2026-11-16
+
 Verified on 2026-11-16. The application was built and exercised against real PostgreSQL with pgvector, the official MCP SDK clients, Keycloak, and local Ollama.
 
 ## Functional checks

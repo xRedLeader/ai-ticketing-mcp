@@ -35,6 +35,7 @@
     "commit:check": "node scripts/check-commits.mjs",
     "benchmark": "tsx scripts/benchmark.ts",
     "benchmark:protocol": "tsx scripts/protocol-benchmark.ts",
+    "benchmark:claims": "tsx scripts/claim-benchmark.ts",
     "walkthrough": "tsx scripts/walkthrough.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

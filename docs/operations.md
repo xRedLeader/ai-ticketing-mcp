@@ -89,6 +89,32 @@ Set `BENCHMARK_DATABASE_URL` to a disposable database and run `npm run benchmark
 
 The design targets p95 below 300 ms for ordinary operations and one second for retrieval on a 4-vCPU/8-GB application/database machine. Treat those as targets until reproduced on your hardware and vector workload. Project mutations serialize for correctness; high write contention in one project is the first reason to revisit the PostgreSQL adapter's locking strategy.
 
+## Claim contention and receipt capacity
+
+Run `npm run benchmark:claims` with Node 24 and a disposable `BENCHMARK_DATABASE_URL` or `TEST_DATABASE_URL`. It creates and removes its own schema, leaving other schemas alone. The JSON report is written to `.local/claim-benchmark-results.json`; CI uploads it as the `claim-benchmark` artifact for the exact tested commit.
+
+Each case runs three bursts of eight claims plus eight heartbeats in one project (24 samples of each operation). It compares claim-only and embedded-context requests on both modest prose requirements and a large, high-entropy criteria fixture. The large embedded-context responses must contain at least 20,000 reference tokens. Timings include database/pool/lock waits and packing, excluding setup, assertions, retries, transport, and inference. Budget, live ownership, lease renewal, receipt count, and byte-stable retry assertions fail the run on a correctness regression. Latency targets are reported separately and do not gate CI on shared-runner speed. This is a small burst test, not a sustained-load or SQLite result; reproduce it on deployment hardware before setting capacity.
+
+Keep the ordinary-operation target of 300 ms p95. Investigate claims or heartbeats above that target in three consecutive five-minute production windows (or three identical benchmark runs). A failed heartbeat or heartbeat taking over 30 seconds needs immediate investigation, well before the ten-minute lease expires. First reduce simultaneous work in the affected project and inspect database waits/CPU. Clients that already retrieved all required context may use `include_context:false`; otherwise retrieve current context and follow mandatory omission references before execution. Do not move packing after commit as a quick fix: combined-claim failure must still roll back ownership, revisions, events, jobs, and receipts. Any change to that guarantee needs explicit API/retry design and regression tests.
+
+Receipts have **no automatic expiry**. Deleting one can turn a delayed retry into a second mutation, so capacity planning must retain them. Run these read-only PostgreSQL checks off peak and record daily results externally; the size queries inspect stored results and can be expensive on a large table:
+
+```sql
+SELECT pg_total_relation_size('receipts') AS receipt_table_index_toast_bytes;
+
+SELECT operation, count(*) AS receipts_last_24h,
+       round(avg(octet_length(result::text))) AS mean_logical_result_bytes,
+       round(avg(pg_column_size(result))) AS mean_stored_result_bytes,
+       max(pg_column_size(result)) AS max_stored_result_bytes
+FROM receipts
+WHERE created_at >= now() - interval '24 hours'
+GROUP BY operation;
+```
+
+Estimate annual result growth as `daily_receipts * mean_stored_result_bytes * 365`; separately budget row/index overhead, other operations, WAL, backups, and replicas. The benchmark reports a 10,000-claims/day illustration, not a traffic forecast. Logical JSON size and PostgreSQL stored size differ with compression, so use your own content mix and measured total table growth. SQLite operators should record database plus WAL file size daily instead of using PostgreSQL size estimates.
+
+Use the larger of recent daily growth and the planned workload estimate to calculate remaining days of disk headroom. Investigate at 70% disk use or fewer than 30 days of headroom; expand capacity or reduce incoming work before 85% use or seven days of headroom. These are starting operator thresholds, not installed alerts. Backups and read-only archives do not replace online idempotency records. A future retention mechanism must preserve retry fencing (for example, durable tombstones and an explicit retry horizon); there is no safe receipt-pruning command today.
+
 ## Known operating limits
 
 This is one team per deployment with project grants, not multi-tenant SaaS. Local DB credentials confer operator trust. Audit records and idempotency receipts are retained indefinitely. Indexing is eventual; a changed source is omitted from search until its new revision is indexed. Mean-pooled document embeddings trade passage precision for a compact index. A reviewer must validate evidence; the server verifies its presence and attribution, not its truth.

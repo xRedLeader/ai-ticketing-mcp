@@ -99,11 +99,15 @@ npm run check
 npm run format:check
 # With a disposable database configured, check the frozen protocol benchmark.
 npm run benchmark:protocol
+# Measure concurrent claims/heartbeats and receipt capacity on PostgreSQL.
+npm run benchmark:claims
 ```
 
 Integration tests require a real database and fail clearly when it is not configured. They exercise claims, races, retries, stale workers, review policies, permissions, search freshness, and both MCP transports. See the [verification record](docs/verification.md) for measured results, the [real-client benchmark](docs/real-client-benchmark.md) for Codex cost/completion measurements, and [operations](docs/operations.md) for backup/restore, rebuilding search, and benchmarks.
 
 Contributions use [Conventional Commits](CONTRIBUTING.md). Public MCP and adapter contracts follow semantic versioning. Licensed under [Apache-2.0](LICENSE).
+
+Before upgrading, read the [release notes and required migrations](docs/release-notes.md).
 
 ## Boundaries
 
