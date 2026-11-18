@@ -102,6 +102,22 @@ Compose passes these settings to the app, defaults capture to `true`, and retain
 
 Library consumers can create a recorder with `createProfileRecorder`, supply it as `HttpConfig.profiler`, or wrap a stdio transport before `createMcpServer(...).connect(...)`. The caller owns `recorder.close()` after transports stop. `analyzeProfile(runDirectory)` provides the same offline analysis as the CLI.
 
+## Hot reload for local stdio
+
+Build each candidate in a separate, immutable checkout with `npm run build`. Keep the launcher, active build, and previous build available. Publish the initial server selection using an absolute path to the built CLI:
+
+```powershell
+node C:/ticketing/launcher/dist/stdio-hot-reload.js --pointer C:/ticketing/local/mcp-active --select C:/ticketing/build-a/dist/cli.js
+```
+
+Set the MCP server command to `node` and its arguments to `C:/ticketing/launcher/dist/stdio-hot-reload.js`, `--pointer`, `C:/ticketing/local/mcp-active`, `--profile`, `worker`. Keep the existing actor, database, working directory, and profiling environment. Reconnect the client once to install the launcher. Protect the pointer and builds with the same local account permissions as the MCP configuration: selecting a build authorizes local code execution with the server's environment.
+
+To roll forward or back, repeat the `--select` command with another built CLI. Selection is atomic. Each existing launcher checks for the change on the next request it receives while idle. It replays only the observed MCP handshake and discovery against the candidate, and keeps the previous backend if the candidate fails or its discovered interface changes. Outstanding requests finish on their original backend. The launcher does not retry calls across a disconnect. Clients must retry uncertain mutations with the original idempotency key.
+
+Look for `mcp_relay_switched` in stderr to verify the new PID and entry. `mcp_relay_rejected` gives the reason and indicates whether the old process remains active. Selecting a path stages the switch; it does not prove a connected client has picked it up. MCP requests, results and profiling still come from the actual backend.
+
+This launcher targets the current stateless ticketing stdio interface. Changing the discovered tool catalog, capabilities, or SQLite migrations needs a controlled upgrade and reconnect. Unknown or stateful protocol methods pin the session. A cancelled request without a terminal MCP response can defer replacement until reconnect. HTTP deployments use their existing server lifecycle.
+
 ## Backup and restore
 
 Use PostgreSQL custom-format backups and protect them as sensitive project data. With the default Compose deployment:
