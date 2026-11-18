@@ -10,6 +10,22 @@ Do not run automatic migrations from every HTTP process. Compose runs an explici
 
 Select `STORAGE_ADAPTER=sqlite` and `SQLITE_PATH` for the persistent file, or use the CLI's `--sqlite PATH` convenience flag. SQLite stdio bootstraps its schema automatically. `EMBEDDING_PROVIDER=none` avoids external inference; SQLite search always uses FTS5 and explicitly reports full-text-only capability. Run the indexing worker when source records change so lexical search reaches the latest revisions.
 
+With Node 24 and dependencies installed, run `npm run build`, then start local MCP stdio with the full tool profile for initial project setup:
+
+```sh
+node dist/cli.js stdio --sqlite .local/ticketing.sqlite --profile full
+```
+
+Without `--actor` or `ACTOR_ID`, this local stdio command creates or reuses a stable agent identity with administrator access in that database. This identity trusts the local operator and does not enable automatic HTTP authentication.
+
+After setup, use the default worker tool profile for execution on the same database:
+
+```sh
+node dist/cli.js stdio --sqlite .local/ticketing.sqlite
+```
+
+Profiles change the exposed tools; the trusted local identity and its permissions remain unchanged.
+
 Keep the database on a local filesystem. WAL mode allows coherent read snapshots alongside a writer, but only one write transaction can commit at a time across all projects. Long-lived snapshots retain WAL pages. Synchronous SQLite statements run on the Node event loop; use PostgreSQL for workloads requiring greater write concurrency or a shared database service.
 
 The database, `-wal`, and `-shm` files contain trusted local state, including claim credentials. Protect them with operating-system permissions. New database files use owner-only permissions where supported; existing permissions are preserved. A local operator who can access the file can administer its contents. Close both storage and search handles before copying the database alone for an offline backup; copying a live main file without its WAL can omit committed work. Restore into a separate file and verify reads before switching clients. Existing files, receipts, and audit history are never reset by startup.
