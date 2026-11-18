@@ -15,3 +15,4 @@ export { createSqliteAdapters } from './adapters/sqlite.js';
 export { CachedEmbeddings } from './query-embeddings.js';
 export { countReferenceTokens } from './tokens.js';
 export { GitHubClient } from './github.js';
+export { SignedWebhook } from './webhook.js';

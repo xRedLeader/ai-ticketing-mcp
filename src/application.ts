@@ -22,6 +22,7 @@ import {
   type GitHubEvidence,
   type GitHubObservation,
   type GitHubCIStatus,
+  type WebhookTarget,
   validateGitHubConfiguration,
 } from './contracts.js';
 import { resultSchemas, githubEvidenceSchema } from './result-schemas.js';
@@ -37,8 +38,23 @@ export interface ApplicationOptions {
   countReferenceTokens?: (text: string) => number;
   referenceTokenMetrics?: boolean;
   github?: GitHubConfiguration & { provider: GitHubProvider };
+  webhook?: WebhookTarget;
 }
 const LEASE_MS = 600_000;
+const webhookEvents = new Set([
+  'ticket.created',
+  'ticket.updated',
+  'ticket.transitioned',
+  'ticket.invalidated',
+  'ticket.linked',
+  'ticket.checkpointed',
+  'ticket.note_added',
+  'ticket.submitted',
+  'ticket.reviewed',
+  'ticket.github_evidence_refreshed',
+  'work.claimed',
+  'work.released',
+]);
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
@@ -59,6 +75,7 @@ export class Application {
   private countTokens: (text: string) => number;
   private referenceTokenMetrics: boolean;
   private readonly github?: GitHubConfiguration & { provider: GitHubProvider };
+  private readonly webhook?: WebhookTarget;
   readonly metrics = {
     requests: 0,
     errors: 0,
@@ -81,6 +98,16 @@ export class Application {
     this.now = options.now ?? (() => new Date());
     this.countTokens = options.countReferenceTokens ?? countReferenceTokens;
     this.referenceTokenMetrics = options.referenceTokenMetrics === true;
+    if (options.webhook) {
+      ensure(
+        options.storage.leaseDeliveries &&
+          options.storage.finishDelivery &&
+          /^[a-f0-9]{64}$/.test(options.webhook.fingerprint),
+        'INVALID_CONFIG',
+        'Webhook delivery requires durable delivery storage and a target fingerprint.',
+      );
+      this.webhook = options.webhook;
+    }
     if (options.github) {
       validateGitHubConfiguration(options.github);
       this.github = Object.freeze({
@@ -314,16 +341,47 @@ export class Application {
   ) {
     project.event_seq++;
     await tx.put('projects', project);
+    const eventId = `${project.id}:${project.event_seq}`;
+    const occurredAt = this.timestamp();
     await tx.put('events', {
-      id: `${project.id}:${project.event_seq}`,
+      id: eventId,
       project_id: project.id,
       seq: project.event_seq,
       actor_id: actor.id,
       type,
       entity_id: entityId,
       data,
-      created_at: this.timestamp(),
+      created_at: occurredAt,
     });
+    if (this.webhook && webhookEvents.has(type)) {
+      const ticket = await this.ticket(tx, project.id, entityId);
+      const id = randomUUID();
+      await tx.put('outbound_deliveries', {
+        id,
+        event_id: eventId,
+        project_id: project.id,
+        body: JSON.stringify({
+          schema_version: 1,
+          delivery_id: id,
+          event_id: eventId,
+          project_id: project.id,
+          entity_id: entityId,
+          event_type: type,
+          seq: project.event_seq,
+          ticket_revision: ticket.revision,
+          requirements_revision: ticket.requirements_revision,
+          occurred_at: occurredAt,
+        }),
+        target_fingerprint: this.webhook.fingerprint,
+        attempt_count: 0,
+        next_attempt_at: occurredAt,
+        locked_until: null,
+        lock_token: null,
+        sent_at: null,
+        last_error: null,
+        created_at: occurredAt,
+      });
+    }
   }
   private async queue(
     tx: Transaction,
@@ -1845,6 +1903,38 @@ export class Application {
     return best;
   }
 
+  async deliverOnce(limit = 1) {
+    if (!this.webhook) return 0;
+    ensure(
+      Number.isInteger(limit) && limit >= 1 && limit <= 100,
+      'INVALID_INPUT',
+      'Delivery batch must be 1–100.',
+    );
+    const deliveries = await this.storage.leaseDeliveries!(
+      this.webhook.fingerprint,
+      limit,
+      limit * 5000 + 10000,
+    );
+    for (const delivery of deliveries) {
+      let errorCode: string | undefined;
+      try {
+        errorCode = (await this.webhook.send(delivery))?.error_code;
+      } catch {
+        errorCode = 'NETWORK_ERROR';
+      }
+      if (errorCode) {
+        const safeCode = /^[A-Z][A-Z0-9_]{0,79}$/.test(errorCode) ? errorCode : 'DELIVERY_FAILED';
+        const backoffMs = Math.min(3600000, 1000 * 2 ** Math.min(delivery.attempt_count, 12));
+        await this.storage.finishDelivery!(delivery, {
+          next_attempt_at: new Date(this.now().getTime() + backoffMs).toISOString(),
+          error_code: safeCode,
+        });
+      } else {
+        await this.storage.finishDelivery!(delivery, { sent_at: this.timestamp() });
+      }
+    }
+    return deliveries.length;
+  }
   async indexOnce(limit = 10) {
     const jobs = await this.storage.leaseJobs(limit, 300_000);
     for (const job of jobs) {

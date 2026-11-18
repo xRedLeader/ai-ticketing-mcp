@@ -18,6 +18,7 @@ import {
   type Query,
   type Note,
   type Job,
+  type OutboundDelivery,
   type SearchDocument,
   type SearchHit,
   type EmbeddingProfile,
@@ -112,6 +113,20 @@ const columns: Record<Table, string[]> = {
     'locked_until',
     'lock_token',
     'last_error',
+  ],
+  outbound_deliveries: [
+    'id',
+    'event_id',
+    'project_id',
+    'body',
+    'target_fingerprint',
+    'attempt_count',
+    'next_attempt_at',
+    'locked_until',
+    'lock_token',
+    'sent_at',
+    'last_error',
+    'created_at',
   ],
   github_evidence: [
     'id',
@@ -259,7 +274,7 @@ function repository(db: DatabaseSync): Transaction {
         'A record ID is required.',
       );
       const conflict =
-        table === 'github_evidence'
+        table === 'github_evidence' || table === 'outbound_deliveries'
           ? ''
           : ` ON CONFLICT(id) DO UPDATE SET ${keys
               .filter((key) => key !== 'id')
@@ -272,6 +287,11 @@ function repository(db: DatabaseSync): Transaction {
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
       ensure(table !== 'github_evidence', 'IMMUTABLE_EVIDENCE', 'GitHub evidence records are immutable.');
+      ensure(
+        table !== 'outbound_deliveries',
+        'IMMUTABLE_DELIVERY',
+        'Outbound delivery records are immutable.',
+      );
       db.prepare(`DELETE FROM "${table}" WHERE id=?`).run(id);
     },
   };
@@ -485,6 +505,79 @@ class SqliteStorage extends Handle implements StorageAdapter {
           job.revision,
         );
     });
+  }
+  async leaseDeliveries(
+    targetFingerprint: string,
+    limit: number,
+    leaseMs: number,
+  ): Promise<OutboundDelivery[]> {
+    this.open();
+    ensure(
+      Number.isSafeInteger(limit) &&
+        limit >= 1 &&
+        limit <= 100 &&
+        Number.isSafeInteger(leaseMs) &&
+        leaseMs >= 1 &&
+        leaseMs <= 3_600_000,
+      'INVALID_INPUT',
+      'Delivery leases require a limit of 1–100 and duration of 1–3600000 milliseconds.',
+    );
+    return write(this.shared, async (db) => {
+      const now = new Date().toISOString();
+      const until = new Date(Date.now() + leaseMs).toISOString();
+      const deliveries = db
+        .prepare(
+          'SELECT * FROM outbound_deliveries WHERE target_fingerprint=? AND sent_at IS NULL AND next_attempt_at<=? AND (locked_until IS NULL OR locked_until<=?) ORDER BY next_attempt_at,id LIMIT ?',
+        )
+        .all(targetFingerprint, now, now, limit)
+        .map(decode) as unknown as OutboundDelivery[];
+      const update = db.prepare(
+        'UPDATE outbound_deliveries SET locked_until=?,lock_token=?,attempt_count=MIN(attempt_count+1,2147483647) WHERE id=?',
+      );
+      for (const delivery of deliveries) {
+        delivery.locked_until = until;
+        delivery.lock_token = randomUUID();
+        update.run(until, delivery.lock_token, delivery.id);
+        delivery.attempt_count = Math.min(delivery.attempt_count + 1, 2147483647);
+      }
+      return deliveries;
+    });
+  }
+  async finishDelivery(
+    delivery: OutboundDelivery,
+    outcome: { sent_at: string } | { next_attempt_at: string; error_code: string },
+  ) {
+    this.open();
+    if (!delivery.lock_token) return;
+    if ('error_code' in outcome)
+      ensure(
+        /^[A-Z][A-Z0-9_]{0,79}$/.test(outcome.error_code),
+        'INVALID_QUERY',
+        'Delivery failures require a code without response content.',
+      );
+    await write(this.shared, async (db) => {
+      if ('sent_at' in outcome)
+        db.prepare(
+          'UPDATE outbound_deliveries SET sent_at=?,locked_until=NULL,lock_token=NULL,last_error=NULL WHERE id=? AND lock_token=? AND sent_at IS NULL',
+        ).run(outcome.sent_at, delivery.id, delivery.lock_token);
+      else
+        db.prepare(
+          'UPDATE outbound_deliveries SET next_attempt_at=?,last_error=?,locked_until=NULL,lock_token=NULL WHERE id=? AND lock_token=? AND sent_at IS NULL',
+        ).run(outcome.next_attempt_at, outcome.error_code, delivery.id, delivery.lock_token);
+    });
+  }
+  async deliveryMetrics() {
+    this.open();
+    const row = this.db
+      .prepare(
+        'SELECT count(*) FILTER(WHERE sent_at IS NULL) webhook_pending,count(*) FILTER(WHERE sent_at IS NULL AND last_error IS NOT NULL) webhook_failed,total(attempt_count) webhook_attempts FROM outbound_deliveries',
+      )
+      .get()!;
+    return {
+      webhook_pending: Number(row.webhook_pending),
+      webhook_failed: Number(row.webhook_failed),
+      webhook_attempts: Math.min(Number.MAX_SAFE_INTEGER, Number(row.webhook_attempts)),
+    };
   }
   async metrics() {
     this.open();

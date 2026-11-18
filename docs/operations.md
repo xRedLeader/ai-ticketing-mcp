@@ -40,6 +40,18 @@ Only one embedding profile is active per process. Its identity covers provider, 
 
 Use `docker compose exec ollama ollama pull nomic-embed-text` to retry model installation. Raw artifact URLs are never fetched, and the server does not execute agent commands.
 
+## Durable signed notifications
+
+Webhooks are disabled by default. An operator can set both `TICKETING_WEBHOOK_URL` and a private `TICKETING_WEBHOOK_SECRET` of at least 32 bytes. Configure the same destination on mutation processes and workers. URLs require HTTPS, except literal `http://127.0.0.1` or `http://[::1]` for a local receiver; embedded credentials and fragments are rejected. The destination comes only from operator configuration. Redirects are never followed.
+
+Selected committed events enqueue an immutable delivery in the same transaction: `ticket.created`, `ticket.updated`, `ticket.transitioned`, `ticket.invalidated`, `ticket.linked`, `ticket.checkpointed`, `ticket.note_added`, `ticket.submitted`, `ticket.reviewed`, `ticket.github_evidence_refreshed`, `work.claimed`, and `work.released`. Payloads contain only `schema_version:1`, `delivery_id`, `event_id`, `project_id`, `entity_id`, `event_type`, `seq`, `ticket_revision`, `requirements_revision`, and `occurred_at`. Titles, notes, event data, actor content, claim tokens, receiver URLs, and signing secrets are excluded. Receivers use authenticated tools to fetch current details.
+
+Each POST has `X-Ticketing-Delivery` (the stable delivery UUID), `X-Ticketing-Timestamp` (attempt time in Unix seconds), and `X-Ticketing-Signature` (`sha256=` followed by hex HMAC-SHA256 of `timestamp + '.' + exact request body`). Verify the signature with the shared secret using constant-time comparison, apply a receiver-side timestamp tolerance, and deduplicate by delivery UUID. A crash after receiver acceptance can produce a second delivery with the same ID and body. A secret rotation for the same URL signs pending bodies with the new secret; coordinate receiver acceptance during rotation.
+
+The worker runs indexing and delivery loops independently. Configured stdio also drains notifications with one in-flight delivery. Each attempt times out after five seconds, accepts only 2xx as success, and stores only safe failure codes such as `HTTP_503`, `TIMEOUT`, or `NETWORK_ERROR`. Retries continue with exponential delay from two seconds, capped at one hour; there is no attempt limit. Expiring leases recover interrupted work and stale acknowledgements cannot mark a newly leased row complete. Shutdown waits for in-flight bounded work. Receiver failures cannot roll back committed ticket operations or stall indexing.
+
+The SHA256 fingerprint of the canonical URL binds queued rows to their original destination. Changing the URL leaves old rows pending; it never forwards them to the new URL. Restoring the old URL resumes those deliveries. Retain `changes_since` polling as the recovery source: notifications are hints, and claim expiry itself does not emit an event. PostgreSQL migration 011 and SQLite migration 003 preserve existing data and history. Delivery rows are retained after success; include them in backups.
+
 ## Health and metrics
 
 - `/healthz`: process liveness.
@@ -47,6 +59,8 @@ Use `docker compose exec ollama ollama pull nomic-embed-text` to retry model ins
 - `/metrics`: authenticated system-administrator-only Prometheus metrics for requests/errors/time, indexing, active/expired claims, review backlog, pending jobs, and lag. Numeric embedding counters report provider `embed` invocations, document/query reuse, provider failures, and cache saturation. Reference-token metric accounting is off by default; opt in with `REFERENCE_TOKEN_METRICS=true` to count validated tool inputs (SDK defaults may be materialized), canonical-envelope results, and accounting failures. Context budgets and excerpt limits always remain enforced. These are local reference counts, not billed tokens or exact wire/client costs. No content labels are collected.
 
 Readiness does not imply the embedding provider or identity provider is available; alert on authentication failures, indexing error increases, and growing job lag. HTTP logs include only method, recognized route, status, and duration. Tokens, database URLs, ticket bodies, and evidence are not logged.
+
+Built-in adapters also expose `webhook_pending` (all unsent rows, including old destinations), `webhook_failed` (unsent rows with a failure code), and `webhook_attempts` (safely bounded total attempt count) through authenticated `/metrics` and administrator CLI `inspect`. These metrics contain no destination or content labels.
 
 ## Backup and restore
 

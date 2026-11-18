@@ -12,6 +12,8 @@ import {
   type Tables,
   type Query,
   type Job,
+  type OutboundDelivery,
+  type DeliveryOutcome,
   type SearchAdapter,
   type SearchDocument,
   type SearchHit,
@@ -20,6 +22,20 @@ import {
 } from '../contracts.js';
 
 const columns: Record<Table, string[]> = {
+  outbound_deliveries: [
+    'id',
+    'event_id',
+    'project_id',
+    'body',
+    'target_fingerprint',
+    'attempt_count',
+    'next_attempt_at',
+    'locked_until',
+    'lock_token',
+    'sent_at',
+    'last_error',
+    'created_at',
+  ],
   github_evidence: [
     'id',
     'project_id',
@@ -233,7 +249,7 @@ function repository(db: Executor): Transaction {
       const values = keys.map((key) => (jsonColumns.has(key) ? JSON.stringify(record[key]) : record[key]));
       const names = keys.map((key) => field(table, key));
       const conflict =
-        table === 'github_evidence'
+        table === 'github_evidence' || table === 'outbound_deliveries'
           ? ''
           : ` ON CONFLICT(id) DO UPDATE SET ${names
               .filter((name) => name !== '"id"')
@@ -247,6 +263,7 @@ function repository(db: Executor): Transaction {
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
       ensure(table !== 'github_evidence', 'IMMUTABLE_EVIDENCE', 'GitHub evidence snapshots are immutable.');
+      ensure(table !== 'outbound_deliveries', 'IMMUTABLE_DELIVERY', 'Outbound deliveries are immutable.');
       await db.query(`DELETE FROM "${table}" WHERE id=$1`, [id]);
     },
   };
@@ -369,6 +386,52 @@ export class PostgresStorage implements StorageAdapter {
   }
   async health() {
     await this.pool.query('SELECT 1 FROM schema_migrations LIMIT 1');
+  }
+  async leaseDeliveries(
+    targetFingerprint: string,
+    limit: number,
+    leaseMs: number,
+  ): Promise<OutboundDelivery[]> {
+    ensure(
+      Number.isInteger(limit) && limit >= 1 && limit <= 100,
+      'INVALID_INPUT',
+      'Delivery batch must be 1–100.',
+    );
+    ensure(
+      Number.isInteger(leaseMs) && leaseMs >= 1 && leaseMs <= 3600000,
+      'INVALID_INPUT',
+      'Invalid delivery lease.',
+    );
+    const result = await this.pool.query(
+      `UPDATE outbound_deliveries SET locked_until=now()+($3 * interval '1 millisecond'), lock_token=gen_random_uuid(), attempt_count=least(attempt_count::bigint+1,2147483647)::integer WHERE id IN (SELECT id FROM outbound_deliveries WHERE target_fingerprint=$1 AND sent_at IS NULL AND next_attempt_at<=now() AND (locked_until IS NULL OR locked_until<=now()) ORDER BY next_attempt_at,id FOR UPDATE SKIP LOCKED LIMIT $2) RETURNING *`,
+      [targetFingerprint, limit, leaseMs],
+    );
+    return result.rows.map(decode) as unknown as OutboundDelivery[];
+  }
+  async finishDelivery(delivery: OutboundDelivery, outcome: DeliveryOutcome): Promise<void> {
+    if (!delivery.lock_token) return;
+    if ('sent_at' in outcome) {
+      await this.pool.query(
+        'UPDATE outbound_deliveries SET sent_at=$3,locked_until=NULL,lock_token=NULL,last_error=NULL WHERE id=$1 AND lock_token=$2 AND sent_at IS NULL',
+        [delivery.id, delivery.lock_token, outcome.sent_at],
+      );
+    } else {
+      ensure(
+        /^[A-Z][A-Z0-9_]{0,79}$/.test(outcome.error_code),
+        'INVALID_INPUT',
+        'Delivery errors must be safe codes.',
+      );
+      await this.pool.query(
+        'UPDATE outbound_deliveries SET next_attempt_at=$3,last_error=$4,locked_until=NULL,lock_token=NULL WHERE id=$1 AND lock_token=$2 AND sent_at IS NULL',
+        [delivery.id, delivery.lock_token, outcome.next_attempt_at, outcome.error_code],
+      );
+    }
+  }
+  async deliveryMetrics() {
+    const result = await this.pool.query(
+      `SELECT count(*) FILTER(WHERE sent_at IS NULL)::float webhook_pending,count(*) FILTER(WHERE sent_at IS NULL AND last_error IS NOT NULL)::float webhook_failed,least(coalesce(sum(attempt_count),0),9007199254740991)::float webhook_attempts FROM outbound_deliveries`,
+    );
+    return result.rows[0] as { webhook_pending: number; webhook_failed: number; webhook_attempts: number };
   }
   async metrics() {
     const result = await this.pool.query(

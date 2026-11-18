@@ -122,7 +122,12 @@ export function createHttpServer(app: Application, config: HttpConfig) {
           'FORBIDDEN',
           'Metrics require system administrator access.',
         );
-        const metrics = { ...app.metrics, ...app.embeddings?.metrics, ...(await app.storage.metrics()) };
+        const metrics = {
+          ...app.metrics,
+          ...app.embeddings?.metrics,
+          ...(await app.storage.metrics()),
+          ...(await app.storage.deliveryMetrics?.()),
+        };
         res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
         res.end(
           Object.entries(metrics)

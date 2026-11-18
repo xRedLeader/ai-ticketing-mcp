@@ -199,7 +199,33 @@ export interface Job {
   lock_token: string | null;
   last_error: string | null;
 }
+export interface OutboundDelivery {
+  id: string;
+  event_id: string;
+  project_id: string;
+  /** Exact JSON text, reused unchanged across delivery attempts. */
+  body: string;
+  target_fingerprint: string;
+  attempt_count: number;
+  next_attempt_at: string;
+  locked_until: string | null;
+  lock_token: string | null;
+  sent_at: string | null;
+  last_error: string | null;
+  created_at: string;
+}
+export type DeliveryOutcome = { sent_at: string } | { next_attempt_at: string; error_code: string };
+export interface DeliveryMetrics {
+  webhook_pending: number;
+  webhook_failed: number;
+  webhook_attempts: number;
+}
+export interface WebhookTarget {
+  readonly fingerprint: string;
+  send(delivery: OutboundDelivery): Promise<{ error_code: string } | undefined>;
+}
 export interface Tables {
+  outbound_deliveries: OutboundDelivery;
   github_evidence: GitHubEvidence;
   actors: Actor;
   projects: Project;
@@ -257,6 +283,10 @@ export interface StorageAdapter extends Reader {
   /** Atomically leases durable jobs, including abandoned jobs whose lease expired. */
   leaseJobs(limit: number, leaseMs: number): Promise<Job[]>;
   finishJob(job: Job, error?: string): Promise<void>;
+  /** Atomically leases 1–100 due rows for this target; lease is 1–3,600,000 ms. */
+  leaseDeliveries?(targetFingerprint: string, limit: number, leaseMs: number): Promise<OutboundDelivery[]>;
+  finishDelivery?(delivery: OutboundDelivery, outcome: DeliveryOutcome): Promise<void>;
+  deliveryMetrics?(): Promise<DeliveryMetrics>;
   metrics(): Promise<{
     active_claims: number;
     expired_claims: number;

@@ -3,8 +3,17 @@ import { createSqliteAdapters } from './adapters/sqlite.js';
 import { HttpEmbeddings } from './adapters/embeddings.js';
 import { createApplication } from './application.js';
 import { GitHubClient } from './github.js';
+import { SignedWebhook } from './webhook.js';
 import { ensure, type StorageAdapter, type SearchAdapter, type EmbeddingProvider } from './contracts.js';
 export function createRuntime(env: NodeJS.ProcessEnv = process.env) {
+  ensure(
+    Boolean(env.TICKETING_WEBHOOK_URL) === Boolean(env.TICKETING_WEBHOOK_SECRET),
+    'INVALID_CONFIG',
+    'Configure both TICKETING_WEBHOOK_URL and TICKETING_WEBHOOK_SECRET.',
+  );
+  const webhook = env.TICKETING_WEBHOOK_URL
+    ? new SignedWebhook(env.TICKETING_WEBHOOK_URL, env.TICKETING_WEBHOOK_SECRET!)
+    : undefined;
   const adapter = env.STORAGE_ADAPTER ?? 'postgres';
   ensure(
     adapter === 'postgres' || adapter === 'sqlite',
@@ -50,6 +59,7 @@ export function createRuntime(env: NodeJS.ProcessEnv = process.env) {
     storage,
     search,
     embeddings,
+    webhook,
     referenceTokenMetrics: env.REFERENCE_TOKEN_METRICS === 'true',
     ...(env.TICKETING_GITHUB_REPOSITORY
       ? {

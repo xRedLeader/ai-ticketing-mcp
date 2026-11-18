@@ -134,7 +134,7 @@ async function main() {
       );
       print({
         project: await app.execute(actorId, 'project_get', { project_id: values.project }),
-        metrics: await app.storage.metrics(),
+        metrics: { ...(await app.storage.metrics()), ...(await app.storage.deliveryMetrics?.()) },
       });
       return;
     }
@@ -145,11 +145,20 @@ async function main() {
       };
       process.once('SIGINT', stop);
       process.once('SIGTERM', stop);
-      do {
-        const count = await app.indexOnce(10);
-        if (values.once) break;
-        if (!count) await new Promise((resolve) => setTimeout(resolve, 1000));
-      } while (!stopped);
+      const run = async (work: () => Promise<number>) => {
+        try {
+          do {
+            const count = await work();
+            if (values.once) break;
+            if (!count) await new Promise((resolve) => setTimeout(resolve, 1000));
+          } while (!stopped);
+        } finally {
+          stopped = true;
+        }
+      };
+      const results = await Promise.allSettled([run(() => app.indexOnce(10)), run(() => app.deliverOnce())]);
+      const failed = results.find((result) => result.status === 'rejected');
+      if (failed?.status === 'rejected') throw failed.reason;
       return;
     }
     if (command === 'stdio') {
@@ -194,6 +203,7 @@ async function main() {
       keepAlive = true;
       let closing = false;
       let indexing: Promise<unknown> | undefined;
+      let delivering: Promise<unknown> | undefined;
       const index = () => {
         if (closing || indexing) return;
         indexing = app
@@ -214,12 +224,29 @@ async function main() {
       const indexTimer = runtimeEnv.STORAGE_ADAPTER === 'sqlite' ? setInterval(index, 1000) : undefined;
       indexTimer?.unref();
       if (indexTimer) index();
+      const deliver = () => {
+        if (closing || delivering) return;
+        delivering = app
+          .deliverOnce()
+          .catch(() => {
+            process.stderr.write(
+              JSON.stringify({ level: 'warn', event: 'webhook_delivery_failed', code: 'FAILED' }) + '\n',
+            );
+          })
+          .finally(() => {
+            delivering = undefined;
+          });
+      };
+      const deliveryTimer = runtimeEnv.TICKETING_WEBHOOK_URL ? setInterval(deliver, 1000) : undefined;
+      deliveryTimer?.unref();
+      if (deliveryTimer) deliver();
       const shutdown = async () => {
         if (closing) return;
         closing = true;
         clearInterval(indexTimer);
+        clearInterval(deliveryTimer);
         await server.close();
-        await indexing;
+        await Promise.all([indexing, delivering]);
         await app.searchAdapter.close();
         await app.storage.close();
       };

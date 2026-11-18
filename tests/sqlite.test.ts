@@ -10,6 +10,7 @@ import { once } from 'node:events';
 import { createSqliteAdapters } from '../src/adapters/sqlite.js';
 import { createApplication } from '../src/application.js';
 import { fixture, registerAdapterContractTests, testEmbeddings } from '../src/testing/contracts.js';
+import type { OutboundDelivery } from '../src/contracts.js';
 
 async function adapters() {
   const directory = await mkdtemp(join(tmpdir(), 'ticketing-sqlite-'));
@@ -31,6 +32,31 @@ async function setup() {
   await a.storage.migrate();
   await a.search.configure(testEmbeddings.profile);
   return { ...(await fixture(a)), ...a };
+}
+async function deliveryRecord(
+  a: Awaited<ReturnType<typeof setup>>,
+  target = 'a'.repeat(64),
+): Promise<OutboundDelivery> {
+  await a.ticket();
+  const [event] = await a.storage.find('events', {
+    where: { project_id: a.project.id },
+    order: [{ field: 'seq', direction: 'desc' }],
+    limit: 1,
+  });
+  return {
+    id: randomUUID(),
+    event_id: event!.id,
+    project_id: a.project.id,
+    body: '{ "id": "stable-delivery", "event": "ticket.changed" }\n',
+    target_fingerprint: target,
+    attempt_count: 0,
+    next_attempt_at: '2000-01-01T00:00:00.000Z',
+    locked_until: null,
+    lock_token: null,
+    sent_at: null,
+    last_error: null,
+    created_at: new Date().toISOString(),
+  };
 }
 registerAdapterContractTests('SQLite', adapters);
 
@@ -246,6 +272,228 @@ it('leases jobs once across factories and fences superseded tokens and retries',
   } finally {
     await other.search.close();
     await other.storage.close();
+    await a.dispose();
+  }
+});
+
+it('adds the outbox to schema 002 and preserves exact delivery bytes across restart', async () => {
+  const a = await adapters();
+  let reopened: ReturnType<typeof createSqliteAdapters> | undefined;
+  try {
+    const db = new DatabaseSync(a.filename);
+    try {
+      db.exec('CREATE TABLE schema_migrations(name TEXT PRIMARY KEY,applied_at TEXT NOT NULL)');
+      for (const name of ['001_initial.sql', '002_github_evidence.sql']) {
+        db.exec(await readFile(new URL(`../migrations/sqlite/${name}`, import.meta.url), 'utf8'));
+        db.prepare('INSERT INTO schema_migrations VALUES(?,?)').run(name, new Date().toISOString());
+      }
+    } finally {
+      db.close();
+    }
+    const f = { ...(await fixture(a)), ...a };
+    const originalTicket = await f.ticket();
+    await a.storage.migrate();
+    await a.storage.migrate();
+    assert.equal(
+      (await a.storage.get('tickets', originalTicket.id))?.description,
+      originalTicket.description,
+    );
+    const delivery = await deliveryRecord(f);
+    await a.storage.transaction(f.project.id, (tx) => tx.put('outbound_deliveries', delivery));
+    await a.search.close();
+    await a.storage.close();
+    reopened = createSqliteAdapters(a.filename);
+    await reopened.storage.migrate();
+    assert.deepEqual(await reopened.storage.get('outbound_deliveries', delivery.id), delivery);
+    assert.deepEqual(await reopened.storage.deliveryMetrics!(), {
+      webhook_pending: 1,
+      webhook_failed: 0,
+      webhook_attempts: 0,
+    });
+  } finally {
+    await reopened?.search.close();
+    await reopened?.storage.close();
+    await a.dispose();
+  }
+});
+
+it('commits outbound records with their events and rejects mutation or duplicate delivery identities', async () => {
+  const a = await setup();
+  try {
+    const delivery = await deliveryRecord(a);
+    const event = (await a.storage.get('events', delivery.event_id))!;
+    const rolledEvent = { ...event, id: randomUUID(), seq: event.seq + 1 };
+    const rolledDelivery = { ...delivery, id: randomUUID(), event_id: rolledEvent.id };
+    await assert.rejects(
+      a.storage.transaction(a.project.id, async (tx) => {
+        await tx.put('events', rolledEvent);
+        await tx.put('outbound_deliveries', rolledDelivery);
+        throw new Error('rollback both');
+      }),
+      /rollback both/,
+    );
+    assert.equal(await a.storage.get('events', rolledEvent.id), null);
+    assert.equal(await a.storage.get('outbound_deliveries', rolledDelivery.id), null);
+    await a.storage.transaction(a.project.id, (tx) => tx.put('outbound_deliveries', delivery));
+    for (const candidate of [
+      { ...delivery, body: '{}' },
+      { ...delivery, id: randomUUID() },
+    ])
+      await assert.rejects(
+        a.storage.transaction(a.project.id, (tx) => tx.put('outbound_deliveries', candidate)),
+        { code: 'CONFLICT' },
+      );
+    await assert.rejects(
+      a.storage.transaction(a.project.id, (tx) => tx.remove('outbound_deliveries', delivery.id)),
+      { code: 'IMMUTABLE_DELIVERY' },
+    );
+    const second = (await a.app.execute(a.admin.id, 'project_create', {
+      key: 'X' + randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase(),
+      name: 'Other project',
+      idempotency_key: randomUUID(),
+    })) as { id: string };
+    await assert.rejects(
+      a.storage.transaction(a.project.id, (tx) =>
+        tx.put('outbound_deliveries', {
+          ...delivery,
+          id: randomUUID(),
+          target_fingerprint: 'b'.repeat(64),
+          project_id: second.id,
+        }),
+      ),
+      { code: 'INVALID_REFERENCE' },
+    );
+    assert.deepEqual(await a.storage.get('outbound_deliveries', delivery.id), delivery);
+  } finally {
+    await a.dispose();
+  }
+});
+
+it('leases each due delivery once, fences stale acknowledgements, and retains retry failures without content', async () => {
+  const a = await setup();
+  const other = createSqliteAdapters(a.filename);
+  try {
+    for (const [limit, leaseMs] of [
+      [0, 1],
+      [101, 1],
+      [1, 0],
+      [1, 3_600_001],
+    ])
+      await assert.rejects(a.storage.leaseDeliveries!('a'.repeat(64), limit!, leaseMs!), {
+        code: 'INVALID_INPUT',
+      });
+    const due = await deliveryRecord(a),
+      mismatch = await deliveryRecord(a, 'b'.repeat(64)),
+      future = { ...(await deliveryRecord(a)), next_attempt_at: '2999-01-01T00:00:00.000Z' };
+    await a.storage.transaction(a.project.id, async (tx) => {
+      for (const delivery of [due, mismatch, future]) await tx.put('outbound_deliveries', delivery);
+    });
+    const batches = await Promise.all([
+      a.storage.leaseDeliveries!(due.target_fingerprint, 100, 60_000),
+      other.storage.leaseDeliveries!(due.target_fingerprint, 100, 60_000),
+    ]);
+    const [stale] = batches.flat();
+    assert.equal(batches.flat().length, 1);
+    assert.equal(stale!.id, due.id);
+    assert.equal(stale!.attempt_count, 1);
+    const db = new DatabaseSync(a.filename);
+    try {
+      db.prepare('UPDATE outbound_deliveries SET locked_until=? WHERE id=?').run(
+        '2000-01-01T00:00:00.000Z',
+        due.id,
+      );
+    } finally {
+      db.close();
+    }
+    const [current] = await other.storage.leaseDeliveries!(due.target_fingerprint, 100, 60_000);
+    assert.notEqual(current!.lock_token, stale!.lock_token);
+    assert.equal(current!.attempt_count, 2);
+    await a.storage.finishDelivery!(stale!, { sent_at: new Date().toISOString() });
+    assert.equal((await a.storage.get('outbound_deliveries', due.id))?.lock_token, current!.lock_token);
+    await assert.rejects(
+      a.storage.finishDelivery!(current!, {
+        next_attempt_at: '2000-01-01T00:00:00.000Z',
+        error_code: 'Receiver said secret=do-not-store',
+      }),
+      { code: 'INVALID_QUERY' },
+    );
+    await other.storage.finishDelivery!(current!, {
+      next_attempt_at: '2000-01-01T00:00:00.000Z',
+      error_code: 'NETWORK_ERROR',
+    });
+    const failed = (await a.storage.get('outbound_deliveries', due.id))!;
+    assert.equal(failed.last_error, 'NETWORK_ERROR');
+    assert.equal(failed.lock_token, null);
+    assert.equal(failed.body, due.body);
+    assert.deepEqual(await a.storage.deliveryMetrics!(), {
+      webhook_pending: 3,
+      webhook_failed: 1,
+      webhook_attempts: 2,
+    });
+    const [retry] = await a.storage.leaseDeliveries!(due.target_fingerprint, 100, 60_000);
+    assert.equal(retry!.attempt_count, 3);
+    const sent = new Date().toISOString();
+    await a.storage.finishDelivery!(retry!, { sent_at: sent });
+    await a.storage.finishDelivery!(retry!, {
+      next_attempt_at: '2000-01-01T00:00:00.000Z',
+      error_code: 'NETWORK_ERROR',
+    });
+    assert.equal((await a.storage.get('outbound_deliveries', due.id))?.sent_at, sent);
+    assert.equal((await a.storage.get('outbound_deliveries', due.id))?.last_error, null);
+    assert.equal((await a.storage.leaseDeliveries!(due.target_fingerprint, 100, 60_000)).length, 0);
+    assert.equal(
+      (await a.storage.leaseDeliveries!(mismatch.target_fingerprint, 100, 60_000))[0]?.id,
+      mismatch.id,
+    );
+  } finally {
+    await other.search.close();
+    await other.storage.close();
+    await a.dispose();
+  }
+});
+
+it('recovers a delivery abandoned by a terminated worker and saturates attempt counters', async () => {
+  const a = await setup();
+  try {
+    const delivery = { ...(await deliveryRecord(a)), attempt_count: 2147483646 };
+    await a.storage.transaction(a.project.id, (tx) => tx.put('outbound_deliveries', delivery));
+    const source = new URL('../src/adapters/sqlite.ts', import.meta.url).href;
+    const child = spawn(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        '--input-type=module',
+        '-e',
+        `import {createSqliteAdapters} from ${JSON.stringify(source)}; const a=createSqliteAdapters(process.argv[1]); await a.storage.leaseDeliveries(process.argv[2],1,1); process.exit(0);`,
+        a.filename,
+        delivery.target_fingerprint,
+      ],
+      { cwd: process.cwd(), windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] },
+    );
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    const [exitCode] = await once(child, 'close');
+    assert.equal(exitCode, 0, stderr);
+    const abandoned = (await a.storage.get('outbound_deliveries', delivery.id))!;
+    assert.equal(abandoned.attempt_count, 2147483647);
+    assert.ok(abandoned.lock_token);
+    const [recovered] = await a.storage.leaseDeliveries!(delivery.target_fingerprint, 1, 60_000);
+    assert.ok(recovered);
+    assert.equal(recovered.attempt_count, 2147483647);
+    assert.notEqual(recovered.lock_token, abandoned.lock_token);
+    assert.equal(recovered.body, delivery.body);
+    await a.storage.finishDelivery!(abandoned, { sent_at: new Date().toISOString() });
+    assert.equal((await a.storage.get('outbound_deliveries', delivery.id))?.sent_at, null);
+    await a.storage.finishDelivery!(recovered, { sent_at: new Date().toISOString() });
+    assert.deepEqual(await a.storage.deliveryMetrics!(), {
+      webhook_pending: 0,
+      webhook_failed: 0,
+      webhook_attempts: 2147483647,
+    });
+  } finally {
     await a.dispose();
   }
 });
