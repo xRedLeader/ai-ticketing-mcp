@@ -12,6 +12,7 @@ import { createSqliteAdapters } from '../src/adapters/sqlite.js';
 import { createApplication } from '../src/application.js';
 import { fixture, registerAdapterContractTests, testEmbeddings } from '../src/testing/contracts.js';
 import type { OutboundDelivery } from '../src/contracts.js';
+import { registerKnowledgeContractTests } from '../src/testing/knowledge-contracts.js';
 
 async function adapters() {
   const directory = await mkdtemp(join(tmpdir(), 'ticketing-sqlite-'));
@@ -60,6 +61,7 @@ async function deliveryRecord(
   };
 }
 registerAdapterContractTests('SQLite', adapters);
+registerKnowledgeContractTests('SQLite', adapters);
 
 it('prunes old receipts only when worker retention is configured', async () => {
   const f = await setup();
@@ -108,6 +110,8 @@ it('upgrades schema 001 without losing tickets and stores immutable GitHub evide
     const actorId = randomUUID(),
       projectId = randomUUID(),
       ticketId = randomUUID();
+    const knowledgeId = randomUUID(),
+      archivedKnowledgeId = randomUUID();
     const at = new Date().toISOString();
     const db = new DatabaseSync(a.filename);
     try {
@@ -137,6 +141,21 @@ it('upgrades schema 001 without losing tickets and stores immutable GitHub evide
         'Original ticket',
         'Preserve this existing body.',
       );
+      for (const [id, kind, revision, archived] of [
+        [knowledgeId, 'decision', 3, 0],
+        [archivedKnowledgeId, 'policy', 7, 1],
+      ] as const)
+        db.prepare('INSERT INTO knowledge VALUES(?,?,?,?,?,?,?,?,?)').run(
+          id,
+          projectId,
+          'Original knowledge',
+          'Preserve this existing evidence.',
+          kind,
+          revision,
+          archived,
+          actorId,
+          at,
+        );
     } finally {
       db.close();
     }
@@ -151,6 +170,47 @@ it('upgrades schema 001 without losing tickets and stores immutable GitHub evide
     assert.equal(original.github_pull_request, undefined);
     assert.equal((await a.storage.get('actors', actorId))?.name, 'Original operator');
     assert.equal((await a.storage.get('projects', projectId))?.scheduling_policy, undefined);
+    for (const [id, revision, archived] of [
+      [knowledgeId, 3, false],
+      [archivedKnowledgeId, 7, true],
+    ] as const) {
+      const current = await a.storage.get('knowledge', id);
+      assert.deepEqual(current?.sources, []);
+      assert.deepEqual(current?.verification, { state: 'unverified' });
+      assert.equal(current?.status, 'proposed');
+      assert.equal(current?.archived, archived);
+      assert.equal(current?.actor_id, actorId);
+      assert.equal(current?.updated_at, at);
+      const historical = (await app.execute(actorId, 'knowledge_get', {
+        project_id: projectId,
+        knowledge_id: id,
+        revision,
+      })) as any;
+      assert.equal(historical.id, id);
+      assert.equal(historical.body, 'Preserve this existing evidence.');
+      assert.equal(historical.trusted_reuse, false);
+      assert.equal((await a.storage.find('knowledge_revisions', { where: { knowledge_id: id } })).length, 1);
+      await assert.rejects(
+        app.execute(actorId, 'knowledge_get', { project_id: projectId, knowledge_id: id, revision: 1 }),
+        { code: 'NOT_FOUND' },
+      );
+    }
+    const database = new DatabaseSync(a.filename);
+    try {
+      assert.throws(
+        () =>
+          database
+            .prepare('UPDATE knowledge_revisions SET body=? WHERE knowledge_id=?')
+            .run('tampered', knowledgeId),
+        /immutable/,
+      );
+      assert.throws(
+        () => database.prepare('DELETE FROM knowledge_revisions WHERE knowledge_id=?').run(knowledgeId),
+        /immutable/,
+      );
+    } finally {
+      database.close();
+    }
     const linked = { ...original, github_pull_request: { repository: 'owner/repository', number: 7 } };
     const evidence = {
       id: randomUUID(),

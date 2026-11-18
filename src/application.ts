@@ -713,7 +713,12 @@ export class Application {
   private async checkParent(reader: Reader, ticket: Ticket, parentId: string | null) {
     if (parentId) await this.checkCycle(reader, ticket.project_id, parentId, ticket.id);
   }
-  private async canReview(reader: Reader, actor: Actor, project: Project, submission: Submission) {
+  private async canReview(
+    reader: Reader,
+    actor: Actor,
+    project: Project,
+    submission: Pick<Submission, 'actor_id'>,
+  ) {
     await this.access(reader, actor, project.id, ['verifier', 'admin']);
     ensure(
       project.policy === 'self' || submission.actor_id !== actor.id,
@@ -751,7 +756,7 @@ export class Application {
     const roles: Role[] = ['contributor', 'admin'];
     if (['project_update', 'member_set'].includes(operation)) roles.splice(0, roles.length, 'admin');
     if (operation === 'ticket_review') roles.splice(0, roles.length, 'verifier', 'admin');
-    if (operation === 'ticket_note') roles.push('verifier');
+    if (operation === 'ticket_note' || operation === 'knowledge_write') roles.push('verifier');
     return this.scoped(actorId, operation, input, roles, async (tx, project, actor) => {
       switch (operation) {
         case 'project_create': {
@@ -880,24 +885,100 @@ export class Application {
           }
           if (input.kind === 'policy' || previous?.kind === 'policy')
             await this.access(tx, actor, project.id, ['admin']);
+          const sources: Knowledge['sources'] = input.sources ?? previous?.sources ?? [];
+          const changed =
+            !previous ||
+            digest([input.title, input.body, input.kind, sources]) !==
+              digest([previous.title, previous.body, previous.kind, previous.sources]);
+          if (changed || input.archived !== previous?.archived)
+            await this.access(tx, actor, project.id, ['contributor', 'admin']);
+          let verification: Knowledge['verification'] = changed
+            ? { state: 'unverified' }
+            : previous!.verification;
+          const status: Knowledge['status'] =
+            input.status ??
+            (changed || input.verification?.state === 'unverified' ? 'proposed' : previous!.status);
+          if (
+            input.sources !== undefined ||
+            input.verification?.state === 'verified' ||
+            input.status === 'accepted'
+          ) {
+            for (const source of sources) {
+              const current = await this.sourceDocument(tx, source.kind, source.id);
+              ensure(
+                current && current.project_id === project.id,
+                'INVALID_REFERENCE',
+                'Knowledge sources must belong to this project.',
+              );
+              ensure(
+                current.revision === source.revision,
+                'VERSION_CONFLICT',
+                'A knowledge source revision changed. Read the current source before citing or verifying it.',
+              );
+              if (input.verification?.state === 'verified' || input.status === 'accepted')
+                ensure(
+                  !current.archived,
+                  'INVALID_REFERENCE',
+                  'Archived sources cannot be verified as current evidence.',
+                );
+            }
+          }
+          if (input.verification?.state === 'verified') {
+            ensure(
+              previous && !changed,
+              'INVALID_INPUT',
+              'Review an existing unchanged proposal before verifying it.',
+            );
+            await this.canReview(tx, actor, project, previous);
+            ensure(
+              sources.length > 0,
+              'INVALID_INPUT',
+              'Verification requires supporting source identities and revisions.',
+            );
+            verification = {
+              state: 'verified',
+              actor_id: actor.id,
+              verified_at: this.timestamp(),
+              evidence: input.verification.evidence,
+            };
+          } else if (input.verification?.state === 'unverified') verification = { state: 'unverified' };
+          if (status === 'accepted') {
+            if (input.status === 'accepted')
+              await this.canReview(tx, actor, project, previous ?? { actor_id: actor.id });
+            ensure(
+              verification.state === 'verified' && sources.length > 0,
+              'INVALID_INPUT',
+              'Acceptance requires explicitly verified supporting evidence.',
+            );
+          }
           const document: Knowledge = {
             id: previous?.id ?? randomUUID(),
             project_id: project.id,
             title: input.title,
             body: input.body,
             kind: input.kind,
+            sources,
+            status,
+            verification,
             revision: (previous?.revision ?? 0) + 1,
             archived: input.archived,
-            actor_id: actor.id,
+            actor_id: changed ? actor.id : previous!.actor_id,
             updated_at: this.timestamp(),
           };
           await tx.put('knowledge', document);
+          await tx.put('knowledge_revisions', {
+            ...document,
+            id: `${document.id}:${document.revision}`,
+            knowledge_id: document.id,
+          });
           await this.queue(tx, document, 'knowledge');
           await this.event(tx, project, actor, 'knowledge.updated', document.id, {
             revision: document.revision,
             archived: document.archived,
+            status: document.status,
+            verification_state: document.verification.state,
           });
-          return document;
+          return { ...document, verification_state: document.verification.state };
         }
         case 'work_claim': {
           const ticket = input.ticket_id
@@ -1470,9 +1551,12 @@ export class Application {
         return note;
       }
       case 'knowledge_get': {
-        const document = await this.storage.get('knowledge', input.knowledge_id);
+        const document =
+          input.revision === undefined
+            ? await this.storage.get('knowledge', input.knowledge_id)
+            : await this.storage.get('knowledge_revisions', `${input.knowledge_id}:${input.revision}`);
         ensure(document && document.project_id === project.id, 'NOT_FOUND', 'Knowledge document not found.');
-        return document;
+        return { ...document, id: input.knowledge_id };
       }
       case 'changes_since': {
         const events = await this.storage.find('events', {
@@ -1524,6 +1608,11 @@ export class Application {
             title: item.title,
             text: item.body,
             archived: item.archived,
+            memory: {
+              status: item.status,
+              verification_state: item.verification.state,
+              trusted_reuse: false,
+            },
           }
         : null;
     }
@@ -1603,9 +1692,11 @@ export class Application {
               : hit.kind === 'checkpoint'
                 ? 'checkpoint_id'
                 : 'knowledge_id']: source.id,
+            ...(hit.kind === 'knowledge' ? { revision: source.revision } : {}),
           },
         },
         untrusted_content: true,
+        ...(source.memory ? { memory: source.memory } : {}),
       });
       if (results.length === input.limit) break;
     }

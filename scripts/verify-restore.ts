@@ -17,6 +17,7 @@ const tables = [
   'submissions',
   'reviews',
   'knowledge',
+  'knowledge_revisions',
   'events',
   'receipts',
   'jobs',

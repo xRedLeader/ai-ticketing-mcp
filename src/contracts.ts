@@ -128,11 +128,18 @@ export interface Knowledge {
   project_id: string;
   title: string;
   body: string;
-  kind: 'policy' | 'decision' | 'runbook' | 'architecture' | 'note';
+  kind: 'policy' | 'decision' | 'convention' | 'pitfall' | 'runbook' | 'architecture' | 'note';
+  sources: { kind: 'ticket' | 'knowledge' | 'checkpoint'; id: string; revision: number }[];
+  status: 'proposed' | 'accepted';
+  verification:
+    { state: 'unverified' } | { state: 'verified'; actor_id: string; verified_at: string; evidence: string };
   revision: number;
   archived: boolean;
   actor_id: string;
   updated_at: string;
+}
+export interface KnowledgeRevision extends Knowledge {
+  knowledge_id: string;
 }
 export interface Event {
   id: string;
@@ -240,6 +247,7 @@ export interface Tables {
   submissions: Submission;
   reviews: Review;
   knowledge: Knowledge;
+  knowledge_revisions: KnowledgeRevision;
   events: Event;
   receipts: Receipt;
   jobs: Job;
@@ -316,6 +324,11 @@ export interface SearchDocument {
   title: string;
   text: string;
   archived: boolean;
+  memory?: {
+    status: Knowledge['status'];
+    verification_state: Knowledge['verification']['state'];
+    trusted_reuse: false;
+  };
 }
 export interface SearchHit {
   id: string;

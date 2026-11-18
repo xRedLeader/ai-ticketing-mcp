@@ -23,6 +23,20 @@ import {
 } from '../contracts.js';
 import { MAX_INDEX_JOB_ATTEMPTS } from './index-job-policy.js';
 
+const knowledgeColumns = [
+  'id',
+  'project_id',
+  'title',
+  'body',
+  'kind',
+  'sources',
+  'status',
+  'verification',
+  'revision',
+  'archived',
+  'actor_id',
+  'updated_at',
+];
 const columns: Record<Table, string[]> = {
   outbound_deliveries: [
     'id',
@@ -128,7 +142,8 @@ const columns: Record<Table, string[]> = {
     'ticket_revision',
     'created_at',
   ],
-  knowledge: ['id', 'project_id', 'title', 'body', 'kind', 'revision', 'archived', 'actor_id', 'updated_at'],
+  knowledge: knowledgeColumns,
+  knowledge_revisions: [...knowledgeColumns, 'knowledge_id'],
   events: ['id', 'project_id', 'seq', 'actor_id', 'type', 'entity_id', 'data', 'created_at'],
   receipts: ['id', 'project_id', 'actor_id', 'operation', 'input_hash', 'result', 'created_at'],
   jobs: [
@@ -153,6 +168,8 @@ const jsonColumns = new Set([
   'execution_hints',
   'github_pull_request',
   'checks',
+  'sources',
+  'verification',
 ]);
 type Executor = Pick<pg.Pool, 'query'> | Pick<pg.PoolClient, 'query'>;
 function decode(row: Record<string, unknown>) {
@@ -278,7 +295,7 @@ function repository(db: Executor): Transaction {
       const values = keys.map((key) => (jsonColumns.has(key) ? JSON.stringify(record[key]) : record[key]));
       const names = keys.map((key) => field(table, key));
       const conflict =
-        table === 'github_evidence' || table === 'outbound_deliveries'
+        table === 'github_evidence' || table === 'outbound_deliveries' || table === 'knowledge_revisions'
           ? ''
           : ` ON CONFLICT(id) DO UPDATE SET ${names
               .filter((name) => name !== '"id"')
@@ -291,6 +308,11 @@ function repository(db: Executor): Transaction {
     },
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
+      ensure(
+        table !== 'knowledge' && table !== 'knowledge_revisions',
+        'IMMUTABLE_KNOWLEDGE',
+        'Archive knowledge instead of deleting its revision history.',
+      );
       ensure(table !== 'github_evidence', 'IMMUTABLE_EVIDENCE', 'GitHub evidence snapshots are immutable.');
       ensure(table !== 'outbound_deliveries', 'IMMUTABLE_DELIVERY', 'Outbound deliveries are immutable.');
       await db.query(`DELETE FROM "${table}" WHERE id=$1`, [id]);

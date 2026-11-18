@@ -141,7 +141,7 @@ docker compose cp .local/ticketing.dump db:/tmp/ticketing-restore.dump
 docker compose exec -T db pg_restore -U ticketing_owner -d ticketing_restore --no-owner --no-privileges /tmp/ticketing-restore.dump
 ```
 
-Recreate least-privilege runtime grants for the restored database before connecting the application. Check ticket, criterion, submission, review, knowledge, and event counts; run application reads against it before any cutover. Back up the Keycloak database separately, along with encrypted operator configuration and the identities' issuer URL. Search indexes are reconstructible, but audit history, receipts, and primary records are not.
+Recreate least-privilege runtime grants for the restored database before connecting the application. Check ticket, criterion, submission, review, knowledge, immutable knowledge revision, and event counts; run application reads against it before any cutover. Back up the Keycloak database separately, along with encrypted operator configuration and the identities' issuer URL. Search indexes are reconstructible, but audit history, receipts, and primary records are not.
 
 Use `scripts/verify-restore.ts` to compare a source and restored database with `SOURCE_DATABASE_URL` and `RESTORE_DATABASE_URL`; it performs read-only checks. Retention and restoration scheduling belong to the operator. No destructive restore or automatic deletion command is exposed over MCP.
 

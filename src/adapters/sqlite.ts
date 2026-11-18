@@ -26,6 +26,20 @@ import {
 } from '../contracts.js';
 import { MAX_INDEX_JOB_ATTEMPTS } from './index-job-policy.js';
 
+const knowledgeColumns = [
+  'id',
+  'project_id',
+  'title',
+  'body',
+  'kind',
+  'sources',
+  'status',
+  'verification',
+  'revision',
+  'archived',
+  'actor_id',
+  'updated_at',
+];
 const columns: Record<Table, string[]> = {
   actors: ['id', 'issuer', 'subject', 'name', 'kind', 'system_admin'],
   projects: [
@@ -102,7 +116,8 @@ const columns: Record<Table, string[]> = {
     'ticket_revision',
     'created_at',
   ],
-  knowledge: ['id', 'project_id', 'title', 'body', 'kind', 'revision', 'archived', 'actor_id', 'updated_at'],
+  knowledge: knowledgeColumns,
+  knowledge_revisions: [...knowledgeColumns, 'knowledge_id'],
   events: ['id', 'project_id', 'seq', 'actor_id', 'type', 'entity_id', 'data', 'created_at'],
   receipts: ['id', 'project_id', 'actor_id', 'operation', 'input_hash', 'result', 'created_at'],
   jobs: [
@@ -156,6 +171,8 @@ const json = new Set([
   'execution_hints',
   'github_pull_request',
   'checks',
+  'sources',
+  'verification',
   'data',
   'result',
 ]);
@@ -303,7 +320,7 @@ function repository(db: DatabaseSync): Transaction {
         'A record ID is required.',
       );
       const conflict =
-        table === 'github_evidence' || table === 'outbound_deliveries'
+        table === 'github_evidence' || table === 'outbound_deliveries' || table === 'knowledge_revisions'
           ? ''
           : ` ON CONFLICT(id) DO UPDATE SET ${keys
               .filter((key) => key !== 'id')
@@ -315,6 +332,11 @@ function repository(db: DatabaseSync): Transaction {
     },
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
+      ensure(
+        table !== 'knowledge' && table !== 'knowledge_revisions',
+        'IMMUTABLE_KNOWLEDGE',
+        'Archive knowledge instead of deleting its revision history.',
+      );
       ensure(table !== 'github_evidence', 'IMMUTABLE_EVIDENCE', 'GitHub evidence records are immutable.');
       ensure(
         table !== 'outbound_deliveries',
