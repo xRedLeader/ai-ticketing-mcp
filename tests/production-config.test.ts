@@ -112,7 +112,10 @@ it('checks exact production identities, assigned realm audience, private ports a
           windowsHide: true,
         },
       ),
-      (error: any) => error.code === 1 && /Run --prepare-realm/.test(error.stderr),
+      (error: any) =>
+        error.code === 1 &&
+        /Run --prepare-realm/.test(error.stderr) &&
+        /both new and existing/.test(error.stderr),
     );
   } finally {
     assert.equal(dirname(resolve(directory)), resolve(tmpdir()));

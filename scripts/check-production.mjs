@@ -173,7 +173,7 @@ async function main() {
     );
   } catch {
     throw new Error(
-      'Cannot read realm JSON. Run --prepare-realm for a new installation; use --realm-file with a private current export for an existing realm.',
+      'Cannot read realm JSON. Run --prepare-realm to create the required mounted import for both new and existing installations; existing realms additionally require --realm-file with a private current export.',
     );
   }
   try {
