@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -15,10 +17,11 @@ const exec = promisify(execFile);
 const work = { name: 'work', description: 'Do work', inputSchema: { type: 'object' } };
 const added = { name: 'added', description: 'New tool', inputSchema: { type: 'object' } };
 
-async function fixture(t: TestContext, env: Record<string, string> = {}, modern = false) {
+async function fixture(t: TestContext, env: Record<string, string> = {}, modern = false, sqlite = false) {
   const directory = await mkdtemp(join(tmpdir(), 'ticketing-stdio-reload-'));
   const pointer = join(directory, 'active');
   const journal = join(directory, 'started');
+  const database = join(directory, 'test.sqlite');
   const updates: (string[] | Error)[] = [];
   const client = new Client(
     { name: 'reload-test', version: '1' },
@@ -42,15 +45,6 @@ async function fixture(t: TestContext, env: Record<string, string> = {}, modern 
       );
     });
   let diagnostics = '';
-  const relay = new StdioClientTransport({
-    command: process.execPath,
-    args: ['--import', 'tsx', entry, '--pointer', pointer],
-    stderr: 'pipe',
-    env,
-  });
-  relay.stderr?.on('data', (chunk) => {
-    diagnostics += chunk.toString();
-  });
   t.after(async () => {
     await client.close();
     await rm(directory, { recursive: true, force: true });
@@ -66,23 +60,47 @@ async function fixture(t: TestContext, env: Record<string, string> = {}, modern 
       prompts?: Record<string, unknown>[];
       replies?: Record<string, unknown>[];
       metadata?: Record<string, unknown>;
+      expansion?: string;
+      failLive?: boolean;
+      disconnectAfterInit?: boolean;
+      editDuringProbe?: boolean;
     } = {},
   ) => {
     const folder = join(directory, version);
     const migrations = join(folder, 'migrations', 'sqlite');
     await mkdir(migrations, { recursive: true });
     await writeFile(join(migrations, '001.sql'), options.migration ?? 'SELECT 1;');
+    if (options.expansion) await writeFile(join(migrations, '002.sql'), options.expansion);
     await mkdir(join(folder, 'dist'));
     const path = join(folder, 'dist', 'cli.js');
     // Each invocation writes one journal entry; waiting and crashing are test-only controls.
     await writeFile(
       path,
       `const { createInterface } = require('node:readline');
-const { appendFileSync } = require('node:fs');
+const { appendFileSync, readFileSync, readdirSync, existsSync, writeFileSync } = require('node:fs');
+const { join } = require('node:path');
 const version = ${JSON.stringify(version)};
 const journal = ${JSON.stringify(journal)};
 const modern = ${modern};
 const options = ${JSON.stringify(options)};
+if (${sqlite}) {
+  const path = process.env.SQLITE_PATH;
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync(path);
+  db.exec('PRAGMA busy_timeout=3000; BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS schema_migrations(name TEXT PRIMARY KEY, applied_at TEXT NOT NULL);');
+  const migrations = join(__dirname,'..','migrations','sqlite');
+  for (const name of readdirSync(migrations).sort()) {
+    if (db.prepare('SELECT 1 FROM schema_migrations WHERE name=?').get(name)) continue;
+    db.exec(readFileSync(join(migrations,name),'utf8'));
+    db.prepare('INSERT INTO schema_migrations VALUES(?,?)').run(name,new Date().toISOString());
+  }
+  db.exec('COMMIT');
+  db.close();
+  if (options.editDuringProbe && path !== ${JSON.stringify(database)}) {
+    writeFileSync(join(migrations,'002.sql'),'CREATE TABLE edited (id TEXT);');
+  }
+  if (options.failLive && path === ${JSON.stringify(database)}) process.exit(1);
+}
 const capabilities = {tools: options.listChanged ? {listChanged:true} : {}, prompts:{}};
 const replies = options.replies ?? [{tools:options.tools ?? ${JSON.stringify([work])},...options.metadata}];
 let lists = 0;
@@ -96,7 +114,14 @@ createInterface({input:process.stdin}).on('line', line=>{
   if(method==='server/discover') return modern
     ? send({id,result:{supportedVersions:['2026-07-28'],capabilities,instructions:options.instructions}})
     : send({id,error:{code:-32601,message:'Method not found'}});
-  if(method==='initialize') return send({id,result:{protocolVersion:params.protocolVersion,capabilities,serverInfo:{name:'fixture',version},instructions:options.instructions}});
+  if(method==='initialize') {
+    send({id,result:{protocolVersion:params.protocolVersion,capabilities,serverInfo:{name:'fixture',version},instructions:options.instructions}});
+    if (options.disconnectAfterInit && !existsSync(journal+'.disconnected')) {
+      writeFileSync(journal+'.disconnected','');
+      setTimeout(()=>process.exit(1),60);
+    }
+    return;
+  }
   if(method==='tools/list') return send({id,result:replies[Math.min(lists++,replies.length-1)]});
   if(method==='prompts/list') return send({id,result:{prompts:options.prompts ?? []}});
   if(method==='tools/call') {
@@ -117,9 +142,23 @@ createInterface({input:process.stdin}).on('line', line=>{
     return content.text;
   };
   const events = () => readFile(journal, 'utf8');
-  const connect = async (path: string) => {
-    await select(path);
+  const connect = async (path: string, selected = path) => {
+    await select(selected);
+    const relay = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', 'tsx', entry, '--pointer', pointer, ...(sqlite ? ['--sqlite-base', path] : [])],
+      stderr: 'pipe',
+      env: sqlite ? { ...env, STORAGE_ADAPTER: 'sqlite', SQLITE_PATH: database } : env,
+    });
+    relay.stderr?.on('data', (chunk) => {
+      diagnostics += chunk.toString();
+    });
     await client.connect(relay);
+    if (sqlite && existsSync(join(directory, 'started.disconnected'))) {
+      for (let i = 0; i < 150 && !diagnostics.includes('mcp_relay_backend_disconnected'); i++)
+        await delay(10);
+      assert.match(diagnostics, /mcp_relay_backend_disconnected/);
+    }
     // Modern stdio negotiation probes a sibling process; advertise on this connection too.
     if (modern) await client.discover();
     assert.equal((await client.listTools()).tools[0]?.name, 'work');
@@ -129,8 +168,87 @@ createInterface({input:process.stdin}).on('line', line=>{
     assert.equal(updates.length, count);
     return updates;
   };
-  return { build, call, connect, select, events, client, updates, refreshed, diagnostics: () => diagnostics };
+  const tableExists = (name: string) => {
+    const db = new DatabaseSync(database, { readOnly: true });
+    try {
+      return Boolean(db.prepare('SELECT 1 FROM sqlite_schema WHERE name=?').get(name));
+    } finally {
+      db.close();
+    }
+  };
+  return {
+    build,
+    call,
+    connect,
+    select,
+    events,
+    client,
+    updates,
+    refreshed,
+    tableExists,
+    diagnostics: () => diagnostics,
+  };
 }
+
+test('does not expand live SQLite until shadow discovery passes, even on a fresh connection', async (t) => {
+  const f = await fixture(t, {}, false, true);
+  const base = await f.build('base');
+  const bad = await f.build('incompatible', {
+    instructions: 'Incompatible',
+    expansion: 'CREATE TABLE unexpected (id TEXT);',
+  });
+  await f.connect(base, bad);
+  assert.equal(await f.call('unchanged'), 'base');
+  assert.equal(f.tableExists('unexpected'), false);
+  const good = await f.build('ready', { expansion: 'CREATE TABLE accepted (id TEXT);' });
+  await f.select(good);
+  assert.equal(await f.call('after-expansion'), 'ready');
+  assert(f.tableExists('accepted'));
+  await f.select(base);
+  assert.equal(await f.call('after-binary-rollback'), 'base');
+  assert(f.tableExists('accepted'));
+});
+
+test('reopens the trusted base if its backend disconnects before tool discovery', async (t) => {
+  const f = await fixture(t, {}, false, true);
+  const base = await f.build('base', { disconnectAfterInit: true });
+  await f.connect(base);
+  assert.equal(await f.call('after-recovery'), 'base');
+  assert.equal(await f.events(), 'base:after-recovery\n');
+});
+
+test('retains the previous backend and committed expansion if live candidate startup fails', async (t) => {
+  const f = await fixture(t, {}, false, true);
+  const base = await f.build('base');
+  const migration = 'CREATE TABLE accepted (id TEXT);';
+  const failed = await f.build('fails-live', { expansion: migration, failLive: true });
+  await f.connect(base);
+  await f.select(failed);
+  assert.equal(await f.call('retained'), 'base');
+  assert(f.tableExists('accepted'));
+  const conflict = await f.build('conflict', { expansion: 'CREATE TABLE conflict (id TEXT);' });
+  await f.select(conflict);
+  assert.equal(await f.call('conflict-rejected'), 'base');
+  assert.equal(f.tableExists('conflict'), false);
+  const recovered = await f.build('recovered', { expansion: migration });
+  await f.select(recovered);
+  assert.equal(await f.call('exact-retry'), 'recovered');
+});
+
+test('rejects migration files edited during the shadow startup', async (t) => {
+  const f = await fixture(t, {}, false, true);
+  const base = await f.build('base');
+  const edited = await f.build('edited', {
+    expansion: 'CREATE TABLE proposed (id TEXT);',
+    editDuringProbe: true,
+  });
+  await f.connect(base);
+  await f.select(edited);
+  assert.equal(await f.call('retained'), 'base');
+  assert.equal(f.tableExists('proposed'), false);
+  assert.equal(f.tableExists('edited'), false);
+  assert.match(f.diagnostics(), /migration files changed during validation/);
+});
 
 test('switches a connected client at idle, rejects a changed catalog, and can roll back', async (t) => {
   const f = await fixture(t);

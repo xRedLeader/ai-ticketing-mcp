@@ -5,8 +5,9 @@ import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { createHash, randomUUID } from 'node:crypto';
 import { readdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
-import { parseArgs } from 'node:util';
+import { isDeepStrictEqual, parseArgs } from 'node:util';
 import { serializeSuccessEnvelope } from './envelope.js';
+import { prepareSqliteReload, readSqliteMigrations, type SqliteMigrations } from './hot-reload-sqlite.js';
 import { parseMcpProfile } from './profiles.js';
 
 type Message = Parameters<StdioServerTransport['send']>[0];
@@ -104,7 +105,7 @@ async function selectEntry(pointer: string, path: string) {
   process.stdout.write(`${JSON.stringify({ selected: entry })}\n`);
 }
 
-async function relay(pointer: string, profile: string) {
+async function relay(pointer: string, profile: string, sqliteBase?: string) {
   const front = new StdioServerTransport();
   const pending = new Map<Request['id'], Bootstrap | null>();
   const bootstrap: Bootstrap[] = [];
@@ -112,6 +113,7 @@ async function relay(pointer: string, profile: string) {
   let stopping = false;
   let attempted: string | undefined;
   let deployed: string | undefined;
+  let deployedMigrations: SqliteMigrations | undefined;
   let active: Backend | undefined;
   let candidate: Backend | undefined;
   let messages = Promise.resolve();
@@ -187,13 +189,25 @@ async function relay(pointer: string, profile: string) {
     };
   }
 
-  async function open(entry: string, replay: readonly Bootstrap[]) {
+  async function open(entry: string, replay: readonly Bootstrap[], shadowDatabase?: string) {
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [entry, 'stdio', '--profile', profile],
-      env: Object.fromEntries(
-        Object.entries(process.env).filter((pair): pair is [string, string] => pair[1] !== undefined),
-      ),
+      env: {
+        ...Object.fromEntries(
+          Object.entries(process.env).filter((pair): pair is [string, string] => pair[1] !== undefined),
+        ),
+        ...(shadowDatabase
+          ? {
+              SQLITE_PATH: shadowDatabase,
+              TICKETING_WEBHOOK_URL: '',
+              TICKETING_WEBHOOK_SECRET: '',
+              EMBEDDING_PROVIDER: 'none',
+              MCP_PROFILE_CAPTURE: 'false',
+              REFERENCE_TOKEN_METRICS: 'false',
+            }
+          : {}),
+      },
     });
     const backend = { entry, transport };
     candidate = backend;
@@ -247,6 +261,11 @@ async function relay(pointer: string, profile: string) {
         if (definitions.size !== 1) throw new Error('Candidate tool catalog changed during discovery.');
       }
       if (stopping) throw new Error('Client closed.');
+      if (shadowDatabase) {
+        // Rehearse the real startup and discovery without promoting its state or notifying the client.
+        await transport.close();
+        return;
+      }
       const previous = active;
       active = backend;
       deployed = entry;
@@ -259,7 +278,8 @@ async function relay(pointer: string, profile: string) {
       if (previous) void previous.transport.close().catch(() => log('mcp_relay_close_error'));
       if (catalogChanged) await send({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
     } catch (error) {
-      void transport.close().catch(() => {});
+      if (shadowDatabase) await transport.close().catch(() => {});
+      else void transport.close().catch(() => {});
       throw error;
     } finally {
       candidate = undefined;
@@ -270,11 +290,53 @@ async function relay(pointer: string, profile: string) {
   async function reload() {
     if (pending.size || pinned || stopping) return;
     try {
+      if (sqliteBase && !deployed) {
+        // A fresh connection must learn the trusted catalog before probing a schema change.
+        deployedMigrations = await readSqliteMigrations(sqliteBase);
+        await open(sqliteBase, []);
+        attempted = sqliteBase;
+        return;
+      }
+      if (
+        sqliteBase &&
+        !bootstrap.some((frame) => !('notification' in frame) && frame.catalog && 'result' in frame.catalog)
+      ) {
+        if (!active && deployed) await open(deployed, bootstrap);
+        return;
+      }
       const selected = (await readFile(pointer, 'utf8')).trim();
       if (selected === attempted) return;
       attempted = selected;
       const entry = await validateEntry(selected);
-      // The SQLite stdio CLI migrates during startup. Never let a rejected probe change the live schema.
+      if (active?.entry === entry) return;
+      if (sqliteBase && deployedMigrations) {
+        const migrations = await readSqliteMigrations(entry);
+        const verifyMigrationFiles = async () => {
+          if (!isDeepStrictEqual(migrations, await readSqliteMigrations(entry)))
+            throw new Error('Candidate migration files changed during validation.');
+        };
+        const plan = await prepareSqliteReload(
+          deployedMigrations,
+          migrations,
+          process.env.SQLITE_PATH?.trim() || '.local/ticketing.sqlite',
+        );
+        if (plan) {
+          try {
+            await open(entry, bootstrap, plan.filename);
+            if (stopping) return;
+            await verifyMigrationFiles();
+            await plan.apply();
+          } finally {
+            await plan.dispose();
+          }
+        }
+        if (stopping) return;
+        await verifyMigrationFiles();
+        await open(entry, bootstrap);
+        deployedMigrations = migrations;
+        return;
+      }
+      // Existing launchers without a trusted base keep the original same-schema guard.
       if (deployed && deployed !== entry && process.env.STORAGE_ADAPTER === 'sqlite') {
         const [current, replacement] = await Promise.all([
           sqliteMigrations(deployed),
@@ -283,7 +345,7 @@ async function relay(pointer: string, profile: string) {
         if (current !== replacement)
           throw new Error('SQLite migrations changed; a controlled upgrade is required.');
       }
-      if (active?.entry !== entry) await open(entry, bootstrap);
+      await open(entry, bootstrap);
     } catch (error) {
       log('mcp_relay_rejected', {
         retained: Boolean(active),
@@ -342,14 +404,27 @@ async function relay(pointer: string, profile: string) {
 async function main() {
   process.stderr.on('error', () => {});
   const { values } = parseArgs({
-    options: { pointer: { type: 'string' }, profile: { type: 'string' }, select: { type: 'string' } },
+    options: {
+      pointer: { type: 'string' },
+      profile: { type: 'string' },
+      select: { type: 'string' },
+      'sqlite-base': { type: 'string' },
+    },
   });
   if (!values.pointer || !isAbsolute(values.pointer))
     throw new Error(
-      'Usage: node dist/stdio-hot-reload.js --pointer ABSOLUTE_PATH [--profile NAME | --select ABSOLUTE_CLI]',
+      'Usage: node dist/stdio-hot-reload.js --pointer ABSOLUTE_PATH [--profile NAME [--sqlite-base ABSOLUTE_CLI] | --select ABSOLUTE_CLI]',
     );
   if (values.select !== undefined) await selectEntry(values.pointer, values.select);
-  else await relay(values.pointer, parseMcpProfile(values.profile));
+  else {
+    if (values['sqlite-base'] !== undefined && process.env.STORAGE_ADAPTER !== 'sqlite')
+      throw new Error('--sqlite-base requires STORAGE_ADAPTER=sqlite.');
+    await relay(
+      values.pointer,
+      parseMcpProfile(values.profile),
+      values['sqlite-base'] === undefined ? undefined : await validateEntry(values['sqlite-base']),
+    );
+  }
 }
 
 void main().catch((error: unknown) => {
