@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { specTypeSchemas } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { createHash, randomUUID } from 'node:crypto';
@@ -11,7 +12,8 @@ import { parseMcpProfile } from './profiles.js';
 type Message = Parameters<StdioServerTransport['send']>[0];
 type Request = Extract<Message, { method: string; id: string | number }>;
 type Reply = Extract<Message, { result: unknown } | { error: unknown }>;
-type Bootstrap = { message: Request; hash?: string } | { message: Message; notification: true };
+type Bootstrap =
+  { message: Request; hash?: string; catalog?: Reply } | { message: Message; notification: true };
 type Backend = { entry: string; transport: StdioClientTransport };
 
 const discovery = new Set([
@@ -42,6 +44,34 @@ function fingerprint(reply: Reply): string {
   return createHash('sha256')
     .update(serializeSuccessEnvelope({ result: value }))
     .digest('hex');
+}
+
+function toolCatalog(reply: Reply) {
+  if ('error' in reply || !Array.isArray(reply.result.tools))
+    throw new Error('Candidate tool catalog is incomplete.');
+  const { tools, ...metadata } = reply.result;
+  const definitions = new Map<string, string>();
+  for (const tool of tools) {
+    const parsed = specTypeSchemas.Tool['~standard'].validate(tool);
+    if (parsed.issues || definitions.has(parsed.value.name))
+      throw new Error('Candidate tool catalog has invalid or duplicate definitions.');
+    definitions.set(parsed.value.name, serializeSuccessEnvelope(tool));
+  }
+  return { definitions, metadata: serializeSuccessEnvelope(metadata), paginated: 'nextCursor' in metadata };
+}
+
+function addsTools(frame: Exclude<Bootstrap, { notification: true }>, reply: Reply) {
+  if (!frame.catalog) throw new Error('Connected client discovery changed.');
+  const before = toolCatalog(frame.catalog);
+  const after = toolCatalog(reply);
+  // A single page cannot establish that the complete existing catalog is preserved.
+  if (frame.message.params?.cursor !== undefined || before.paginated || after.paginated)
+    throw new Error('Paginated tool catalog changed; reconnect the client.');
+  if (before.metadata !== after.metadata) throw new Error('Connected client discovery changed.');
+  for (const [name, definition] of before.definitions) {
+    if (after.definitions.get(name) !== definition) throw new Error('Existing tool removed or changed.');
+  }
+  return after.definitions.size > before.definitions.size;
 }
 
 async function sqliteMigrations(entry: string) {
@@ -85,6 +115,7 @@ async function relay(pointer: string, profile: string) {
   let active: Backend | undefined;
   let candidate: Backend | undefined;
   let messages = Promise.resolve();
+  let toolsListChanged = false;
 
   const stop = async () => {
     if (stopping) return;
@@ -126,7 +157,30 @@ async function relay(pointer: string, profile: string) {
       if ('method' in message && 'id' in message) pinned = true;
       if (!('method' in message) && message.id !== undefined) {
         const frame = pending.get(message.id);
-        if (frame && !('notification' in frame)) frame.hash = fingerprint(message);
+        if (frame && !('notification' in frame)) {
+          frame.hash = fingerprint(message);
+          if (frame.message.method === 'tools/list') {
+            const cached = bootstrap.find(
+              (cached) => !('notification' in cached) && cached.hash === frame.hash && cached.catalog,
+            );
+            frame.catalog = cached && !('notification' in cached) ? cached.catalog : message;
+          }
+          if (
+            (frame.message.method === 'initialize' || frame.message.method === 'server/discover') &&
+            'result' in message
+          ) {
+            const capabilities = message.result.capabilities;
+            toolsListChanged = Boolean(
+              capabilities &&
+              typeof capabilities === 'object' &&
+              'tools' in capabilities &&
+              capabilities.tools &&
+              typeof capabilities.tools === 'object' &&
+              'listChanged' in capabilities.tools &&
+              capabilities.tools.listChanged === true,
+            );
+          }
+        }
         pending.delete(message.id);
       }
       void send(message);
@@ -159,6 +213,9 @@ async function relay(pointer: string, profile: string) {
     };
     try {
       await Promise.race([aborted, transport.start()]);
+      const catalogs = new Map<Exclude<Bootstrap, { notification: true }>, Reply>();
+      const catalogReplies = new Map<string, Reply>();
+      let catalogChanged = false;
       for (const frame of replay) {
         if ('notification' in frame) {
           await Promise.race([aborted, transport.send(frame.message)]);
@@ -169,15 +226,38 @@ async function relay(pointer: string, profile: string) {
           reply = resolve;
         });
         const result = await Promise.race([aborted, transport.send(frame.message).then(() => response)]);
-        if (fingerprint(result) !== frame.hash) throw new Error('Connected client discovery changed.');
+        const hash = fingerprint(result);
+        if (hash !== frame.hash) {
+          if (frame.message.method !== 'tools/list' || !toolsListChanged)
+            throw new Error('Connected client discovery changed.');
+          catalogChanged = addsTools(frame, result) || catalogChanged;
+        }
+        if (frame.message.method === 'tools/list') {
+          const catalog = catalogReplies.get(hash) ?? result;
+          catalogReplies.set(hash, catalog);
+          catalogs.set(frame, catalog);
+        }
+      }
+      if (catalogChanged) {
+        const definitions = new Set(
+          [...catalogs.values()].map((reply) =>
+            serializeSuccessEnvelope(Object.fromEntries(toolCatalog(reply).definitions)),
+          ),
+        );
+        if (definitions.size !== 1) throw new Error('Candidate tool catalog changed during discovery.');
       }
       if (stopping) throw new Error('Client closed.');
       const previous = active;
       active = backend;
       deployed = entry;
       attach(backend);
+      for (const [frame, reply] of catalogs) {
+        frame.hash = fingerprint(reply);
+        frame.catalog = reply;
+      }
       log(previous ? 'mcp_relay_switched' : 'mcp_relay_ready', { entry, pid: transport.pid });
       if (previous) void previous.transport.close().catch(() => log('mcp_relay_close_error'));
+      if (catalogChanged) await send({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
     } catch (error) {
       void transport.close().catch(() => {});
       throw error;
