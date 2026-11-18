@@ -1,6 +1,6 @@
 {
   "name": "ai-ticketing-mcp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Headless AI work coordination through MCP, with replaceable storage and semantic search.",
   "type": "module",
   "license": "Apache-2.0",

@@ -53,7 +53,7 @@ async function main() {
       'INVALID_CONFIG',
       'Set the token environment variable and --operation.',
     );
-    const client = new Client({ name: 'ai-ticketing-cli', version: '1.0.0' });
+    const client = new Client({ name: 'ai-ticketing-cli', version: '2.0.0' });
     try {
       await client.connect(
         new StreamableHTTPClientTransport(new URL(values.url), {

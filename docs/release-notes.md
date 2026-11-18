@@ -1,13 +1,14 @@
 # Release notes
 
-## Unreleased: compact MCP workflows and self-hosted operation
+## 2.0.0 (unreleased): compact MCP workflows and self-hosted operation
 
-These notes include the breaking changes merged in PR #1 and the self-hosted additions in PR #2. Use a new major version if upgrading a previously published compatible release; the repository's package version is still `1.0.0` and is not a statement that older clients or adapters remain compatible.
+These notes include the breaking changes merged in PR #1 and the self-hosted additions in PR #2. Package, MCP server, and CLI client metadata identify version `2.0.0` because the public input and adapter contracts changed.
 
 ### Required migration from the original MCP API
 
 - Custom storage adapters must implement `readSnapshot<T>(work: (reader: Reader) => Promise<T>): Promise<T>` and `unansweredQuestions`. A snapshot must be consistent and read-only without taking the project mutation lock. Standalone context collection releases the snapshot before token packing. Run the exported adapter contract suite before deploying a replacement adapter; see [adapter requirements](adapters.md).
 - MCP defaults to the worker profile. Select `full` for the original administrative tool surface, or `planner` / `reviewer` for those roles. Profiles do not grant permissions.
+- The `ticket_history` filter is now `nonblocking_unanswered:true`, replacing `unanswered_questions:true` without an alias. It returns only unanswered non-blocking questions; blocking questions remain in context blockers. Generated omission references use the new name. `kind:'notes'` and the prohibition on combining the filter with `item_id` are unchanged.
 - Lists and mutation results are compact. Read complete state through `ticket_get` / `project_get`, and page history explicitly. Follow required context omission references before execution or review. Claim retries replay the original receipt and do not renew ownership.
 - Default page sizes change: lists 25 to 10, `work_next` 5 to 1, search 10 to 3, and `changes_since` 100 to 25. Context defaults to brief (4,096 reference tokens); related knowledge requires explicit search. See [changed defaults](mcp.md#changed-defaults).
 - Embedding identity now includes the endpoint or an explicit shared embedding space. Reindex after an identity change; matching model names alone do not establish compatible vectors.
@@ -17,6 +18,8 @@ Stop application/worker processes, back up and verify restoration, apply all pen
 ### Self-hosted additions
 
 PR #2 adds local SQLite/FTS5 operation, immutable GitHub PR/CI evidence, signed notification delivery, opt-in unblocking scheduling, and advisory project/ticket model and effort hints. Notifications remain disabled until configured. SQLite has one writer and is intended for local operation; PostgreSQL remains the shared-service option.
+
+Query embedding caches use exact text keys within each immutable profile instance. At capacity, expired completed entries are reclaimed before live completed LRU entries; in-flight requests stay protected and coalesced. The 256-entry bound and ten-minute TTL from completion remain unchanged.
 
 ### Operational follow-up
 

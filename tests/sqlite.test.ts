@@ -230,7 +230,7 @@ it('pages only unanswered questions of the requested blocking kind', async () =>
     const page = (await a.app.execute(a.worker.id, 'ticket_history', {
       project_id: a.project.id,
       ticket_id: ticket.id,
-      unanswered_questions: true,
+      nonblocking_unanswered: true,
       limit: 1,
       offset: 1,
     })) as any;

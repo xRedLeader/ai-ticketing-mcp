@@ -39,7 +39,7 @@ it('retrieves only unanswered nonblocking questions with deterministic lossless 
       project_id: f.project.id,
       ticket_id: ticket.id,
       kind: 'notes',
-      unanswered_questions: true,
+      nonblocking_unanswered: true,
     };
     const first = (await f.app.execute(f.worker.id, 'ticket_history', { ...input, limit: 1 })) as any;
     const second = (await f.app.execute(f.worker.id, 'ticket_history', {
@@ -56,7 +56,7 @@ it('retrieves only unanswered nonblocking questions with deterministic lossless 
     assert.equal(context.open_questions[0].id, questions[0]);
     const reference = context.omitted.find((entry: any) => entry.section === 'open_questions_more');
     assert.equal(reference.retrieve_with, 'ticket_history');
-    assert.equal(reference.arguments.unanswered_questions, true);
+    assert.equal(reference.arguments.nonblocking_unanswered, true);
     assert.equal(reference.arguments.offset, 0);
     await f.call(f.worker.id, 'ticket_note', {
       ticket_id: ticket.id,

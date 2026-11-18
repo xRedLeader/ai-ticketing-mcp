@@ -30,18 +30,21 @@ export class CachedEmbeddings implements EmbeddingProvider {
 
   async embed(text: string, purpose: 'query' | 'document'): Promise<number[]> {
     if (purpose === 'document') return (await this.invoke(text, purpose)).slice();
-    const key = JSON.stringify([this.profile.id, this.profile.model, this.profile.dimensions, text]);
-    const cached = this.queries.get(key);
-    if (cached && (cached.expires === undefined || cached.expires > Date.now())) {
-      this.queries.delete(key);
-      this.queries.set(key, cached);
+    const now = Date.now();
+    const cached = this.queries.get(text);
+    if (cached && (cached.expires === undefined || cached.expires > now)) {
+      this.queries.delete(text);
+      this.queries.set(text, cached);
       this.metrics.query_embedding_reuses++;
       return (await cached.value).slice();
     }
-    if (cached) this.queries.delete(key);
+    if (cached) this.queries.delete(text);
     if (this.queries.size === CAPACITY) {
-      const oldestResolved = [...this.queries].find(([, entry]) => entry.expires !== undefined);
-      if (oldestResolved) this.queries.delete(oldestResolved[0]);
+      const entries = [...this.queries];
+      const evicted =
+        entries.find(([, entry]) => entry.expires !== undefined && entry.expires <= now) ??
+        entries.find(([, entry]) => entry.expires !== undefined);
+      if (evicted) this.queries.delete(evicted[0]);
       else {
         this.metrics.query_embedding_saturations++;
         throw new DomainError('EMBEDDING_UNAVAILABLE', 'Semantic query embeddings are busy. Retry later.');
@@ -50,16 +53,16 @@ export class CachedEmbeddings implements EmbeddingProvider {
     const entry: Entry = {
       value: this.invoke(text, purpose).then(
         (vector) => {
-          if (this.queries.get(key) === entry) entry.expires = Date.now() + TTL_MS;
+          if (this.queries.get(text) === entry) entry.expires = Date.now() + TTL_MS;
           return vector.slice();
         },
         (error) => {
-          if (this.queries.get(key) === entry) this.queries.delete(key);
+          if (this.queries.get(text) === entry) this.queries.delete(text);
           throw error;
         },
       ),
     };
-    this.queries.set(key, entry);
+    this.queries.set(text, entry);
     return (await entry.value).slice();
   }
 }

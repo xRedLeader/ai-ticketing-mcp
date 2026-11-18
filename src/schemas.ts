@@ -97,12 +97,12 @@ export const schemas = {
       ...page,
       kind: z.enum(['notes', 'submissions', 'reviews', 'github']).default('notes'),
       item_id: id.optional(),
-      unanswered_questions: z.literal(true).optional(),
+      nonblocking_unanswered: z.literal(true).optional(),
     })
     .strict()
-    .refine((input) => !input.unanswered_questions || (input.kind === 'notes' && !input.item_id), {
-      message: 'unanswered_questions requires notes history and cannot be combined with item_id.',
-      path: ['unanswered_questions'],
+    .refine((input) => !input.nonblocking_unanswered || (input.kind === 'notes' && !input.item_id), {
+      message: 'nonblocking_unanswered requires notes history and cannot be combined with item_id.',
+      path: ['nonblocking_unanswered'],
     }),
   ticket_list: z
     .object({

@@ -1348,7 +1348,7 @@ export class Application {
           });
           return { items: items.map((row) => this.githubView(row, ticket, latest?.id)) };
         }
-        if (input.unanswered_questions)
+        if (input.nonblocking_unanswered)
           return {
             items: await this.storage.unansweredQuestions(
               project.id,
@@ -1767,7 +1767,7 @@ export class Application {
         omission: {
           section: 'open_questions',
           retrieve_with: 'ticket_history',
-          arguments: { ...history('notes'), unanswered_questions: true, offset: 0 },
+          arguments: { ...history('notes'), nonblocking_unanswered: true, offset: 0 },
         },
       },
       {
@@ -1857,7 +1857,7 @@ export class Application {
         addedNotice = {
           section: 'open_questions_more',
           retrieve_with: 'ticket_history',
-          arguments: { ...history('notes'), unanswered_questions: true, offset: 0 },
+          arguments: { ...history('notes'), nonblocking_unanswered: true, offset: 0 },
         };
       const delta =
         cost - this.responseTokens(section.omission) + (addedNotice ? this.responseTokens(addedNotice) : 0);

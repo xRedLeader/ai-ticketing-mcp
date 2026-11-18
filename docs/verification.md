@@ -1,5 +1,13 @@
 # Verification record
 
+## PR #1 optional cleanup in PR #2: 2026-11-18
+
+The remaining query-cache and naming nits are implemented. Query caches use exact text keys within each immutable profile instance and reclaim expired completed entries before live completed LRU entries at capacity. A new regression test first failed on the previous eviction behavior, then passed after the fix; it also verifies that pending work stays coalesced. Existing TTL, capacity, failure-retry, result-isolation, and separate-profile checks still pass.
+
+The history filter and generated omission arguments now use `nonblocking_unanswered`, with no alias for `unanswered_questions`. Schema tests reject the old field and invalid combinations; PostgreSQL and SQLite tests verify the filtered behavior. Package, MCP server, and CLI metadata advance to 2.0.0, with the breaking input change recorded in the release notes.
+
+Local Node 24 validation passed 163 tests (111 unit/SQLite and 52 PostgreSQL), both benchmarks, type checking, build, formatting, and credential scanning. The frozen protocol baseline and workload fixtures were unchanged. Claim packing and receipt retention retain the operating limits measured below.
+
 ## PR #2 review follow-up: 2026-11-18
 
 `npm run benchmark:claims` was run against a new disposable PostgreSQL 17.12 database on the local Docker host, using Node 24.22.3 on Windows (32 available logical CPUs, 31.14 GiB host RAM). Application/database resources were not constrained to the earlier 4-vCPU/8-GB target. This measurement used the PR #2 worktree based on `10da326`, with the new benchmark; CI attaches a fresh report to each tested commit.

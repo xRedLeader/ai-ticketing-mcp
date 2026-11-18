@@ -139,13 +139,15 @@ it('makes reference-token telemetry opt-in without disabling context budgets', a
 
 it('validates the exact unanswered-question history filter combinations', () => {
   const fixture = contextFixture();
-  const base = { project_id: fixture.project.id, ticket_id: fixture.ticket.id, unanswered_questions: true };
+  const base = { project_id: fixture.project.id, ticket_id: fixture.ticket.id, nonblocking_unanswered: true };
   assert.equal(schemas.ticket_history.safeParse(base).success, true);
   for (const input of [
     { ...base, kind: 'reviews' },
     { ...base, kind: 'submissions' },
+    { ...base, kind: 'github' },
     { ...base, item_id: fixture.ticket.id },
-    { ...base, unanswered_questions: false },
+    { ...base, nonblocking_unanswered: false },
+    { project_id: fixture.project.id, ticket_id: fixture.ticket.id, unanswered_questions: true },
   ])
     assert.equal(schemas.ticket_history.safeParse(input).success, false);
 });

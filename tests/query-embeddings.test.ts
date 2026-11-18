@@ -73,6 +73,38 @@ it('expires successful vectors ten minutes after completion and evicts resolved 
   assert.equal(calls, before + 1);
 });
 
+it('reclaims an expired recent entry before a live LRU entry without evicting pending work', async (t) => {
+  let now = 1000;
+  t.mock.method(Date, 'now', () => now);
+  const calls: string[] = [];
+  let resolve!: (vector: number[]) => void;
+  const pending = new Promise<number[]>((done) => {
+    resolve = done;
+  });
+  const cache = new CachedEmbeddings({
+    profile,
+    async embed(text) {
+      calls.push(text);
+      return text === 'pending' ? pending : [1, 2, 3];
+    },
+  });
+  const first = cache.embed('pending', 'query');
+  await cache.embed('expired', 'query');
+  now++;
+  for (let i = 0; i < 254; i++) await cache.embed(`live-${i}`, 'query');
+  await cache.embed('expired', 'query');
+  now = 601_000;
+  await cache.embed('overflow', 'query');
+  const joined = cache.embed('pending', 'query');
+  resolve([1, 2, 3]);
+  await Promise.all([first, joined]);
+  assert.equal(calls.filter((text) => text === 'pending').length, 1);
+  await cache.embed('live-0', 'query');
+  assert.equal(calls.filter((text) => text === 'live-0').length, 1);
+  await cache.embed('expired', 'query');
+  assert.equal(calls.filter((text) => text === 'expired').length, 2);
+});
+
 it('bounds pending entries, keeps matching work coalesced, and retries rejected work', async () => {
   let calls = 0;
   let resolve!: (vector: number[]) => void;
