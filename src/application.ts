@@ -1134,6 +1134,70 @@ export class Application {
       return next;
     });
   }
+  /** Capacity identity creation must serialize with adoption and its never-started proof. */
+  async admitExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    token: string,
+    controller: ExecutionControllerFence,
+    admit: () => undefined,
+  ): Promise<boolean> {
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (
+        !(await this.currentExecutionController(tx, controller)) ||
+        run.status !== 'reserved' ||
+        run.reservation_token !== token ||
+        !run.locked_until ||
+        !(await this.executionAuthority(tx, run))
+      )
+        return false;
+      const current = (await tx.get('execution_controllers', 'execution'))!;
+      const claim = await tx.get('claims', run.ticket_id);
+      const now = this.timestamp();
+      if (current.expires_at <= now || run.locked_until <= now || !claim || claim.expires_at <= now)
+        return false;
+      admit();
+      return true;
+    });
+  }
+  /** Native spawn must be synchronous here: takeover waits until the launch boundary has passed. */
+  async dispatchExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    token: string,
+    attemptId: string,
+    processToken: string,
+    fingerprint: string,
+    controller: ExecutionControllerFence,
+    dispatch: () => undefined,
+  ): Promise<boolean> {
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (
+        !(await this.currentExecutionController(tx, controller)) ||
+        run.status !== 'running' ||
+        run.reservation_token !== token ||
+        !run.locked_until ||
+        run.locked_until <= this.timestamp() ||
+        run.recipe_fingerprint !== fingerprint ||
+        !(await this.executionAuthority(tx, run))
+      )
+        return false;
+      const attempt = await this.executionAttempt(tx, runId);
+      if (!attempt || attempt.id !== attemptId || attempt.process_token !== processToken) return false;
+      const observation = await this.latestExecutionObservation(tx, attempt);
+      if (observation?.kind !== 'dispatching' || observation.controller_generation !== controller.generation)
+        return false;
+      const current = (await tx.get('execution_controllers', 'execution'))!;
+      const claim = await tx.get('claims', run.ticket_id);
+      const now = this.timestamp();
+      if (current.expires_at <= now || run.locked_until <= now || !claim || claim.expires_at <= now)
+        return false;
+      dispatch();
+      return true;
+    });
+  }
   async heartbeatExecutionRun(
     actorId: string,
     projectId: string,
@@ -1211,6 +1275,19 @@ export class Application {
           (result.exit_code !== null || result.signal !== null || !result.error_code))
       )
         return false;
+      if (result.error_code === 'RECOVERED_NOT_DISPATCHED') {
+        const attempt = await this.executionAttempt(tx, runId);
+        const observation = attempt ? await this.latestExecutionObservation(tx, attempt) : null;
+        if (
+          !recovery ||
+          run.status !== 'reserved' ||
+          observation?.next_step !== 'dispatch' ||
+          result.exit_code !== null ||
+          result.signal !== null ||
+          result.artifacts.length !== 0
+        )
+          return false;
+      }
       const finishedAt = this.timestamp();
       const next: ExecutionJob = {
         ...run,

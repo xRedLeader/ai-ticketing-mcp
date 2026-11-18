@@ -562,6 +562,9 @@ class Handle {
 }
 class SqliteStorage extends Handle implements StorageAdapter {
   readonly executionRuns = true as const;
+  get executionLaunchStorage() {
+    return Object.freeze({ adapter: 'sqlite' as const, filename: this.shared.path });
+  }
   readonly schedulingPolicies = Object.freeze(['priority_age', 'unblocking'] as const);
   get<K extends Table>(table: K, id: string) {
     this.open();

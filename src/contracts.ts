@@ -382,6 +382,9 @@ export interface Transaction extends Reader {
 }
 export interface StorageAdapter extends Reader {
   readonly executionRuns?: true;
+  /** Private bootstrap for a detached supervisor connected to this same physical store. */
+  readonly executionLaunchStorage?:
+    { adapter: 'sqlite'; filename: string } | { adapter: 'postgres'; connection_string: string };
   /** Absent capabilities support only the legacy priority_age ordering. */
   readonly schedulingPolicies?: readonly SchedulingPolicy[];
   /** One consistent read-only view, independent of project mutation locks. */

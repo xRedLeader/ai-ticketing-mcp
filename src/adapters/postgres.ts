@@ -438,10 +438,15 @@ function repository(db: Executor): Transaction {
 
 export class PostgresStorage implements StorageAdapter {
   readonly executionRuns = true as const;
+  readonly executionLaunchStorage;
   readonly schedulingPolicies = Object.freeze(['priority_age', 'unblocking'] as const);
   readonly pool: pg.Pool;
   private reader: Transaction;
   constructor(connectionString: string) {
+    this.executionLaunchStorage = Object.freeze({
+      adapter: 'postgres' as const,
+      connection_string: connectionString,
+    });
     this.pool = new pg.Pool({
       connectionString,
       max: 20,

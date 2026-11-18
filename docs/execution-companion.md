@@ -54,7 +54,7 @@ Capacity admission waits at most 30 seconds, with asynchronous checks at most on
 
 ## Results and files
 
-A detached supervisor receives the immutable approved recipe once through a private stdin pipe. Recipe environment, arguments and cwd are not persisted in recovery manifests. The native script still receives only its explicit registered environment. Closing or crashing the controller does not stop the supervisor's bounded timeout, log capture or result journal.
+A detached supervisor receives the immutable approved recipe, exact controller/reservation/attempt credentials, and a same-store connection descriptor once through a private stdin pipe. Connection credentials, recipe environment, arguments and cwd are not persisted in recovery manifests. The supervisor opens its own connection, validates the current claim and execution fences under project/controller transaction locks, consumes the write-once dispatch marker, and calls native spawn synchronously before releasing those locks. A replaced controller cannot launch the recipe. The native script still receives only its explicit registered environment. Closing or crashing the controller after valid launch does not stop the supervisor's bounded timeout, log capture or result journal. Capacity enqueue and admission use the same controller/reservation fence so stale controllers cannot create stranded capacity identities after recovery.
 
 For normal foreground completion, fsynced logs and `result.json` precede the durable application outcome, which precedes capacity release. Exact exit codes and signals are retained, including native Windows exit codes. Continuation success uses the submitted exit condition and fresh authority; it does not accept a ticket or resume a model. Authorized `run_get` returns bounded opaque references:
 
@@ -70,6 +70,7 @@ With `--artifacts ROOT`, private write-once files live under `ROOT/<run UUID>/<a
 - `supervisor.json`, `dispatch.json`, `process.json`: durable supervisor identity, launch intent and native process acknowledgment. Process identity includes PID plus an OS start marker; a bare PID is never sufficient.
 - `stdout.log`, `stderr.log`, `result.json`: bounded logs and authoritative direct-child outcome, timing, truncation and cleanup observation.
 - `cancel.json`: an optional bounded cancellation request to the supervisor.
+- `never-started.json`: write-once, fsynced pre-dispatch recovery proof bound to the run, immutable attempt/process identity, recipe fingerprint, and exact host capacity execution token. It precedes terminal settlement so restart can drain a stranded slot only when the stored outcome and capacity identity match.
 
 Restrict artifact directories with OS permissions/ACLs; logs may contain secrets and the process token is a trusted recovery credential. Requested file modes apply where supported; configure Windows ACLs separately. Older accepted execution installations retain their original `ROOT/<run UUID>/execution.json` and result/log layout; matching legacy journals are inspected without launching another attempt.
 
@@ -77,7 +78,7 @@ Timeout, cancellation, native signals and unverified cleanup retain occupied cap
 
 ## Restart and the next safe step
 
-`run_get.reconciliation` exposes `state` (`queued`, `running`, `completed`, `unresolved`), `attempt_id`, and `next_step` through both PostgreSQL and SQLite. The trusted `listExecutionReconciliations` API provides the same state together with the immutable attempt and latest observation. Restart inspects at most 100 active runs plus 100 occupied host entries per pass; unchanged observations do not append rows on every poll.
+`run_get.reconciliation` exposes `state` (`queued`, `running`, `completed`, `unresolved`), `attempt_id`, and `next_step` through both PostgreSQL and SQLite. The trusted `listExecutionReconciliations` API provides the same state together with the immutable attempt and latest observation. Restart inspects at most 100 active runs plus 100 queued or occupied script entries for its project per pass; unchanged observations do not append rows on every poll.
 
 | Durable evidence                                            | Recovery action / next step                                                                                    |
 | ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |

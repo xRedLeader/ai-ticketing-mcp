@@ -16,12 +16,14 @@ import {
 import { HostCapacity } from './host-capacity.js';
 import { ExecutionRecipeRegistry } from './execution-recipes.js';
 import { durableExecutionFile, executionProcessIdentity, readExecutionFile } from './execution-journal.js';
-import type { ExecutionManifest } from './execution-supervisor.js';
+import type { ExecutionLaunch, ExecutionManifest } from './execution-supervisor.js';
 
 export type ExecutionApplication = Pick<
   Application,
+  | 'storage'
   | 'listExecutionRuns'
   | 'reserveExecutionRun'
+  | 'admitExecutionRun'
   | 'startExecutionRun'
   | 'heartbeatExecutionRun'
   | 'settleExecutionRun'
@@ -53,6 +55,15 @@ type ResultJournal = ExecutionOutcome & {
   cleanup_verified: boolean;
   spawned?: boolean;
 };
+type NeverStartedJournal = ResultJournal & {
+  capacity: {
+    host_id: string;
+    queue_id: string;
+    run_id: string;
+    project_id: string;
+    execution_token: string | null;
+  } | null;
+};
 
 /** One renewable controller per store; recovered attempts are inspected, never relaunched. */
 export class ExecutionCompanion {
@@ -60,6 +71,11 @@ export class ExecutionCompanion {
   private readonly directory: string;
   private readonly heartbeatMs: number;
   constructor(private readonly options: ExecutionCompanionOptions) {
+    ensure(
+      options.application.storage.executionLaunchStorage,
+      'UNSUPPORTED_EXECUTION_RUNS',
+      'Storage must provide a detached launch connection to the same store.',
+    );
     ensure(
       isAbsolute(options.artifacts_directory),
       'INVALID_CONFIG',
@@ -100,7 +116,13 @@ export class ExecutionCompanion {
       const recovery = await app.listExecutionReconciliations(actor, project);
       const occupied = capacity
         .inspect(host)
-        .entries.filter((entry) => ['running', 'reconciling'].includes(entry.state));
+        .entries.filter(
+          (entry) =>
+            entry.kind === 'script' &&
+            entry.project_id === project &&
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(entry.queue_id) &&
+            ['queued', 'running', 'reconciling'].includes(entry.state),
+        );
       const terminal = occupied.length
         ? await app.listExecutionReconciliations(
             actor,
@@ -133,31 +155,22 @@ export class ExecutionCompanion {
           );
           return true;
         }
-        try {
-          capacity.enqueue(host, {
-            queue_id: job.id,
-            run_id: job.id,
-            project_id: project,
-            kind: 'script',
-            resources: { ...recipe.resources },
-            timeout_ms: recipe.timeout_ms,
-            created_at: Date.parse(job.created_at),
-          });
-        } catch (error) {
-          await app.settleExecutionRun(
-            actor,
-            project,
-            job.id,
-            token,
-            { exit_code: null, signal: null, artifacts: [], error_code: 'CAPACITY_REJECTED' },
-            controller,
-          );
-          throw error;
-        }
         const capacityDeadline = Date.now() + 30_000;
-        let admission: ReturnType<HostCapacity['claimNext']>;
+        let admission!: ReturnType<HostCapacity['claimNext']>;
         while (true) {
-          admission = capacity.claimNext(host, this.owner, { kind: 'script', queue_ids: [job.id] });
+          const current = await app.admitExecutionRun(actor, project, job.id, token, controller, () => {
+            capacity.enqueue(host, {
+              queue_id: job.id,
+              run_id: job.id,
+              project_id: project,
+              kind: 'script',
+              resources: { ...recipe.resources },
+              timeout_ms: recipe.timeout_ms,
+              created_at: Date.parse(job.created_at),
+            });
+            admission = capacity.claimNext(host, this.owner, { kind: 'script', queue_ids: [job.id] });
+          });
+          if (!current) return true;
           if (admission.admitted) break;
           if (
             !owned ||
@@ -227,7 +240,15 @@ export class ExecutionCompanion {
         child.stdin!.on('error', () => {
           /* Broken launch input is ambiguous; reconciliation retains the attempt. */
         });
-        child.stdin!.end(JSON.stringify(recipe));
+        const launch: ExecutionLaunch = {
+          recipe,
+          storage: app.storage.executionLaunchStorage!,
+          actor_id: actor,
+          project_id: project,
+          reservation_token: token,
+          controller,
+        };
+        child.stdin!.end(JSON.stringify(launch));
         let supervisorExited = false;
         child.once('exit', () => {
           supervisorExited = true;
@@ -384,8 +405,12 @@ export class ExecutionCompanion {
       (result.exit_code !== null || result.signal !== null || result.error_code !== null)
     );
   }
-  private liveIdentity(state: ExecutionReconciliation, directory: string): ExecutionProcessIdentity | null {
-    for (const name of ['process.json', 'supervisor.json']) {
+  private liveIdentity(
+    state: ExecutionReconciliation,
+    directory: string,
+    includeSupervisor = false,
+  ): ExecutionProcessIdentity | null {
+    for (const name of includeSupervisor ? ['process.json', 'supervisor.json'] : ['process.json']) {
       const journal = this.journal(directory, name);
       if (!this.matches(state, journal) || !journal.identity) continue;
       const current = executionProcessIdentity(journal.identity.pid);
@@ -399,13 +424,18 @@ export class ExecutionCompanion {
       const directory = original.attempt
         ? join(this.directory, original.run.id, original.attempt.id)
         : join(this.directory, original.run.id);
+      const proof = original.attempt ? this.neverStarted(original, directory) : null;
       const result =
-        (original.attempt ? this.result(original, directory) : null) ?? this.legacyResult(original);
+        (original.attempt ? (this.result(original, directory) ?? proof) : null) ??
+        this.legacyResult(original);
       if (
         result?.cleanup_verified &&
         JSON.stringify(this.outcome(result)) === JSON.stringify(this.outcome(original.run))
-      )
-        this.releaseCapacity(original.run.id, result);
+      ) {
+        const entry = capacity.inspect(host).entries.find((entry) => entry.queue_id === original.run.id);
+        if (proof && entry?.state === 'queued') capacity.cancel(host, original.run.id);
+        else this.releaseCapacity(original.run.id, result);
+      }
       return;
     }
     const state = await app.adoptExecutionRun(actor, project, original.run.id, controller, LEASE_MS);
@@ -435,6 +465,32 @@ export class ExecutionCompanion {
         artifacts: [],
         error_code: 'RECOVERED_NOT_DISPATCHED',
       };
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      if (!existsSync(join(directory, 'never-started.json'))) {
+        const entry = capacity.inspect(host).entries.find((entry) => entry.queue_id === state.run.id);
+        durableExecutionFile(join(directory, 'never-started.json'), {
+          run_id: state.run.id,
+          attempt_id: state.attempt.id,
+          process_token: state.attempt.process_token,
+          recipe_fingerprint: state.run.recipe_fingerprint,
+          ...outcome,
+          started_at: 0,
+          finished_at: Date.now(),
+          cleanup_verified: true,
+          spawned: false,
+          capacity: entry
+            ? {
+                host_id: host,
+                queue_id: entry.queue_id,
+                run_id: entry.run_id,
+                project_id: entry.project_id,
+                execution_token: entry.execution_token,
+              }
+            : null,
+        } satisfies NeverStartedJournal);
+      }
+      const proof = this.neverStarted(state, directory);
+      ensure(proof, 'CONFLICT', 'Never-started capacity proof is missing or does not match this attempt.');
       if (
         await app.recoverExecutionRun(
           actor,
@@ -449,17 +505,11 @@ export class ExecutionCompanion {
       ) {
         const entry = capacity.inspect(host).entries.find((entry) => entry.queue_id === state.run.id);
         if (entry?.state === 'queued') capacity.cancel(host, state.run.id);
-        else
-          this.releaseCapacity(state.run.id, {
-            ...outcome,
-            started_at: 0,
-            finished_at: Date.now(),
-            spawned: false,
-          });
+        else this.releaseCapacity(state.run.id, proof);
       }
       return;
     }
-    const identity = result ? null : this.liveIdentity(state, directory);
+    const identity = result ? null : this.liveIdentity(state, directory, true);
     await app.observeExecutionRun(
       actor,
       project,
@@ -471,6 +521,33 @@ export class ExecutionCompanion {
       identity,
       identity ? 'running' : 'unresolved',
     );
+  }
+  private neverStarted(state: ExecutionReconciliation, directory: string): NeverStartedJournal | null {
+    const proof = this.journal(directory, 'never-started.json');
+    if (
+      !this.matches(state, proof) ||
+      !this.validResult(proof) ||
+      proof.cleanup_verified !== true ||
+      proof.spawned !== false ||
+      proof.started_at !== 0 ||
+      proof.error_code !== 'RECOVERED_NOT_DISPATCHED' ||
+      proof.exit_code !== null ||
+      proof.signal !== null ||
+      proof.artifacts.length !== 0
+    )
+      return null;
+    const { capacity, host_id: host } = this.options;
+    const entry = capacity.inspect(host).entries.find((entry) => entry.queue_id === state.run.id);
+    const never = proof as NeverStartedJournal;
+    if (!entry) return never.capacity === null ? never : null;
+    if (entry.run_id !== state.run.id || entry.project_id !== state.run.project_id) return null;
+    return never.capacity?.host_id === host &&
+      never.capacity.queue_id === entry.queue_id &&
+      never.capacity.run_id === entry.run_id &&
+      never.capacity.project_id === entry.project_id &&
+      never.capacity.execution_token === entry.execution_token
+      ? never
+      : null;
   }
   private legacyResult(state: ExecutionReconciliation): ResultJournal | null {
     const directory = join(this.directory, state.run.id);

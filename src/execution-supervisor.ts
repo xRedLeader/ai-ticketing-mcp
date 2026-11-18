@@ -2,6 +2,8 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { closeSync, existsSync, fsyncSync, openSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { ExecutionControllerFence, StorageAdapter } from './contracts.js';
+import { createRuntime } from './runtime.js';
 import { MAX_EXECUTION_RECIPE_BYTES, type ExecutionRecipe } from './execution-recipes.js';
 import { durableExecutionFile, executionProcessIdentity, readExecutionFile } from './execution-journal.js';
 
@@ -11,6 +13,14 @@ export interface ExecutionManifest {
   process_token: string;
   recipe_fingerprint: string;
 }
+export interface ExecutionLaunch {
+  recipe: ExecutionRecipe;
+  storage: NonNullable<StorageAdapter['executionLaunchStorage']>;
+  actor_id: string;
+  project_id: string;
+  reservation_token: string;
+  controller: ExecutionControllerFence;
+}
 /** Detached from the controller, so an observed completion can survive its restart. */
 async function supervise(directory: string) {
   const manifest = readExecutionFile(join(directory, 'manifest.json')) as ExecutionManifest;
@@ -18,10 +28,11 @@ async function supervise(directory: string) {
   let size = 0;
   for await (const chunk of process.stdin) {
     size += chunk.length;
-    if (size > MAX_EXECUTION_RECIPE_BYTES) throw new Error('Recipe exceeds supervisor input limit.');
+    if (size > MAX_EXECUTION_RECIPE_BYTES + 65536) throw new Error('Launch exceeds supervisor input limit.');
     input.push(chunk);
   }
-  const recipe = JSON.parse(Buffer.concat(input).toString('utf8')) as ExecutionRecipe;
+  const launch = JSON.parse(Buffer.concat(input).toString('utf8')) as ExecutionLaunch;
+  const { recipe } = launch;
   if (recipe.fingerprint !== manifest.recipe_fingerprint) throw new Error('Recipe fingerprint changed.');
   const identity = {
     run_id: manifest.run_id,
@@ -29,7 +40,7 @@ async function supervise(directory: string) {
     process_token: manifest.process_token,
     recipe_fingerprint: recipe.fingerprint,
   };
-  const started = Date.now();
+  let started = Date.now();
   durableExecutionFile(join(directory, 'supervisor.json'), {
     ...identity,
     identity: executionProcessIdentity(process.pid),
@@ -53,62 +64,94 @@ async function supervise(directory: string) {
     // shortcut: native direct-child termination cannot prove process-tree cleanup; retain capacity for inspection.
     deadline = setTimeout(() => process.exit(1), 15_000);
   };
-  const timeout = setTimeout(() => stop('TIMEOUT'), recipe.timeout_ms);
+  let timeout: NodeJS.Timeout | undefined;
   const cancellation = setInterval(() => {
     if (existsSync(join(directory, 'cancel.json'))) stop('CANCELLED');
   }, 100);
   try {
-    durableExecutionFile(join(directory, 'dispatch.json'), { ...identity, started_at: started });
-    let completion: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+    let completion: Promise<{ code: number | null; signal: NodeJS.Signals | null }> | undefined;
+    const app = createRuntime({
+      EMBEDDING_PROVIDER: 'none',
+      STORAGE_ADAPTER: launch.storage.adapter,
+      ...(launch.storage.adapter === 'sqlite'
+        ? { SQLITE_PATH: launch.storage.filename }
+        : { DATABASE_URL: launch.storage.connection_string }),
+    });
     try {
-      child = spawn(recipe.executable, [...recipe.argv], {
-        cwd: recipe.cwd,
-        env: { ...recipe.env },
-        shell: false,
-        windowsHide: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      completion = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-        child!.once('spawn', () => {
-          spawned = true;
+      const dispatched = await app.dispatchExecutionRun(
+        launch.actor_id,
+        launch.project_id,
+        manifest.run_id,
+        launch.reservation_token,
+        manifest.attempt_id,
+        manifest.process_token,
+        manifest.recipe_fingerprint,
+        launch.controller,
+        () => {
+          if (stopped || existsSync(join(directory, 'cancel.json')))
+            throw new Error('Execution was cancelled before its launch fence was acquired.');
+          started = Date.now();
+          timeout = setTimeout(() => stop('TIMEOUT'), recipe.timeout_ms);
+          // Consuming this capability before spawn makes a duplicate or uncertain launch non-replayable.
+          durableExecutionFile(join(directory, 'dispatch.json'), { ...identity, started_at: started });
           try {
-            durableExecutionFile(join(directory, 'process.json'), {
-              ...identity,
-              identity: executionProcessIdentity(child!.pid!),
-              started_at: started,
+            child = spawn(recipe.executable, [...recipe.argv], {
+              cwd: recipe.cwd,
+              env: { ...recipe.env },
+              shell: false,
+              windowsHide: true,
+              stdio: ['ignore', 'pipe', 'pipe'],
             });
-          } catch {
-            stop('JOURNAL_WRITE_FAILED');
+            completion = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+              child!.once('spawn', () => {
+                spawned = true;
+                try {
+                  durableExecutionFile(join(directory, 'process.json'), {
+                    ...identity,
+                    identity: executionProcessIdentity(child!.pid!),
+                    started_at: started,
+                  });
+                } catch {
+                  stop('JOURNAL_WRITE_FAILED');
+                }
+              });
+              child!.on('error', () => {
+                error ??= spawned ? 'PROCESS_ERROR' : 'SPAWN_FAILED';
+              });
+              child!.once('close', (code, signal) => {
+                terminal = true;
+                resolve({ code, signal });
+              });
+            });
+            const capture = (stream: 'stdout' | 'stderr', fd: number) => (chunk: Buffer) => {
+              const length = Math.min(chunk.length, Math.max(0, recipe.max_log_bytes - bytes[stream]));
+              try {
+                if (length) writeFileSync(fd, chunk.subarray(0, length));
+              } catch {
+                stop('LOG_WRITE_FAILED');
+              }
+              bytes[stream] += length;
+              if (length < chunk.length) truncated[stream] = true;
+            };
+            child.stdout!.on('data', capture('stdout', stdout));
+            child.stderr!.on('data', capture('stderr', stderr));
+            child.stdout!.on('error', () => stop('LOG_READ_FAILED'));
+            child.stderr!.on('error', () => stop('LOG_READ_FAILED'));
+          } catch (cause) {
+            if (child) throw cause;
+            error = 'SPAWN_FAILED';
+            terminal = true;
+            completion = Promise.resolve({ code: null, signal: null });
           }
-        });
-        child!.on('error', () => {
-          error ??= spawned ? 'PROCESS_ERROR' : 'SPAWN_FAILED';
-        });
-        child!.once('close', (code, signal) => {
-          terminal = true;
-          resolve({ code, signal });
-        });
-      });
-      const capture = (stream: 'stdout' | 'stderr', fd: number) => (chunk: Buffer) => {
-        const length = Math.min(chunk.length, Math.max(0, recipe.max_log_bytes - bytes[stream]));
-        try {
-          if (length) writeFileSync(fd, chunk.subarray(0, length));
-        } catch {
-          stop('LOG_WRITE_FAILED');
-        }
-        bytes[stream] += length;
-        if (length < chunk.length) truncated[stream] = true;
-      };
-      child.stdout!.on('data', capture('stdout', stdout));
-      child.stderr!.on('data', capture('stderr', stderr));
-      child.stdout!.on('error', () => stop('LOG_READ_FAILED'));
-      child.stderr!.on('error', () => stop('LOG_READ_FAILED'));
-    } catch {
-      error = 'SPAWN_FAILED';
-      terminal = true;
-      completion = Promise.resolve({ code: null, signal: null });
+        },
+      );
+      if (!dispatched) return;
+    } catch (cause) {
+      if (!completion) throw cause;
+    } finally {
+      await Promise.allSettled([app.storage.close(), app.searchAdapter.close()]);
     }
-    const observed = await completion;
+    const observed = await completion!;
     fsyncSync(stdout);
     fsyncSync(stderr);
     const finished = Date.now();
@@ -130,7 +173,7 @@ async function supervise(directory: string) {
       cleanup_verified: !stopped && observed.signal === null,
     });
   } finally {
-    clearTimeout(timeout);
+    if (timeout) clearTimeout(timeout);
     clearInterval(cancellation);
     if (deadline) clearTimeout(deadline);
     closeSync(stdout);

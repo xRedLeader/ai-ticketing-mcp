@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 import type {
   ExecutionAttempt,
   ExecutionController,
@@ -19,11 +20,17 @@ import {
 } from '../src/execution-recipes.js';
 import { ExecutionCompanion, type ExecutionApplication } from '../src/execution-companion.js';
 import { HostCapacity } from '../src/host-capacity.js';
+import { createSqliteAdapters } from '../src/adapters/sqlite.js';
+import { createApplication } from '../src/application.js';
+import { fixture as contractFixture } from '../src/testing/contracts.js';
 
 async function fixture(script: string, extra: Record<string, unknown> = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'ticketing-execution-'));
-  const project = randomUUID(),
-    actor = randomUUID();
+  const adapters = createSqliteAdapters(join(directory, 'launch.sqlite'));
+  await adapters.storage.migrate();
+  const authority = await contractFixture(adapters);
+  const project = authority.project.id,
+    actor = authority.admin.id;
   const config = {
     workspace_roots: [directory],
     recipes: [
@@ -40,40 +47,22 @@ async function fixture(script: string, extra: Record<string, unknown> = {}) {
   };
   const recipes = new ExecutionRecipeRegistry(config),
     metadata = recipes.metadata()[0]!;
-  let job: ExecutionJob = {
-    id: randomUUID(),
+  const registered = createApplication({ ...adapters, executionRecipes: recipes.metadata() });
+  const ticket = await authority.ticket();
+  const claim = await authority.claim(ticket.id);
+  const receipt = (await registered.execute(authority.worker.id, 'run_submit', {
     project_id: project,
-    actor_id: actor,
-    ticket_id: randomUUID(),
-    checkpoint_id: randomUUID(),
-    continuation_id: randomUUID(),
-    claim_token: randomUUID(),
-    requirements_revision: 1,
+    ticket_id: ticket.id,
+    claim_token: claim.claim.token,
+    idempotency_key: randomUUID(),
     recipe_id: metadata.id,
-    recipe_fingerprint: metadata.fingerprint,
-    status: 'queued',
-    reservation_token: null,
-    locked_until: null,
-    started_at: null,
-    finished_at: null,
-    created_at: new Date().toISOString(),
-    exit_code: null,
-    signal: null,
-    artifacts: [],
-    error_code: null,
-  };
+    checkpoint: { progress: 'Await execution.' },
+    completion_condition: { kind: 'exit_code', exit_code: 0 },
+  })) as any;
+  let job: ExecutionJob = (await adapters.storage.get('execution_jobs', receipt.run_id))!;
   const events: string[] = [];
   let controller: ExecutionController | null = null;
-  let generation = 1;
-  const attempt: ExecutionAttempt = {
-    id: randomUUID(),
-    project_id: project,
-    run_id: job.id,
-    previous_attempt_id: null,
-    ordinal: 1,
-    process_token: randomUUID(),
-    created_at: job.created_at,
-  };
+  let attempt: ExecutionAttempt;
   let observed: ExecutionObservation | null = null;
   const state = (): ExecutionReconciliation => ({
     run: { ...job },
@@ -87,21 +76,18 @@ async function fixture(script: string, extra: Record<string, unknown> = {}) {
     next_step: observed?.next_step ?? (job.status === 'reserved' ? 'dispatch' : 'inspect_launch'),
   });
   const app: ExecutionApplication = {
-    async acquireExecutionController() {
+    storage: adapters.storage,
+    async acquireExecutionController(_actor, _project, owner, lease) {
       if (controller) return null;
-      controller = {
-        id: 'execution',
-        owner_id: 'test',
-        token: randomUUID(),
-        generation: ++generation,
-        expires_at: new Date(Date.now() + 60000).toISOString(),
-      };
-      return controller;
+      const acquired = await registered.acquireExecutionController(actor, project, owner, lease);
+      if (acquired) controller = acquired;
+      return acquired;
     },
     async heartbeatExecutionController() {
       return true;
     },
     async releaseExecutionController() {
+      if (controller) await registered.releaseExecutionController(actor, project, controller);
       controller = null;
     },
     async listExecutionReconciliations(_actor, _project, ids) {
@@ -136,16 +122,31 @@ async function fixture(script: string, extra: Record<string, unknown> = {}) {
     async reserveExecutionRun() {
       if (job.status !== 'queued') return null;
       events.push('reserved');
-      job = { ...job, status: 'reserved', reservation_token: randomUUID() };
+      job = (await registered.reserveExecutionRun(actor, project, job.id, 60000, controller!))!;
+      attempt = (await registered.listExecutionReconciliations(actor, project, [job.id]))[0]!.attempt!;
       return { ...job };
     },
     async startExecutionRun() {
       assert.equal(capacity.inspect('host').occupied.script, 1);
       assert.equal(job.status, 'reserved');
       events.push('running');
-      job = { ...job, status: 'running', started_at: new Date().toISOString() };
+      const current = createApplication({
+        ...adapters,
+        executionRecipes: [
+          { id: job.recipe_id, fingerprint: job.recipe_fingerprint, project_ids: [project] },
+        ],
+      });
+      job = (await current.startExecutionRun(
+        actor,
+        project,
+        job.id,
+        job.reservation_token!,
+        60000,
+        controller!,
+      ))!;
       return { ...job };
     },
+    admitExecutionRun: registered.admitExecutionRun.bind(registered),
     async heartbeatExecutionRun() {
       return true;
     },
@@ -183,10 +184,23 @@ async function fixture(script: string, extra: Record<string, unknown> = {}) {
     options,
     events,
     artifactDirectory: () => join(options.artifacts_directory, job.id, attempt.id),
-    attempt,
+    get attempt() {
+      return attempt;
+    },
     job: () => job,
+    setRecipeFingerprint(fingerprint: string) {
+      const db = new DatabaseSync(adapters.storage.executionLaunchStorage!.filename);
+      try {
+        db.prepare('UPDATE execution_jobs SET recipe_fingerprint=? WHERE id=?').run(fingerprint, job.id);
+        job.recipe_fingerprint = fingerprint;
+      } finally {
+        db.close();
+      }
+    },
     async dispose() {
       capacity.close();
+      await adapters.storage.close();
+      await adapters.search.close();
       assert.equal(resolve(dirname(directory)), resolve(tmpdir()));
       assert.ok(basename(directory).startsWith('ticketing-execution-'));
       await rm(directory, { recursive: true, force: true });
@@ -362,7 +376,7 @@ it('records an authentic native spawn failure and releases verified never-starte
     const cwd = join(f.directory, 'removed-cwd');
     await mkdir(cwd);
     const recipes = new ExecutionRecipeRegistry({ ...f.config, recipes: [{ ...f.config.recipes[0], cwd }] });
-    f.job().recipe_fingerprint = recipes.metadata()[0]!.fingerprint;
+    f.setRecipeFingerprint(recipes.metadata()[0]!.fingerprint);
     await rmdir(cwd);
     await new ExecutionCompanion({ ...f.options, recipes }).runOnce();
     assert.equal(f.job().status, 'failed');
