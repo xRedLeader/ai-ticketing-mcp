@@ -8,6 +8,7 @@ Headless ticketing built for agents: find useful work, claim it safely, recover 
 
 - Structured tickets with acceptance criteria, priorities, capabilities, parents, and blocking dependencies.
 - Atomic ten-minute claims, heartbeat renewal, stale-worker fencing, and retry-safe mutations.
+- Optional [GitHub CI evidence](docs/mcp.md#github-evidence), [durable signed notifications](docs/operations.md#durable-signed-notifications), and [deterministic unblocking scheduling](docs/mcp.md#scheduling).
 - Durable checkpoints, blocking questions, decisions, and artifact references.
 - One-call context with complete requirements, project instructions, prior work, and explicit retrieval references.
 - Self, independent-agent, or human verification policies. Independent review is the default.
@@ -100,7 +101,7 @@ npm run format:check
 npm run benchmark:protocol
 ```
 
-Integration tests require a real database and fail clearly when it is not configured. They exercise claims, races, retries, stale workers, review policies, permissions, search freshness, and both MCP transports. See the [verification record](docs/verification.md) for measured results and [operations](docs/operations.md) for backup/restore, rebuilding search, and benchmarks.
+Integration tests require a real database and fail clearly when it is not configured. They exercise claims, races, retries, stale workers, review policies, permissions, search freshness, and both MCP transports. See the [verification record](docs/verification.md) for measured results, the [real-client benchmark](docs/real-client-benchmark.md) for Codex cost/completion measurements, and [operations](docs/operations.md) for backup/restore, rebuilding search, and benchmarks.
 
 Contributions use [Conventional Commits](CONTRIBUTING.md). Public MCP and adapter contracts follow semantic versioning. Licensed under [Apache-2.0](LICENSE).
 

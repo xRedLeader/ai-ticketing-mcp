@@ -10,6 +10,7 @@ const labels = z.array(text.max(80)).max(30);
 const page = { limit: z.int().min(1).max(100).default(10), offset: z.int().min(0).max(1_000_000).default(0) };
 const maxTokens = z.int().min(512).max(32768);
 const criteria = z.array(text.max(1000)).min(1).max(50);
+const schedulingPolicy = z.enum(['priority_age', 'unblocking']);
 export const executionHintsSchema = z
   .object({
     model: z.string().trim().max(128).nullable().optional(),
@@ -53,6 +54,7 @@ export const schemas = {
       name: text.max(200),
       instructions: z.string().max(16000).default(''),
       policy: z.enum(['self', 'independent', 'human']).default('independent'),
+      scheduling_policy: schedulingPolicy.optional(),
       execution_hints: executionHintsSchema.optional(),
     })
     .strict(),
@@ -64,6 +66,7 @@ export const schemas = {
       name: text.max(200).optional(),
       instructions: z.string().max(16000).optional(),
       policy: z.enum(['self', 'independent', 'human']).optional(),
+      scheduling_policy: schedulingPolicy.nullable().optional(),
       execution_hints: executionHintsSchema.optional(),
     })
     .strict(),

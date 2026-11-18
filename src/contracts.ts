@@ -2,6 +2,7 @@
 export type Status = 'backlog' | 'ready' | 'in_progress' | 'in_review' | 'done' | 'cancelled';
 export type Role = 'reader' | 'contributor' | 'verifier' | 'admin';
 export type Policy = 'self' | 'independent' | 'human';
+export type SchedulingPolicy = 'priority_age' | 'unblocking';
 export interface Actor {
   id: string;
   issuer: string;
@@ -20,6 +21,7 @@ export interface Project {
   name: string;
   instructions: string;
   policy: Policy;
+  scheduling_policy?: SchedulingPolicy;
   execution_hints?: ExecutionHints | null;
   revision: number;
   ticket_seq: number;
@@ -267,6 +269,7 @@ export interface Reader {
     now: string,
     limit: number,
     offset: number,
+    policy?: SchedulingPolicy,
   ): Promise<Ticket[]>;
   get<K extends Table>(table: K, id: string): Promise<Tables[K] | null>;
   find<K extends Table>(table: K, query?: Query<Tables[K]>): Promise<Tables[K][]>;
@@ -276,6 +279,8 @@ export interface Transaction extends Reader {
   remove<K extends Table>(table: K, id: string): Promise<void>;
 }
 export interface StorageAdapter extends Reader {
+  /** Absent capabilities support only the legacy priority_age ordering. */
+  readonly schedulingPolicies?: readonly SchedulingPolicy[];
   /** One consistent read-only view, independent of project mutation locks. */
   readSnapshot<T>(work: (reader: Reader) => Promise<T>): Promise<T>;
   /** Serializes mutations in a scope, commits atomically, and rolls back on failure. */

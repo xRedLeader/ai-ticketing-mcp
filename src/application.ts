@@ -23,6 +23,7 @@ import {
   type GitHubObservation,
   type GitHubCIStatus,
   type WebhookTarget,
+  type SchedulingPolicy,
   validateGitHubConfiguration,
 } from './contracts.js';
 import { resultSchemas, githubEvidenceSchema } from './result-schemas.js';
@@ -182,6 +183,16 @@ export class Application {
   private executionHints(project: Project, ticket: Ticket): ExecutionHints | undefined {
     const hints = { ...project.execution_hints, ...ticket.execution_hints };
     return Object.keys(hints).length ? hints : undefined;
+  }
+  private schedulingPolicy(project: Pick<Project, 'scheduling_policy'>): SchedulingPolicy {
+    const policy = project.scheduling_policy ?? 'priority_age';
+    ensure(
+      policy === 'priority_age' ||
+        (policy === 'unblocking' && this.storage.schedulingPolicies?.includes(policy)),
+      'UNSUPPORTED_SCHEDULING_POLICY',
+      'Storage does not support this project scheduling policy.',
+    );
+    return policy;
   }
   private githubStatus(observation: GitHubObservation): GitHubCIStatus {
     const configuration = this.github!;
@@ -577,6 +588,7 @@ export class Application {
     actor: Actor,
     capabilities: string[],
     labels: string[],
+    at = this.timestamp(),
   ) {
     if (
       !['ready', 'in_progress'].includes(ticket.status) ||
@@ -589,31 +601,34 @@ export class Application {
     )
       return false;
     const claim = await reader.get('claims', ticket.id);
-    if (claim && claim.expires_at > this.timestamp()) return false;
+    if (claim && claim.expires_at > at) return false;
     return !(await this.blockers(reader, ticket)).length;
   }
   private async candidates(
     reader: Reader,
-    projectId: string,
+    project: Project,
     actor: Actor,
     capabilities: string[],
     labels: string[],
     limit: number,
   ) {
+    const policy = this.schedulingPolicy(project);
+    const at = this.timestamp();
     const result: Ticket[] = [];
     let offset = 0;
     while (result.length < limit) {
       const page = await reader.workCandidates(
-        projectId,
+        project.id,
         actor.id,
         capabilities,
         labels,
-        this.timestamp(),
+        at,
         limit,
         offset,
+        policy,
       );
       for (const ticket of page) {
-        if (await this.eligible(reader, ticket, actor, capabilities, labels)) result.push(ticket);
+        if (await this.eligible(reader, ticket, actor, capabilities, labels, at)) result.push(ticket);
         if (result.length === limit) break;
       }
       if (page.length < limit) break;
@@ -742,12 +757,14 @@ export class Application {
             name: data.name,
             instructions: data.instructions,
             policy: data.policy,
+            ...(data.scheduling_policy ? { scheduling_policy: data.scheduling_policy } : {}),
             ...(data.execution_hints ? { execution_hints: data.execution_hints } : {}),
             revision: 1,
             ticket_seq: 0,
             event_seq: 0,
             created_at: this.timestamp(),
           };
+          this.schedulingPolicy(created);
           await tx.put('projects', created);
           await tx.put('members', {
             id: `${created.id}:${actor.id}`,
@@ -760,11 +777,21 @@ export class Application {
         }
         case 'project_update': {
           this.version(project, input.expected_revision);
+          this.schedulingPolicy({
+            scheduling_policy:
+              input.scheduling_policy === undefined
+                ? project.scheduling_policy
+                : (input.scheduling_policy ?? undefined),
+          });
           for (const key of ['name', 'instructions', 'policy'] as const)
             if (input[key] !== undefined) (project as any)[key] = input[key];
           if (input.execution_hints !== undefined) {
             if (input.execution_hints) project.execution_hints = input.execution_hints;
             else delete project.execution_hints;
+          }
+          if (input.scheduling_policy !== undefined) {
+            if (input.scheduling_policy) project.scheduling_policy = input.scheduling_policy;
+            else delete project.scheduling_policy;
           }
           project.revision++;
           await this.event(tx, project, actor, 'project.updated', project.id, { revision: project.revision });
@@ -861,7 +888,7 @@ export class Application {
         case 'work_claim': {
           const ticket = input.ticket_id
             ? await this.ticket(tx, project.id, input.ticket_id)
-            : (await this.candidates(tx, project.id, actor, input.capabilities, input.labels, 1))[0];
+            : (await this.candidates(tx, project, actor, input.capabilities, input.labels, 1))[0];
           ensure(ticket, 'NO_ELIGIBLE_WORK', 'No eligible work is currently available.');
           if (input.ticket_id) {
             const blockers = await this.blockers(tx, ticket);
@@ -1353,7 +1380,7 @@ export class Application {
           return {
             tickets: await this.candidates(
               this.storage,
-              project.id,
+              project,
               actor,
               input.capabilities,
               input.labels,

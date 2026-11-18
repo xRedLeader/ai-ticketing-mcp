@@ -32,13 +32,21 @@ Profiles are not an access-control boundary. They select tool exposure; every op
 | Retrieval                  | `ticket_context`, `search`, `knowledge_get`, `knowledge_write`, `checkpoint_get`                                     |
 | Changes                    | `changes_since`                                                                                                      |
 
-`tickets_create` accepts 1–50 tickets atomically, defaulting to backlog. Use `ready` to queue execution. Each ticket needs 1–50 criteria. Priority 1 is highest; 5 is lowest. Work selection orders by priority, creation time, then identifier, and respects declared capabilities, labels, assignment, blockers, and active claims.
+`tickets_create` accepts 1–50 tickets atomically, defaulting to backlog. Use `ready` to queue execution. Each ticket needs 1–50 criteria. Priority 1 is highest; 5 is lowest. Default work selection orders by priority, creation time, then identifier, and respects declared capabilities, labels, assignment, blockers, and active claims.
 
 Ticket lifecycle: `backlog → ready → in_progress → in_review → done`, plus `cancelled` and reopening. `ticket_transition` prepares, cancels, or reopens; it cannot mark work done. Blocking links point from prerequisite (`source_id`) to dependent (`target_id`). Parent completion requires all children done or cancelled. A cancelled prerequisite still blocks its dependents until the link is removed or replaced. Parent and dependency relationships may not form a combined cycle.
 
 `work_claim` returns a token, expiry, compact ticket receipt, and brief context by default. `include_context:false` returns ownership alone. Heartbeat at least every three minutes; claims last ten minutes. Retrying an identical claim returns its original receipt and context snapshot, even after expiry; it never renews ownership. A new claim attempt needs a new key. Checkpoints return the new ticket revision so submission can chain without another read.
 
 Requirement edits revoke claims and invalidate affected reviews, completed dependent tickets, and parent approvals. Metadata edits still increment the ticket revision. Read current state after a revision conflict. Questions marked blocking prevent claims and submissions until an answer references their identifier. Checkpoints are immutable notes, and complete history can be paged with `ticket_history`.
+
+## Scheduling
+
+Projects can opt into `scheduling_policy:'unblocking'` on `project_create` or an administrator's revision-protected `project_update`. Setting the update field to `null` clears the override and restores `priority_age`; omitting it preserves the current setting. Unconfigured projects retain the original ordering. Project reads and summaries expose an explicitly configured policy. Built-in PostgreSQL and SQLite adapters support both policies; custom adapters without an advertised capability support only `priority_age`. Unsupported policy changes fail before committing, and restored unsupported policies fail automatic execution selection explicitly.
+
+The `unblocking` policy preserves strict priority first. Within one priority, tickets created at least 24 hours before the selection instant come first in creation-time/identifier order. Younger tickets follow, ordered by their number of unfinished direct dependents descending, then creation time and identifier. The count includes only same-project `blocks` links whose dependent is neither `done` nor `cancelled`. Each selection uses one fixed timestamp. Age is measured from `created_at`; edits and claim renewals do not reset it.
+
+This can favor prerequisites that help more work progress. The count estimates potential benefit: dependents may have other prerequisites or eligibility constraints. A waiting eligible ticket eventually joins the aged FIFO group, where younger arrivals cannot keep displacing it. The starvation guarantee applies within a priority to continuously eligible work, assuming older work continues progressing; strict priority can keep lower-priority work waiting. Status, assignment, required capabilities, requested labels, prerequisites, blocking questions, and live claims retain their existing gates. Explicit ticket claims and review ordering retain their existing behavior. Ranking uses bounded deterministic storage queries and no model calls.
 
 ## Completion policies
 

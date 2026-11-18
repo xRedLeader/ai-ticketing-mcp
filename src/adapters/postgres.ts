@@ -19,6 +19,7 @@ import {
   type SearchHit,
   type EmbeddingProfile,
   type Note,
+  type SchedulingPolicy,
 } from '../contracts.js';
 
 const columns: Record<Table, string[]> = {
@@ -63,6 +64,7 @@ const columns: Record<Table, string[]> = {
     'ticket_seq',
     'event_seq',
     'created_at',
+    'scheduling_policy',
   ],
   members: ['id', 'project_id', 'actor_id', 'role'],
   tickets: [
@@ -155,7 +157,10 @@ type Executor = Pick<pg.Pool, 'query'> | Pick<pg.PoolClient, 'query'>;
 function decode(row: Record<string, unknown>) {
   return Object.fromEntries(
     Object.entries(row)
-      .filter(([key, value]) => !['execution_hints', 'github_pull_request'].includes(key) || value !== null)
+      .filter(
+        ([key, value]) =>
+          !['execution_hints', 'github_pull_request', 'scheduling_policy'].includes(key) || value !== null,
+      )
       .map(([key, value]) => [
         key,
         value instanceof Date
@@ -191,9 +196,32 @@ function repository(db: Executor): Transaction {
       );
       return result.rows.map(decode) as unknown as Note[];
     },
-    async workCandidates(projectId, actorId, capabilities, labels, now, limit, offset) {
+    async workCandidates(
+      projectId,
+      actorId,
+      capabilities,
+      labels,
+      now,
+      limit,
+      offset,
+      policy = 'priority_age',
+    ) {
+      ensure(
+        Number.isSafeInteger(limit) &&
+          limit >= 1 &&
+          limit <= 10001 &&
+          Number.isSafeInteger(offset) &&
+          offset >= 0,
+        'INVALID_QUERY',
+        'Work page limit must be 1–10001 and offset must be nonnegative.',
+      );
+      ensure(['priority_age', 'unblocking'].includes(policy), 'INVALID_QUERY', 'Unknown scheduling policy.');
+      const order =
+        policy === 'unblocking'
+          ? `t.priority,CASE WHEN t.created_at<=($5::timestamptz-interval '24 hours') THEN 0 ELSE 1 END,CASE WHEN t.created_at<=($5::timestamptz-interval '24 hours') THEN 0 ELSE (SELECT count(*) FROM links outgoing JOIN tickets dependent ON dependent.id=outgoing.target_id AND dependent.project_id=t.project_id WHERE outgoing.project_id=t.project_id AND outgoing.source_id=t.id AND outgoing.kind='blocks' AND dependent.status NOT IN ('done','cancelled')) END DESC,t.created_at,t.id`
+          : 't.priority,t.created_at,t.id';
       const result = await db.query(
-        `SELECT t.* FROM tickets t WHERE t.project_id=$1 AND t.status IN ('ready','in_progress') AND (t.assignee_id IS NULL OR t.assignee_id=$2) AND t.capabilities <@ $3::text[] AND t.labels @> $4::text[] AND NOT EXISTS(SELECT 1 FROM claims c WHERE c.ticket_id=t.id AND c.expires_at>$5) AND NOT EXISTS(SELECT 1 FROM links l JOIN tickets prerequisite ON prerequisite.id=l.source_id WHERE l.target_id=t.id AND l.kind='blocks' AND prerequisite.status<>'done') AND NOT EXISTS(SELECT 1 FROM notes q WHERE q.ticket_id=t.id AND q.kind='question' AND q.blocking AND NOT EXISTS(SELECT 1 FROM notes a WHERE a.answer_to=q.id AND a.kind='answer')) ORDER BY t.priority,t.created_at,t.id LIMIT $6 OFFSET $7`,
+        `SELECT t.* FROM tickets t WHERE t.project_id=$1 AND t.status IN ('ready','in_progress') AND (t.assignee_id IS NULL OR t.assignee_id=$2) AND t.capabilities <@ $3::text[] AND t.labels @> $4::text[] AND NOT EXISTS(SELECT 1 FROM claims c WHERE c.ticket_id=t.id AND c.expires_at>$5) AND NOT EXISTS(SELECT 1 FROM links l JOIN tickets prerequisite ON prerequisite.id=l.source_id WHERE l.target_id=t.id AND l.kind='blocks' AND prerequisite.status<>'done') AND NOT EXISTS(SELECT 1 FROM notes q WHERE q.ticket_id=t.id AND q.kind='question' AND q.blocking AND NOT EXISTS(SELECT 1 FROM notes a WHERE a.answer_to=q.id AND a.kind='answer')) ORDER BY ${order} LIMIT $6 OFFSET $7`,
         [projectId, actorId, capabilities, labels, now, limit, offset],
       );
       return result.rows.map(decode) as unknown as Tables['tickets'][];
@@ -270,6 +298,7 @@ function repository(db: Executor): Transaction {
 }
 
 export class PostgresStorage implements StorageAdapter {
+  readonly schedulingPolicies = Object.freeze(['priority_age', 'unblocking'] as const);
   readonly pool: pg.Pool;
   private reader: Transaction;
   constructor(connectionString: string) {
@@ -298,8 +327,9 @@ export class PostgresStorage implements StorageAdapter {
     now: string,
     limit: number,
     offset: number,
+    policy: SchedulingPolicy = 'priority_age',
   ) {
-    return this.reader.workCandidates(projectId, actorId, capabilities, labels, now, limit, offset);
+    return this.reader.workCandidates(projectId, actorId, capabilities, labels, now, limit, offset, policy);
   }
   async transaction<T>(scope: string, work: (tx: Transaction) => Promise<T>) {
     const client = await this.pool.connect();

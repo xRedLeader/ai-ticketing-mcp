@@ -43,6 +43,7 @@ const project = z.object({
   name: z.string(),
   instructions: z.string(),
   policy: z.enum(['self', 'independent', 'human']),
+  scheduling_policy: z.enum(['priority_age', 'unblocking']).optional(),
   execution_hints: executionHints.optional(),
   revision: z.number(),
   ticket_seq: z.number(),

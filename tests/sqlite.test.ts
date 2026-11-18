@@ -98,6 +98,7 @@ it('upgrades schema 001 without losing tickets and stores immutable GitHub evide
     assert.equal(original.description, 'Preserve this existing body.');
     assert.equal(original.github_pull_request, undefined);
     assert.equal((await a.storage.get('actors', actorId))?.name, 'Original operator');
+    assert.equal((await a.storage.get('projects', projectId))?.scheduling_policy, undefined);
     const linked = { ...original, github_pull_request: { repository: 'owner/repository', number: 7 } };
     const evidence = {
       id: randomUUID(),
@@ -276,10 +277,15 @@ it('leases jobs once across factories and fences superseded tokens and retries',
   }
 });
 
-it('adds the outbox to schema 002 and preserves exact delivery bytes across restart', async () => {
+it('adds the outbox to schema 002 without losing tickets and preserves exact delivery bytes across restart', async () => {
   const a = await adapters();
   let reopened: ReturnType<typeof createSqliteAdapters> | undefined;
   try {
+    const originalActor = randomUUID();
+    const originalProject = randomUUID(),
+      originalTicket = randomUUID(),
+      originalEvent = randomUUID();
+    const createdAt = new Date().toISOString();
     const db = new DatabaseSync(a.filename);
     try {
       db.exec('CREATE TABLE schema_migrations(name TEXT PRIMARY KEY,applied_at TEXT NOT NULL)');
@@ -287,19 +293,68 @@ it('adds the outbox to schema 002 and preserves exact delivery bytes across rest
         db.exec(await readFile(new URL(`../migrations/sqlite/${name}`, import.meta.url), 'utf8'));
         db.prepare('INSERT INTO schema_migrations VALUES(?,?)').run(name, new Date().toISOString());
       }
+      db.prepare('INSERT INTO actors VALUES(?,?,?,?,?,?)').run(
+        originalActor,
+        'upgrade002',
+        'preserved',
+        'Preserved actor',
+        'human',
+        0,
+      );
+      db.prepare("INSERT INTO projects(id,key,name,policy,revision,created_at) VALUES(?,?,?,'self',1,?)").run(
+        originalProject,
+        'PRE002',
+        'Preserved project',
+        createdAt,
+      );
+      db.prepare(
+        "INSERT INTO tickets(id,project_id,key,title,description,status,priority,revision,requirements_revision,created_by,created_at,updated_at) VALUES(?,?,?,?,?,'ready',3,1,1,?,?,?)",
+      ).run(
+        originalTicket,
+        originalProject,
+        'PRE002-1',
+        'Preserved ticket',
+        'Original schema 002 requirements.',
+        originalActor,
+        createdAt,
+        createdAt,
+      );
+      db.prepare('INSERT INTO events VALUES(?,?,?,?,?,?,?,?)').run(
+        originalEvent,
+        originalProject,
+        1,
+        originalActor,
+        'ticket.created',
+        originalTicket,
+        '{}',
+        createdAt,
+      );
     } finally {
       db.close();
     }
-    const f = { ...(await fixture(a)), ...a };
-    const originalTicket = await f.ticket();
     await a.storage.migrate();
     await a.storage.migrate();
+    assert.equal((await a.storage.get('actors', originalActor))?.name, 'Preserved actor');
     assert.equal(
-      (await a.storage.get('tickets', originalTicket.id))?.description,
-      originalTicket.description,
+      (await a.storage.get('tickets', originalTicket))?.description,
+      'Original schema 002 requirements.',
     );
-    const delivery = await deliveryRecord(f);
-    await a.storage.transaction(f.project.id, (tx) => tx.put('outbound_deliveries', delivery));
+    assert.equal((await a.storage.get('events', originalEvent))?.entity_id, originalTicket);
+    const delivery: OutboundDelivery = {
+      id: randomUUID(),
+      event_id: originalEvent,
+      project_id: originalProject,
+      body: '{ "id": "stable-delivery", "event": "ticket.changed" }\n',
+      target_fingerprint: 'a'.repeat(64),
+      attempt_count: 0,
+      next_attempt_at: createdAt,
+      locked_until: null,
+      lock_token: null,
+      sent_at: null,
+      last_error: null,
+      created_at: createdAt,
+    };
+    await a.storage.transaction(originalProject, (tx) => tx.put('outbound_deliveries', delivery));
     await a.search.close();
     await a.storage.close();
     reopened = createSqliteAdapters(a.filename);

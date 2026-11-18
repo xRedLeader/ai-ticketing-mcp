@@ -22,6 +22,7 @@ import {
   type SearchDocument,
   type SearchHit,
   type EmbeddingProfile,
+  type SchedulingPolicy,
 } from '../contracts.js';
 
 const columns: Record<Table, string[]> = {
@@ -37,6 +38,7 @@ const columns: Record<Table, string[]> = {
     'event_seq',
     'created_at',
     'execution_hints',
+    'scheduling_policy',
   ],
   members: ['id', 'project_id', 'actor_id', 'role'],
   tickets: [
@@ -171,7 +173,8 @@ function encode(key: string, value: unknown): SQLInputValue {
 function decode(row: Record<string, unknown>) {
   return Object.fromEntries(
     Object.entries(row).flatMap(([key, value]) =>
-      (key === 'execution_hints' || key === 'github_pull_request') && value === null
+      (key === 'execution_hints' || key === 'github_pull_request' || key === 'scheduling_policy') &&
+      value === null
         ? []
         : [
             [
@@ -255,13 +258,38 @@ function repository(db: DatabaseSync): Transaction {
         .all(projectId, ticketId, Number(blocking), limit, offset)
         .map(decode) as unknown as Note[];
     },
-    async workCandidates(projectId, actorId, capabilities, labels, now, limit, offset) {
+    async workCandidates(
+      projectId,
+      actorId,
+      capabilities,
+      labels,
+      now,
+      limit,
+      offset,
+      policy = 'priority_age',
+    ) {
       page(limit, offset);
+      ensure(['priority_age', 'unblocking'].includes(policy), 'INVALID_QUERY', 'Unknown scheduling policy.');
+      const cutoff =
+        policy === 'unblocking' ? new Date(Date.parse(now) - 24 * 60 * 60 * 1000).toISOString() : null;
+      const order =
+        policy === 'unblocking'
+          ? `t.priority,CASE WHEN t.created_at<=? THEN 0 ELSE 1 END,CASE WHEN t.created_at<=? THEN 0 ELSE (SELECT count(*) FROM links outgoing JOIN tickets dependent ON dependent.id=outgoing.target_id AND dependent.project_id=t.project_id WHERE outgoing.project_id=t.project_id AND outgoing.source_id=t.id AND outgoing.kind='blocks' AND dependent.status NOT IN ('done','cancelled')) END DESC,t.created_at,t.id`
+          : 't.priority,t.created_at,t.id';
       return db
         .prepare(
-          `SELECT t.* FROM tickets t WHERE t.project_id=? AND t.status IN ('ready','in_progress') AND (t.assignee_id IS NULL OR t.assignee_id=?) AND NOT EXISTS(SELECT 1 FROM json_each(t.capabilities) c WHERE c.value NOT IN (SELECT value FROM json_each(?))) AND NOT EXISTS(SELECT 1 FROM json_each(?) l WHERE l.value NOT IN (SELECT value FROM json_each(t.labels))) AND NOT EXISTS(SELECT 1 FROM claims c WHERE c.ticket_id=t.id AND c.expires_at>?) AND NOT EXISTS(SELECT 1 FROM links l JOIN tickets p ON p.id=l.source_id WHERE l.project_id=t.project_id AND l.target_id=t.id AND l.kind='blocks' AND p.status<>'done') AND NOT EXISTS(SELECT 1 FROM notes q WHERE q.project_id=t.project_id AND q.ticket_id=t.id AND q.kind='question' AND q.blocking=1 AND NOT EXISTS(SELECT 1 FROM notes a WHERE a.project_id=q.project_id AND a.ticket_id=q.ticket_id AND a.answer_to=q.id AND a.kind='answer')) ORDER BY t.priority,t.created_at,t.id LIMIT ? OFFSET ?`,
+          `SELECT t.* FROM tickets t WHERE t.project_id=? AND t.status IN ('ready','in_progress') AND (t.assignee_id IS NULL OR t.assignee_id=?) AND NOT EXISTS(SELECT 1 FROM json_each(t.capabilities) c WHERE c.value NOT IN (SELECT value FROM json_each(?))) AND NOT EXISTS(SELECT 1 FROM json_each(?) l WHERE l.value NOT IN (SELECT value FROM json_each(t.labels))) AND NOT EXISTS(SELECT 1 FROM claims c WHERE c.ticket_id=t.id AND c.expires_at>?) AND NOT EXISTS(SELECT 1 FROM links l JOIN tickets p ON p.id=l.source_id WHERE l.project_id=t.project_id AND l.target_id=t.id AND l.kind='blocks' AND p.status<>'done') AND NOT EXISTS(SELECT 1 FROM notes q WHERE q.project_id=t.project_id AND q.ticket_id=t.id AND q.kind='question' AND q.blocking=1 AND NOT EXISTS(SELECT 1 FROM notes a WHERE a.project_id=q.project_id AND a.ticket_id=q.ticket_id AND a.answer_to=q.id AND a.kind='answer')) ORDER BY ${order} LIMIT ? OFFSET ?`,
         )
-        .all(projectId, actorId, JSON.stringify(capabilities), JSON.stringify(labels), now, limit, offset)
+        .all(
+          projectId,
+          actorId,
+          JSON.stringify(capabilities),
+          JSON.stringify(labels),
+          now,
+          ...(cutoff === null ? [] : [cutoff, cutoff]),
+          limit,
+          offset,
+        )
         .map(decode) as unknown as Tables['tickets'][];
     },
     async put<K extends Table>(table: K, value: Tables[K]) {
@@ -396,6 +424,7 @@ class Handle {
   }
 }
 class SqliteStorage extends Handle implements StorageAdapter {
+  readonly schedulingPolicies = Object.freeze(['priority_age', 'unblocking'] as const);
   get<K extends Table>(table: K, id: string) {
     this.open();
     return repository(this.db).get(table, id);
@@ -416,9 +445,19 @@ class SqliteStorage extends Handle implements StorageAdapter {
     now: string,
     limit: number,
     offset: number,
+    policy: SchedulingPolicy = 'priority_age',
   ) {
     this.open();
-    return repository(this.db).workCandidates(projectId, actorId, capabilities, labels, now, limit, offset);
+    return repository(this.db).workCandidates(
+      projectId,
+      actorId,
+      capabilities,
+      labels,
+      now,
+      limit,
+      offset,
+      policy,
+    );
   }
   transaction<T>(_scope: string, work: (tx: Transaction) => Promise<T>): Promise<T> {
     this.open();
