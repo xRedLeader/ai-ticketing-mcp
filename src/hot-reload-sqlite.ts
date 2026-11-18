@@ -1,8 +1,7 @@
 import { isUtf8 } from 'node:buffer';
 import { createHash } from 'node:crypto';
-import { open, readdir, mkdtemp, chmod, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { open, readdir, mkdtemp, chmod, realpath, rm } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { backup, DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -204,7 +203,6 @@ export async function prepareSqliteReload(
   next: SqliteMigrations,
   filename: string,
 ): Promise<{ filename: string; apply(): Promise<void>; dispose(): Promise<void> } | undefined> {
-  const liveFilename = resolve(filename);
   for (let index = 0; index < Math.min(previous.length, next.length); index++) {
     if (previous[index]!.name !== next[index]!.name || previous[index]!.bytes !== next[index]!.bytes)
       throw new Error('SQLite migration history changed; controlled upgrade required.');
@@ -214,18 +212,19 @@ export async function prepareSqliteReload(
   );
   suffix.forEach(expansionSql);
 
-  const directory = await mkdtemp(join(tmpdir(), 'ticketing-sqlite-reload-'));
-  const scratch = join(directory, 'probe.sqlite');
-  const dispose = () => rm(directory, { recursive: true, force: true });
+  const liveFilename = await realpath(filename);
+  let directory: string | undefined;
+  let scratch: string;
+  const dispose = () => (directory ? rm(directory, { recursive: true, force: true }) : Promise.resolve());
   try {
     const source = new DatabaseSync(liveFilename, { readOnly: true });
     try {
       source.exec('BEGIN');
       const { history } = appliedHistory(source, previous, next);
-      if (next.length <= history.length) {
-        await dispose();
-        return;
-      }
+      if (next.length <= history.length) return;
+      // On Windows the copy inherits permissions from the operator's database directory.
+      directory = await mkdtemp(join(dirname(liveFilename), '.ticketing-sqlite-reload-'));
+      scratch = join(directory, 'probe.sqlite');
       await backup(source, scratch);
     } finally {
       source.close();

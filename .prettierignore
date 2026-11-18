@@ -3,5 +3,6 @@ dist
 package-lock.json
 .env
 .local
+.ticketing-sqlite-reload-*/
 *.dump
 LICENSE

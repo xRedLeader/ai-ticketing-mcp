@@ -17,7 +17,13 @@ const exec = promisify(execFile);
 const work = { name: 'work', description: 'Do work', inputSchema: { type: 'object' } };
 const added = { name: 'added', description: 'New tool', inputSchema: { type: 'object' } };
 
-async function fixture(t: TestContext, env: Record<string, string> = {}, modern = false, sqlite = false) {
+async function fixture(
+  t: TestContext,
+  env: Record<string, string> = {},
+  modern = false,
+  sqlite = false,
+  probeTimeoutMs?: number,
+) {
   const directory = await mkdtemp(join(tmpdir(), 'ticketing-stdio-reload-'));
   const pointer = join(directory, 'active');
   const journal = join(directory, 'started');
@@ -64,6 +70,8 @@ async function fixture(t: TestContext, env: Record<string, string> = {}, modern 
       failLive?: boolean;
       disconnectAfterInit?: boolean;
       editDuringProbe?: boolean;
+      slowUntilReady?: boolean;
+      logging?: boolean | 'unsupported';
     } = {},
   ) => {
     const folder = join(directory, version);
@@ -101,9 +109,10 @@ if (${sqlite}) {
   }
   if (options.failLive && path === ${JSON.stringify(database)}) process.exit(1);
 }
-const capabilities = {tools: options.listChanged ? {listChanged:true} : {}, prompts:{}};
+const capabilities = {tools: options.listChanged ? {listChanged:true} : {}, prompts:{}, ...(options.logging ? {logging:{},completions:{}} : {})};
 const replies = options.replies ?? [{tools:options.tools ?? ${JSON.stringify([work])},...options.metadata}];
 let lists = 0;
+let level;
 function send(body) {
   if(modern && body.result) body.result = {resultType:'complete',_meta:{},ttlMs:0,cacheScope:'private',...body.result};
   process.stdout.write(JSON.stringify({jsonrpc:'2.0',...body})+'\\n');
@@ -122,11 +131,22 @@ createInterface({input:process.stdin}).on('line', line=>{
     }
     return;
   }
-  if(method==='tools/list') return send({id,result:replies[Math.min(lists++,replies.length-1)]});
+  if(method==='tools/list') {
+    const result = replies[Math.min(lists++,replies.length-1)];
+    if (options.slowUntilReady && !existsSync(journal+'.ready')) return setTimeout(()=>send({id,result}), 3000);
+    return send({id,result});
+  }
   if(method==='prompts/list') return send({id,result:{prompts:options.prompts ?? []}});
+  if(method==='completion/complete') return send({id,result:{completion:{values:['value']}}});
+  if(method==='logging/setLevel') {
+    if(options.logging !== true) return send({id,error:{code:-32601,message:'Logging unavailable'}});
+    level=params.level;
+    return send({id,result:{}});
+  }
   if(method==='tools/call') {
     appendFileSync(journal,version+':'+params.arguments.label+'\\n');
     if(params.arguments.crash) return process.exit(1);
+    if(params.arguments.expectedLevel && params.arguments.expectedLevel !== level) return send({id,error:{code:-32603,message:'Unexpected logging level'}});
     setTimeout(()=>send({id,result:{content:[{type:'text',text:version}]}}),params.arguments.delay??0);
   }
 });`,
@@ -146,7 +166,15 @@ createInterface({input:process.stdin}).on('line', line=>{
     await select(selected);
     const relay = new StdioClientTransport({
       command: process.execPath,
-      args: ['--import', 'tsx', entry, '--pointer', pointer, ...(sqlite ? ['--sqlite-base', path] : [])],
+      args: [
+        '--import',
+        'tsx',
+        entry,
+        '--pointer',
+        pointer,
+        ...(sqlite ? ['--sqlite-base', path] : []),
+        ...(probeTimeoutMs === undefined ? [] : ['--probe-timeout-ms', String(probeTimeoutMs)]),
+      ],
       stderr: 'pipe',
       env: sqlite ? { ...env, STORAGE_ADAPTER: 'sqlite', SQLITE_PATH: database } : env,
     });
@@ -186,9 +214,62 @@ createInterface({input:process.stdin}).on('line', line=>{
     updates,
     refreshed,
     tableExists,
+    enableProbe: () => writeFile(journal + '.ready', ''),
     diagnostics: () => diagnostics,
   };
 }
+
+test('repeated identical discovery stays reloadable, and distinct frames log the pin limit', async (t) => {
+  const f = await fixture(t);
+  const [first, second] = await Promise.all([f.build('first'), f.build('second')]);
+  await f.connect(first);
+  for (let i = 0; i < 68; i++) await f.client.listTools(undefined, { cacheMode: 'refresh' });
+  await f.select(second);
+  assert.equal(await f.call('after-identical-discovery'), 'second');
+  assert.doesNotMatch(f.diagnostics(), /mcp_relay_pinned/);
+  for (let i = 0; i < 68; i++) await f.client.listTools({ cursor: String(i) }, { cacheMode: 'refresh' });
+  await f.select(first);
+  assert.equal(await f.call('after-distinct-discovery'), 'second');
+  assert.equal(f.diagnostics().match(/"event":"mcp_relay_pinned","reason":"discovery_limit"/g)?.length, 1);
+});
+
+test('retains the old server at the configured probe deadline and retries the same selected path', async (t) => {
+  const f = await fixture(t, {}, false, false, 700);
+  const [first, slow] = await Promise.all([f.build('first'), f.build('slow', { slowUntilReady: true })]);
+  await f.connect(first);
+  await f.select(slow);
+  assert.equal(await f.call('timed-out'), 'first');
+  assert.match(f.diagnostics(), /Probe deadline exceeded/);
+  await f.enableProbe();
+  assert.equal(await f.call('unchanged-selection'), 'first');
+  await f.select(slow);
+  assert.equal(await f.call('reselected'), 'slow');
+});
+
+test('completions and logging settings preserve reload compatibility and keep the latest acknowledged level', async (t) => {
+  const f = await fixture(t);
+  const [first, second, unsupported] = await Promise.all([
+    f.build('first', { logging: true }),
+    f.build('second', { logging: true }),
+    f.build('rejects-logging', { logging: 'unsupported' }),
+  ]);
+  await f.connect(first);
+  await f.client.request({
+    method: 'completion/complete',
+    params: { ref: { type: 'ref/prompt', name: 'example' }, argument: { name: 'input', value: '' } },
+  });
+  for (const level of ['info', 'debug', 'info'] as const) await f.client.setLoggingLevel(level);
+  await f.select(unsupported);
+  assert.equal(await f.call('keep-logging', { expectedLevel: 'info' }), 'first');
+  await f.select(second);
+  assert.equal(await f.call('restore-logging', { expectedLevel: 'info' }), 'second');
+  assert.doesNotMatch(f.diagnostics(), /mcp_relay_pinned/);
+  await f.client.close();
+  await f.connect(unsupported);
+  await assert.rejects(f.client.setLoggingLevel('debug'), /Logging unavailable/);
+  await f.select(second);
+  assert.equal(await f.call('unsupported-logging-ignored'), 'second');
+});
 
 test('does not expand live SQLite until shadow discovery passes, even on a fresh connection', async (t) => {
   const f = await fixture(t, {}, false, true);

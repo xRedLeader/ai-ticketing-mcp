@@ -14,7 +14,9 @@ type Message = Parameters<StdioServerTransport['send']>[0];
 type Request = Extract<Message, { method: string; id: string | number }>;
 type Reply = Extract<Message, { result: unknown } | { error: unknown }>;
 type Bootstrap =
-  { message: Request; hash?: string; catalog?: Reply } | { message: Message; notification: true };
+  | { message: Request; key: string; hash?: string; catalog?: Reply }
+  | { message: Message; key: string; notification: true };
+type RecordedRequest = Exclude<Bootstrap, { notification: true }>;
 type Backend = { entry: string; transport: StdioClientTransport };
 
 const discovery = new Set([
@@ -25,7 +27,9 @@ const discovery = new Set([
   'resources/list',
   'resources/templates/list',
 ]);
-const stateless = new Set(['ping', 'tools/call', 'prompts/get', 'resources/read']);
+const stateless = new Set(['ping', 'tools/call', 'prompts/get', 'resources/read', 'completion/complete']);
+const replayKey = (message: Extract<Message, { method: string }>) =>
+  serializeSuccessEnvelope([message.method, message.params]);
 const log = (event: string, detail: Record<string, unknown> = {}) => {
   process.stderr.write(`${JSON.stringify({ event, ...detail })}\n`);
 };
@@ -105,10 +109,11 @@ async function selectEntry(pointer: string, path: string) {
   process.stdout.write(`${JSON.stringify({ selected: entry })}\n`);
 }
 
-async function relay(pointer: string, profile: string, sqliteBase?: string) {
+async function relay(pointer: string, profile: string, probeTimeoutMs: number, sqliteBase?: string) {
   const front = new StdioServerTransport();
-  const pending = new Map<Request['id'], Bootstrap | null>();
+  const pending = new Map<Request['id'], RecordedRequest | null>();
   const bootstrap: Bootstrap[] = [];
+  let loggingLevel: RecordedRequest | undefined;
   let pinned = false;
   let stopping = false;
   let attempted: string | undefined;
@@ -127,11 +132,23 @@ async function relay(pointer: string, profile: string, sqliteBase?: string) {
   const send = (message: Message) => front.send(message).catch(() => void stop());
   const fail = (id: Request['id'], message: string) =>
     send({ jsonrpc: '2.0', id, error: { code: -32603, message } });
+  const pin = (reason: string) => {
+    if (pinned) return;
+    pinned = true;
+    log('mcp_relay_pinned', { reason });
+  };
 
   function remember(frame: Bootstrap) {
-    // Only replay the fixed discovery surface. Bound memory even if a client repeatedly probes.
-    if (bootstrap.length >= 64 || Buffer.byteLength(JSON.stringify(frame.message)) > 16_384) {
-      pinned = true;
+    if (
+      bootstrap.some(
+        (saved) =>
+          saved.key === frame.key &&
+          ('notification' in frame || ('hash' in saved && saved.hash === frame.hash)),
+      )
+    )
+      return;
+    if (bootstrap.length >= 64 || Buffer.byteLength(frame.key) > 16_384) {
+      pin('discovery_limit');
       return;
     }
     bootstrap.push(frame);
@@ -145,7 +162,7 @@ async function relay(pointer: string, profile: string, sqliteBase?: string) {
       active = undefined;
       attempted = undefined;
       for (const [id, frame] of pending) {
-        if (frame && 'hash' in frame && !frame.hash) pinned = true;
+        if (frame) pin('session_setup_disconnected');
         void fail(
           id,
           'The MCP backend disconnected. The outcome is unknown. Retry mutations with their original idempotency keys.',
@@ -156,10 +173,10 @@ async function relay(pointer: string, profile: string, sqliteBase?: string) {
     };
     backend.transport.onmessage = (message) => {
       if (active !== backend || stopping) return;
-      if ('method' in message && 'id' in message) pinned = true;
+      if ('method' in message && 'id' in message) pin('server_request');
       if (!('method' in message) && message.id !== undefined) {
         const frame = pending.get(message.id);
-        if (frame && !('notification' in frame)) {
+        if (frame) {
           frame.hash = fingerprint(message);
           if (frame.message.method === 'tools/list') {
             const cached = bootstrap.find(
@@ -167,6 +184,9 @@ async function relay(pointer: string, profile: string, sqliteBase?: string) {
             );
             frame.catalog = cached && !('notification' in cached) ? cached.catalog : message;
           }
+          if (frame.message.method === 'logging/setLevel') {
+            if ('result' in message) loggingLevel = frame;
+          } else remember(frame);
           if (
             (frame.message.method === 'initialize' || frame.message.method === 'server/discover') &&
             'result' in message
@@ -217,7 +237,7 @@ async function relay(pointer: string, profile: string, sqliteBase?: string) {
     const aborted = new Promise<never>((_, reject) => {
       rejectProbe = reject;
     });
-    const timer = setTimeout(() => rejectProbe(new Error('Probe deadline exceeded.')), 5_000);
+    const timer = setTimeout(() => rejectProbe(new Error('Probe deadline exceeded.')), probeTimeoutMs);
     transport.onerror = rejectProbe;
     transport.onclose = () => rejectProbe(new Error('Candidate disconnected.'));
     transport.onmessage = (message) => {
@@ -230,16 +250,12 @@ async function relay(pointer: string, profile: string, sqliteBase?: string) {
       const catalogs = new Map<Exclude<Bootstrap, { notification: true }>, Reply>();
       const catalogReplies = new Map<string, Reply>();
       let catalogChanged = false;
-      for (const frame of replay) {
+      for (const frame of loggingLevel ? [...replay, loggingLevel] : replay) {
         if ('notification' in frame) {
           await Promise.race([aborted, transport.send(frame.message)]);
           continue;
         }
-        expected = frame.message.id;
-        const response = new Promise<Reply>((resolve) => {
-          reply = resolve;
-        });
-        const result = await Promise.race([aborted, transport.send(frame.message).then(() => response)]);
+        const result = await discover(frame.message);
         const hash = fingerprint(result);
         if (hash !== frame.hash) {
           if (frame.message.method !== 'tools/list' || !toolsListChanged)
@@ -253,6 +269,11 @@ async function relay(pointer: string, profile: string, sqliteBase?: string) {
         }
       }
       if (catalogChanged) {
+        const [frame, response] = catalogs.entries().next().value!;
+        // Recheck one complete list after replay, even if the client only asked once.
+        const confirmation = await discover({ ...frame.message, id: `mcp-reload-${randomUUID()}` });
+        if (fingerprint(confirmation) !== fingerprint(response))
+          throw new Error('Candidate tool catalog changed during discovery.');
         const definitions = new Set(
           [...catalogs.values()].map((reply) =>
             serializeSuccessEnvelope(Object.fromEntries(toolCatalog(reply).definitions)),
@@ -285,6 +306,14 @@ async function relay(pointer: string, profile: string, sqliteBase?: string) {
       candidate = undefined;
       clearTimeout(timer);
     }
+
+    function discover(message: Request) {
+      expected = message.id;
+      const response = new Promise<Reply>((resolve) => {
+        reply = resolve;
+      });
+      return Promise.race([aborted, transport.send(message).then(() => response)]);
+    }
   }
 
   async function reload() {
@@ -294,7 +323,6 @@ async function relay(pointer: string, profile: string, sqliteBase?: string) {
         // A fresh connection must learn the trusted catalog before probing a schema change.
         deployedMigrations = await readSqliteMigrations(sqliteBase);
         await open(sqliteBase, []);
-        attempted = sqliteBase;
         return;
       }
       if (
@@ -304,9 +332,11 @@ async function relay(pointer: string, profile: string, sqliteBase?: string) {
         if (!active && deployed) await open(deployed, bootstrap);
         return;
       }
+      const { ino, mtimeNs, ctimeNs, size } = await stat(pointer, { bigint: true });
+      const selection = `${ino}:${mtimeNs}:${ctimeNs}:${size}`;
+      if (selection === attempted) return;
+      attempted = selection;
       const selected = (await readFile(pointer, 'utf8')).trim();
-      if (selected === attempted) return;
-      attempted = selected;
       const entry = await validateEntry(selected);
       if (active?.entry === entry) return;
       if (sqliteBase && deployedMigrations) {
@@ -362,22 +392,26 @@ async function relay(pointer: string, profile: string, sqliteBase?: string) {
       if (stopping) return;
       if (!active) return fail(message.id, 'The MCP backend is unavailable. Check the selected build.');
       if (discovery.has(message.method)) {
-        const frame = { message, hash: undefined };
-        remember(frame);
-        pending.set(message.id, frame);
+        pending.set(message.id, { message, key: replayKey(message) });
+      } else if (message.method === 'logging/setLevel') {
+        // Concurrent acknowledgements cannot prove which setting became effective last.
+        if ([...pending.values()].some((frame) => frame?.message.method === message.method))
+          pin('overlapping_logging_settings');
+        pending.set(message.id, { message, key: replayKey(message) });
       } else {
-        if (!stateless.has(message.method)) pinned = true;
+        if (!stateless.has(message.method)) pin('stateful_request');
         pending.set(message.id, null);
       }
     } else if ('method' in message) {
-      if (message.method === 'notifications/initialized') remember({ message, notification: true });
-      else if (message.method !== 'notifications/cancelled') pinned = true;
+      if (message.method === 'notifications/initialized')
+        remember({ message, key: replayKey(message), notification: true });
+      else if (message.method !== 'notifications/cancelled') pin('stateful_notification');
     }
     try {
       await active?.transport.send(message);
     } catch {
       if ('method' in message && 'id' in message && pending.delete(message.id)) {
-        pinned = true;
+        pin('delivery_failed');
         await fail(
           message.id,
           'MCP delivery failed. The outcome is unknown. Retry mutations with their original idempotency keys.',
@@ -409,19 +443,24 @@ async function main() {
       profile: { type: 'string' },
       select: { type: 'string' },
       'sqlite-base': { type: 'string' },
+      'probe-timeout-ms': { type: 'string' },
     },
   });
   if (!values.pointer || !isAbsolute(values.pointer))
     throw new Error(
-      'Usage: node dist/stdio-hot-reload.js --pointer ABSOLUTE_PATH [--profile NAME [--sqlite-base ABSOLUTE_CLI] | --select ABSOLUTE_CLI]',
+      'Usage: node dist/stdio-hot-reload.js --pointer ABSOLUTE_PATH [--profile NAME [--sqlite-base ABSOLUTE_CLI] [--probe-timeout-ms MS] | --select ABSOLUTE_CLI]',
     );
   if (values.select !== undefined) await selectEntry(values.pointer, values.select);
   else {
+    const probeTimeoutMs = Number(values['probe-timeout-ms'] ?? 15_000);
+    if (!Number.isSafeInteger(probeTimeoutMs) || probeTimeoutMs < 100 || probeTimeoutMs > 120_000)
+      throw new Error('--probe-timeout-ms must be an integer from 100 to 120000.');
     if (values['sqlite-base'] !== undefined && process.env.STORAGE_ADAPTER !== 'sqlite')
       throw new Error('--sqlite-base requires STORAGE_ADAPTER=sqlite.');
     await relay(
       values.pointer,
       parseMcpProfile(values.profile),
+      probeTimeoutMs,
       values['sqlite-base'] === undefined ? undefined : await validateEntry(values['sqlite-base']),
     );
   }

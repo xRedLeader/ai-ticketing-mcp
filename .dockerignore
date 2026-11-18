@@ -4,5 +4,6 @@ dist
 .env
 .env.*
 .local
+**/.ticketing-sqlite-reload-*
 coverage
 *.dump

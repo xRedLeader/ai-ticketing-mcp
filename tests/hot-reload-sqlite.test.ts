@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -89,6 +89,11 @@ test('backs up committed WAL data and leaves pristine scratch and live schemas f
     ALTER TABLE "legacy" ADD COLUMN "hint" TEXT NULL DEFAULT NULL; -- trailing ;`);
   const probe = (await prepareSqliteReload(previous, candidate, filename))!;
   try {
+    assert.equal(dirname(dirname(probe.filename)), dirname(await realpath(filename)));
+    if (process.platform !== 'win32') {
+      assert.equal((await stat(dirname(probe.filename))).mode & 0o777, 0o700);
+      assert.equal((await stat(probe.filename)).mode & 0o777, 0o600);
+    }
     const scratch = new DatabaseSync(probe.filename);
     try {
       assert.equal(scratch.prepare('SELECT body FROM legacy WHERE id=?').get('old')!.body, 'preserve me');

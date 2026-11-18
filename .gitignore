@@ -5,6 +5,7 @@ coverage/
 .env.*
 !.env.example
 .local/
+.ticketing-sqlite-reload-*/
 token-profiles/
 *.log
 *.dump
