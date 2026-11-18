@@ -101,6 +101,33 @@ function settle(
   });
 }
 
+it('defaults scripts to 30 minutes, keeps the 15-minute agent timeout and rejects excessive script timeouts', async () => {
+  const f = await fixture();
+  try {
+    assert.equal(f.capacity.inspect('host').config.script_timeout_ms, 30 * 60_000);
+    queue(f.capacity, 'agent');
+    assert.equal(f.capacity.report('project').config.limits.invocation_timeout_ms, 15 * 60_000);
+    queue(f.capacity, 'script-default', 'script-project', { kind: 'script' });
+    queue(f.capacity, 'script-boundary', 'script-project', {
+      kind: 'script',
+      timeout_ms: 30 * 60_000,
+    });
+    assert.equal(
+      f.capacity.inspect('host').entries.find((entry) => entry.queue_id === 'script-default')!.timeout_ms,
+      30 * 60_000,
+    );
+    assert.throws(() =>
+      queue(f.capacity, 'script-excess', 'script-project', {
+        kind: 'script',
+        timeout_ms: 30 * 60_000 + 1,
+      }),
+    );
+    assert.equal(f.capacity.inspect('host').entries.length, 3);
+  } finally {
+    await f.dispose();
+  }
+});
+
 it('keeps agent and script slots separate and commits actual SELF-10 reservations', async () => {
   const f = await fixture();
   try {

@@ -21,7 +21,7 @@ const hostSchema = z.strictObject({
   cpu_millis: positive.nullable().default(null),
   memory_bytes: positive.nullable().default(null),
   lease_ms: positive.max(2147483647).default(60_000),
-  script_timeout_ms: positive.max(2147483647).default(15 * 60_000),
+  script_timeout_ms: positive.max(2147483647).default(30 * 60_000),
 });
 const queueSchema = z.strictObject({
   queue_id: id,
