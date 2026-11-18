@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { lookup } from 'node:dns/promises';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
@@ -125,6 +125,66 @@ export function checkProductionConfig(env, compose, realm) {
   return errors;
 }
 
+export async function prepareProductionRealm(importPath, audience) {
+  const realm = JSON.parse(await readFile('deploy/keycloak-realm.json', 'utf8'));
+  const mapper = realm.clientScopes
+    ?.find((scope) => scope.name === 'ticketing:read')
+    ?.protocolMappers?.find(
+      (mapper) => mapper.name === 'ticketing-audience' && mapper.protocolMapper === 'oidc-audience-mapper',
+    );
+  if (!mapper?.config)
+    throw new Error(
+      'Realm template: restore the ticketing:read audience mapper before preparing the production import.',
+    );
+  mapper.config['included.custom.audience'] = audience;
+  // Only public template fields may enter the container-readable import, never a current realm export.
+  const content =
+    JSON.stringify(
+      realm,
+      [
+        'realm',
+        'enabled',
+        'registrationAllowed',
+        'resetPasswordAllowed',
+        'accessTokenLifespan',
+        'clientScopes',
+        'name',
+        'protocol',
+        'attributes',
+        'include.in.token.scope',
+        'display.on.consent.screen',
+        'protocolMappers',
+        'protocolMapper',
+        'consentRequired',
+        'config',
+        'included.custom.audience',
+        'access.token.claim',
+        'id.token.claim',
+        'clients',
+        'clientId',
+        'publicClient',
+        'standardFlowEnabled',
+        'directAccessGrantsEnabled',
+        'redirectUris',
+        'pkce.code.challenge.method',
+        'oauth2.device.authorization.grant.enabled',
+        'defaultClientScopes',
+        'serviceAccountsEnabled',
+      ],
+      2,
+    ) + '\n';
+  await mkdir(dirname(importPath), { recursive: true });
+  const directory = await mkdtemp(join(dirname(importPath), '.keycloak-realm-'));
+  try {
+    const temporaryPath = join(directory, 'ticketing.json');
+    await writeFile(temporaryPath, content, { mode: 0o600, flag: 'wx' });
+    await chmod(temporaryPath, 0o644);
+    await rename(temporaryPath, importPath);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   const args = process.argv.slice(2);
   if (
@@ -145,21 +205,9 @@ async function main() {
   }
   const importPath = resolve('.local/keycloak-realm.production.json');
   if (args.includes('--prepare-realm')) {
-    const realm = JSON.parse(await readFile('deploy/keycloak-realm.json', 'utf8'));
-    const mapper = realm.clientScopes
-      ?.find((scope) => scope.name === 'ticketing:read')
-      ?.protocolMappers?.find(
-        (mapper) => mapper.name === 'ticketing-audience' && mapper.protocolMapper === 'oidc-audience-mapper',
-      );
-    if (!mapper?.config)
-      throw new Error(
-        'Realm template: restore the ticketing:read audience mapper before preparing the production import.',
-      );
-    mapper.config['included.custom.audience'] = process.env.OAUTH_AUDIENCE;
-    await mkdir(dirname(importPath), { recursive: true });
-    await writeFile(importPath, JSON.stringify(realm, null, 2) + '\n', { mode: 0o600 });
+    await prepareProductionRealm(importPath, process.env.OAUTH_AUDIENCE);
     process.stdout.write(
-      'Prepared private production realm import. Existing Keycloak realms are not overwritten by startup import.\n',
+      'Prepared public production realm import. Existing Keycloak realms are not overwritten by startup import.\n',
     );
   }
   let realm, compose, importRealm;
