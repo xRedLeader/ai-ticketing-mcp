@@ -279,8 +279,9 @@ export const descriptions: Record<Operation, string> = {
   tickets_create:
     'Atomically create up to 50 tickets with acceptance criteria. Use status ready to make work claimable.',
   ticket_get:
-    'Read a ticket, all criteria, dependencies, recent notes, and submissions. Accepts UUID or project ticket key.',
-  ticket_history: 'Page through the complete notes, submissions, or reviews for a ticket.',
+    'Read current ticket details, criteria, dependencies, claim, and blockers. Accepts UUID or ticket key. Use ticket_history for historical records.',
+  ticket_history:
+    'Page through complete notes, submissions, reviews, or GitHub evidence history for a ticket.',
   ticket_list: 'List project tickets, optionally filtered by status.',
   ticket_update:
     'Edit a ticket with revision protection. Requirement changes revoke claims and invalidate affected approvals.',
