@@ -41,6 +41,41 @@ const knowledgeColumns = [
   'updated_at',
 ];
 const columns: Record<Table, string[]> = {
+  execution_jobs: [
+    'id',
+    'project_id',
+    'ticket_id',
+    'actor_id',
+    'checkpoint_id',
+    'continuation_id',
+    'claim_token',
+    'requirements_revision',
+    'recipe_id',
+    'recipe_fingerprint',
+    'status',
+    'reservation_token',
+    'locked_until',
+    'started_at',
+    'finished_at',
+    'exit_code',
+    'signal',
+    'artifacts',
+    'error_code',
+    'created_at',
+  ],
+  continuations: [
+    'id',
+    'project_id',
+    'ticket_id',
+    'run_id',
+    'checkpoint_id',
+    'requirements_revision',
+    'completion_condition',
+    'status',
+    'failure_reason',
+    'created_at',
+    'settled_at',
+  ],
   actors: ['id', 'issuer', 'subject', 'name', 'kind', 'system_admin'],
   projects: [
     'id',
@@ -163,6 +198,8 @@ const columns: Record<Table, string[]> = {
   ],
 };
 const json = new Set([
+  'artifacts',
+  'completion_condition',
   'labels',
   'capabilities',
   'metadata',
@@ -232,6 +269,39 @@ function repository(db: DatabaseSync): Transaction {
     return `"${key}"`;
   };
   return {
+    async compareExecutionRun(previous, next) {
+      ensure(
+        previous.id === next.id && previous.project_id === next.project_id,
+        'INVALID_INPUT',
+        'Execution identity cannot change.',
+      );
+      if (previous.status === 'succeeded' || previous.status === 'failed') return false;
+      const keys = [
+        'status',
+        'reservation_token',
+        'locked_until',
+        'started_at',
+        'finished_at',
+        'exit_code',
+        'signal',
+        'artifacts',
+        'error_code',
+      ] as const;
+      return (
+        db
+          .prepare(
+            `UPDATE execution_jobs SET ${keys.map((key) => `${key}=?`).join(',')} WHERE id=? AND project_id=? AND status=? AND reservation_token IS ? AND locked_until IS ?`,
+          )
+          .run(
+            ...keys.map((key) => encode(key, next[key])),
+            previous.id,
+            previous.project_id,
+            previous.status,
+            previous.reservation_token,
+            previous.locked_until,
+          ).changes === 1
+      );
+    },
     async get<K extends Table>(table: K, id: string) {
       return (await this.find(table, { where: { id } as Query<Tables[K]>['where'], limit: 1 }))[0] ?? null;
     },
@@ -320,7 +390,10 @@ function repository(db: DatabaseSync): Transaction {
         'A record ID is required.',
       );
       const conflict =
-        table === 'github_evidence' || table === 'outbound_deliveries' || table === 'knowledge_revisions'
+        table === 'github_evidence' ||
+        table === 'outbound_deliveries' ||
+        table === 'knowledge_revisions' ||
+        table === 'execution_jobs'
           ? ''
           : ` ON CONFLICT(id) DO UPDATE SET ${keys
               .filter((key) => key !== 'id')
@@ -332,6 +405,11 @@ function repository(db: DatabaseSync): Transaction {
     },
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
+      ensure(
+        table !== 'execution_jobs' && table !== 'continuations',
+        'IMMUTABLE_EXECUTION',
+        'Execution history cannot be deleted.',
+      );
       ensure(
         table !== 'knowledge' && table !== 'knowledge_revisions',
         'IMMUTABLE_KNOWLEDGE',
@@ -447,6 +525,7 @@ class Handle {
   }
 }
 class SqliteStorage extends Handle implements StorageAdapter {
+  readonly executionRuns = true as const;
   readonly schedulingPolicies = Object.freeze(['priority_age', 'unblocking'] as const);
   get<K extends Table>(table: K, id: string) {
     this.open();

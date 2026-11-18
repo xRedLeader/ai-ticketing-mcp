@@ -24,6 +24,10 @@ import {
   type GitHubCIStatus,
   type WebhookTarget,
   type SchedulingPolicy,
+  type ExecutionRecipeRegistration,
+  type ExecutionJob,
+  type ExecutionOutcome,
+  type Continuation,
   validateGitHubConfiguration,
 } from './contracts.js';
 import { resultSchemas, githubEvidenceSchema } from './result-schemas.js';
@@ -40,6 +44,7 @@ export interface ApplicationOptions {
   referenceTokenMetrics?: boolean;
   github?: GitHubConfiguration & { provider: GitHubProvider };
   webhook?: WebhookTarget;
+  executionRecipes?: readonly ExecutionRecipeRegistration[];
 }
 const LEASE_MS = 600_000;
 const webhookEvents = new Set([
@@ -77,6 +82,7 @@ export class Application {
   private referenceTokenMetrics: boolean;
   private readonly github?: GitHubConfiguration & { provider: GitHubProvider };
   private readonly webhook?: WebhookTarget;
+  private readonly executionRecipes = new Map<string, ExecutionRecipeRegistration>();
   readonly metrics = {
     requests: 0,
     errors: 0,
@@ -89,6 +95,21 @@ export class Application {
     token_accounting_failures: 0,
   };
   constructor(options: ApplicationOptions) {
+    for (const recipe of options.executionRecipes ?? []) {
+      ensure(
+        /^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$/.test(recipe.id) &&
+          /^[a-f0-9]{64}$/.test(recipe.fingerprint) &&
+          recipe.project_ids.length > 0 &&
+          recipe.project_ids.every((id) => uuid.test(id)) &&
+          !this.executionRecipes.has(recipe.id),
+        'INVALID_CONFIG',
+        'Configure distinct execution recipes with a fingerprint and authorized projects.',
+      );
+      this.executionRecipes.set(
+        recipe.id,
+        Object.freeze({ ...recipe, project_ids: Object.freeze([...recipe.project_ids]) }),
+      );
+    }
     this.storage = options.storage;
     this.searchAdapter = options.search;
     this.embeddings = options.embeddings
@@ -649,6 +670,249 @@ export class Application {
     );
     return claim;
   }
+  private executionRecipe(projectId: string, recipeId: string) {
+    const recipe = this.executionRecipes.get(recipeId);
+    ensure(
+      recipe && recipe.project_ids.includes(projectId),
+      'RECIPE_NOT_AUTHORIZED',
+      'Recipe is not registered for this project.',
+    );
+    return recipe;
+  }
+  private async executionAuthority(reader: Reader, run: ExecutionJob) {
+    const ticket = await reader.get('tickets', run.ticket_id);
+    const claim = await reader.get('claims', run.ticket_id);
+    const member = await reader.get('members', `${run.project_id}:${run.actor_id}`);
+    const actor = await reader.get('actors', run.actor_id);
+    if (!(
+      ticket &&
+      ticket.project_id === run.project_id &&
+      ticket.status === 'in_progress' &&
+      ticket.requirements_revision === run.requirements_revision &&
+      claim?.project_id === run.project_id &&
+      claim.token === run.claim_token &&
+      claim.actor_id === run.actor_id &&
+      (!ticket.assignee_id || ticket.assignee_id === run.actor_id) &&
+      (actor?.system_admin || (member && ['contributor', 'admin'].includes(member.role)))
+    ))
+      return false;
+    try {
+      return !(await this.blockers(reader, ticket)).length;
+    } catch (error) {
+      if (error instanceof DomainError && error.code === 'GRAPH_LIMIT') return false;
+      throw error;
+    }
+  }
+  private async executionTransaction<T>(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    work: (tx: Transaction, run: ExecutionJob) => Promise<T>,
+  ) {
+    ensure(uuid.test(projectId) && uuid.test(runId), 'INVALID_INPUT', 'Execution identifiers must be UUIDs.');
+    ensure(
+      this.storage.executionRuns,
+      'UNSUPPORTED_EXECUTION_RUNS',
+      'Storage does not support durable execution runs.',
+    );
+    return this.storage.transaction(projectId, async (tx) => {
+      await this.access(tx, await this.actor(actorId, tx), projectId, ['admin']);
+      const run = await tx.get('execution_jobs', runId);
+      ensure(run?.project_id === projectId, 'NOT_FOUND', 'Execution run not found.');
+      ensure(
+        tx.compareExecutionRun,
+        'UNSUPPORTED_EXECUTION_RUNS',
+        'Storage does not support execution ownership fencing.',
+      );
+      return work(tx, run);
+    });
+  }
+  private executionLease(leaseMs: number) {
+    ensure(
+      Number.isSafeInteger(leaseMs) && leaseMs >= 1000 && leaseMs <= 3_600_000,
+      'INVALID_INPUT',
+      'Execution lease must be 1000–3600000 milliseconds.',
+    );
+    return new Date(this.now().getTime() + leaseMs).toISOString();
+  }
+  /** Trusted companion API; these methods are deliberately absent from the MCP catalog. */
+  async listExecutionRuns(actorId: string, projectId: string): Promise<ExecutionJob[]> {
+    ensure(uuid.test(projectId), 'INVALID_INPUT', 'Project identifier must be a UUID.');
+    ensure(
+      this.storage.executionRuns,
+      'UNSUPPORTED_EXECUTION_RUNS',
+      'Storage does not support durable execution runs.',
+    );
+    return this.storage.readSnapshot(async (reader) => {
+      await this.access(reader, await this.actor(actorId, reader), projectId, ['admin']);
+      const eligible: ExecutionJob[] = [];
+      for (let offset = 0; eligible.length < 100; offset += 100) {
+        const page = await reader.find('execution_jobs', {
+          where: { project_id: projectId, status: 'queued' },
+          order: [
+            { field: 'created_at', direction: 'asc' },
+            { field: 'id', direction: 'asc' },
+          ],
+          limit: 100,
+          offset,
+        });
+        for (const run of page)
+          if (await this.executionAuthority(reader, run)) {
+            eligible.push(run);
+            if (eligible.length === 100) break;
+          }
+        if (page.length < 100) break;
+      }
+      return eligible;
+    });
+  }
+  async reserveExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    leaseMs: number,
+  ): Promise<ExecutionJob | null> {
+    const lockedUntil = this.executionLease(leaseMs);
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (run.status !== 'queued' || !(await this.executionAuthority(tx, run))) return null;
+      const next: ExecutionJob = {
+        ...run,
+        status: 'reserved',
+        reservation_token: randomUUID(),
+        locked_until: lockedUntil,
+      };
+      return (await tx.compareExecutionRun!(run, next)) ? next : null;
+    });
+  }
+  async startExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    token: string,
+    leaseMs: number,
+  ): Promise<ExecutionJob | null> {
+    const lockedUntil = this.executionLease(leaseMs);
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (
+        run.status !== 'reserved' ||
+        run.reservation_token !== token ||
+        !run.locked_until ||
+        run.locked_until <= this.timestamp() ||
+        !(await this.executionAuthority(tx, run))
+      )
+        return null;
+      const recipe = this.executionRecipes.get(run.recipe_id);
+      if (!recipe?.project_ids.includes(projectId) || recipe.fingerprint !== run.recipe_fingerprint)
+        return null;
+      const next: ExecutionJob = {
+        ...run,
+        status: 'running',
+        started_at: this.timestamp(),
+        locked_until: lockedUntil,
+      };
+      return (await tx.compareExecutionRun!(run, next)) ? next : null;
+    });
+  }
+  async heartbeatExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    token: string,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const lockedUntil = this.executionLease(leaseMs);
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (
+        !['reserved', 'running'].includes(run.status) ||
+        run.reservation_token !== token ||
+        !run.locked_until ||
+        run.locked_until <= this.timestamp()
+      )
+        return false;
+      return tx.compareExecutionRun!(run, { ...run, locked_until: lockedUntil });
+    });
+  }
+  async settleExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    token: string,
+    outcome: ExecutionOutcome,
+  ): Promise<boolean> {
+    ensure(
+      (outcome.exit_code === null ||
+        (Number.isSafeInteger(outcome.exit_code) &&
+          outcome.exit_code >= -2147483648 &&
+          outcome.exit_code <= 4294967295)) &&
+        (outcome.signal === null ||
+          (typeof outcome.signal === 'string' && outcome.signal.length > 0 && outcome.signal.length <= 80)) &&
+        Array.isArray(outcome.artifacts) &&
+        outcome.artifacts.length <= 50 &&
+        outcome.artifacts.every((ref) => typeof ref === 'string' && ref.length > 0 && ref.length <= 2000) &&
+        (outcome.error_code === null ||
+          (typeof outcome.error_code === 'string' && /^[A-Z0-9_]{1,80}$/.test(outcome.error_code))) &&
+        (outcome.exit_code !== null || outcome.signal !== null || outcome.error_code !== null),
+      'INVALID_INPUT',
+      'Provide a bounded authoritative execution outcome.',
+    );
+    const result: ExecutionOutcome = {
+      exit_code: outcome.exit_code,
+      signal: outcome.signal,
+      artifacts: [...outcome.artifacts],
+      error_code: outcome.error_code,
+    };
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (run.reservation_token !== token) return false;
+      if (['succeeded', 'failed'].includes(run.status))
+        return (
+          digest({
+            exit_code: run.exit_code,
+            signal: run.signal,
+            artifacts: run.artifacts,
+            error_code: run.error_code,
+          }) === digest(result)
+        );
+      if (
+        !['reserved', 'running'].includes(run.status) ||
+        !run.locked_until ||
+        run.locked_until <= this.timestamp() ||
+        (run.status === 'reserved' &&
+          (result.exit_code !== null || result.signal !== null || !result.error_code))
+      )
+        return false;
+      const finishedAt = this.timestamp();
+      const next: ExecutionJob = {
+        ...run,
+        ...result,
+        status: result.exit_code === 0 && !result.signal && !result.error_code ? 'succeeded' : 'failed',
+        finished_at: finishedAt,
+      };
+      if (!(await tx.compareExecutionRun!(run, next))) return false;
+      const continuation = await tx.get('continuations', run.continuation_id);
+      ensure(
+        continuation?.project_id === projectId && continuation.run_id === run.id,
+        'INVALID_REFERENCE',
+        'Execution continuation is missing.',
+      );
+      const current = await this.executionAuthority(tx, run);
+      const satisfied =
+        current &&
+        !result.error_code &&
+        !result.signal &&
+        result.exit_code === continuation.completion_condition.exit_code;
+      await tx.put('continuations', {
+        ...continuation,
+        status: satisfied ? 'satisfied' : 'failed',
+        failure_reason: satisfied
+          ? null
+          : current
+            ? (result.error_code ?? 'EXIT_CONDITION_FAILED')
+            : 'STALE_AUTHORITY',
+        settled_at: finishedAt,
+      });
+      return true;
+    });
+  }
   private async childrenDone(tx: Reader, ticket: Ticket) {
     const children = await tx.find('tickets', {
       where: { project_id: ticket.project_id, parent_id: ticket.id },
@@ -1079,6 +1343,90 @@ export class Application {
   ): Promise<unknown> {
     const ticket = await this.ticket(tx, project.id, input.ticket_id);
     switch (operation) {
+      case 'run_submit': {
+        ensure(
+          this.storage.executionRuns && tx.compareExecutionRun,
+          'UNSUPPORTED_EXECUTION_RUNS',
+          'Storage does not support durable execution runs.',
+        );
+        await this.liveClaim(tx, ticket, actor, input.claim_token);
+        ensure(
+          ticket.status === 'in_progress' && (!ticket.assignee_id || ticket.assignee_id === actor.id),
+          'NOT_CLAIMABLE',
+          'Execution requires an in-progress ticket assigned to this worker or unassigned.',
+        );
+        ensure(
+          !(await this.blockers(tx, ticket)).length,
+          'DEPENDENCY_BLOCKED',
+          'Resolve prerequisites and blocking questions before execution.',
+        );
+        const recipe = this.executionRecipe(project.id, input.recipe_id);
+        const checkpoint = await this.note(tx, actor, ticket, 'checkpoint', input.checkpoint.progress, {
+          metadata: {
+            remaining: input.checkpoint.remaining,
+            decisions: input.checkpoint.decisions,
+            references: input.checkpoint.references,
+          },
+        });
+        await this.touch(tx, ticket);
+        await this.queue(tx, checkpoint, 'checkpoint');
+        const runId = randomUUID(),
+          continuationId = randomUUID(),
+          createdAt = this.timestamp();
+        const run: ExecutionJob = {
+          id: runId,
+          project_id: project.id,
+          ticket_id: ticket.id,
+          actor_id: actor.id,
+          checkpoint_id: checkpoint.id,
+          continuation_id: continuationId,
+          claim_token: input.claim_token,
+          requirements_revision: ticket.requirements_revision,
+          recipe_id: recipe.id,
+          recipe_fingerprint: recipe.fingerprint,
+          status: 'queued',
+          reservation_token: null,
+          locked_until: null,
+          started_at: null,
+          finished_at: null,
+          exit_code: null,
+          signal: null,
+          artifacts: [],
+          error_code: null,
+          created_at: createdAt,
+        };
+        await tx.put('execution_jobs', run);
+        const continuation: Continuation = {
+          id: continuationId,
+          project_id: project.id,
+          ticket_id: ticket.id,
+          run_id: runId,
+          checkpoint_id: checkpoint.id,
+          requirements_revision: ticket.requirements_revision,
+          completion_condition: input.completion_condition,
+          status: 'pending',
+          failure_reason: null,
+          created_at: createdAt,
+          settled_at: null,
+        };
+        await tx.put('continuations', continuation);
+        await this.event(tx, project, actor, 'run.submitted', ticket.id, {
+          run_id: runId,
+          checkpoint_id: checkpoint.id,
+          continuation_id: continuationId,
+        });
+        return {
+          run_id: runId,
+          project_id: project.id,
+          ticket_id: ticket.id,
+          checkpoint_id: checkpoint.id,
+          continuation_id: continuationId,
+          recipe_id: recipe.id,
+          recipe_fingerprint: recipe.fingerprint,
+          status: 'queued',
+          retrieval: { tool: 'run_get', arguments: { project_id: project.id, run_id: runId } },
+        };
+      }
       case 'ticket_update': {
         this.version(ticket, input.expected_revision);
         if (input.execution_hints !== undefined) {
@@ -1373,6 +1721,30 @@ export class Application {
     };
   }
   private async read(actorId: string, operation: Operation, input: any): Promise<unknown> {
+    if (operation === 'run_get')
+      return this.storage.readSnapshot(async (reader) => {
+        await this.access(reader, await this.actor(actorId, reader), input.project_id);
+        ensure(
+          this.storage.executionRuns,
+          'UNSUPPORTED_EXECUTION_RUNS',
+          'Storage does not support durable execution runs.',
+        );
+        const run = await reader.get('execution_jobs', input.run_id);
+        ensure(run && run.project_id === input.project_id, 'NOT_FOUND', 'Execution run not found.');
+        const continuation = await reader.get('continuations', run.continuation_id);
+        const checkpoint = await reader.get('notes', run.checkpoint_id);
+        ensure(
+          continuation &&
+            continuation.project_id === input.project_id &&
+            continuation.run_id === run.id &&
+            checkpoint &&
+            checkpoint.project_id === input.project_id &&
+            checkpoint.kind === 'checkpoint',
+          'INVALID_REFERENCE',
+          'Execution checkpoint or continuation is missing.',
+        );
+        return { run, continuation, checkpoint, stale: !(await this.executionAuthority(reader, run)) };
+      });
     if (operation === 'ticket_context') {
       const snapshot = await this.storage.readSnapshot(async (reader) => {
         const actor = await this.actor(actorId, reader);

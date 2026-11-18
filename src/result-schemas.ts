@@ -210,6 +210,38 @@ const retrieval = z.object({
   tool: z.string(),
   arguments: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])),
 });
+const executionJob = z.object({
+  id,
+  project_id: id,
+  ticket_id: id,
+  actor_id: id,
+  checkpoint_id: id,
+  continuation_id: id,
+  requirements_revision: z.int().positive(),
+  recipe_id: z.string(),
+  recipe_fingerprint: z.string(),
+  status: z.enum(['queued', 'reserved', 'running', 'succeeded', 'failed']),
+  started_at: timestamp.nullable(),
+  finished_at: timestamp.nullable(),
+  created_at: timestamp,
+  exit_code: z.int().min(-2147483648).max(4294967295).nullable(),
+  signal: z.string().nullable(),
+  artifacts: z.array(z.string()),
+  error_code: z.string().nullable(),
+});
+const continuation = z.object({
+  id,
+  project_id: id,
+  ticket_id: id,
+  run_id: id,
+  checkpoint_id: id,
+  requirements_revision: z.int().positive(),
+  completion_condition: z.object({ kind: z.literal('exit_code'), exit_code: z.int().min(0).max(255) }),
+  status: z.enum(['pending', 'satisfied', 'failed']),
+  failure_reason: z.string().nullable(),
+  created_at: timestamp,
+  settled_at: timestamp.nullable(),
+});
 const omission = z.object({
   section: z.string(),
   retrieve_with: z.string(),
@@ -266,6 +298,18 @@ const search = z.object({
   index_consistency: z.literal('eventual'),
 });
 export const resultSchemas: Record<Operation, z.ZodType> = {
+  run_submit: z.object({
+    run_id: id,
+    project_id: id,
+    ticket_id: id,
+    checkpoint_id: id,
+    continuation_id: id,
+    recipe_id: z.string(),
+    recipe_fingerprint: z.string(),
+    status: z.literal('queued'),
+    retrieval,
+  }),
+  run_get: z.object({ run: executionJob, continuation, checkpoint: note, stale: z.boolean() }),
   ticket_github_refresh: z.object({
     ticket: ticketReceipt,
     github_evidence: githubEvidenceSchema.pick({

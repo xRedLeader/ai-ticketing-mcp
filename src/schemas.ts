@@ -11,6 +11,12 @@ const page = { limit: z.int().min(1).max(100).default(10), offset: z.int().min(0
 const maxTokens = z.int().min(512).max(32768);
 const criteria = z.array(text.max(1000)).min(1).max(50);
 const schedulingPolicy = z.enum(['priority_age', 'unblocking']);
+const checkpointFields = {
+  progress: text.max(16000),
+  remaining: z.array(text.max(2000)).max(50).default([]),
+  decisions: z.array(text.max(2000)).max(50).default([]),
+  references: z.array(text.max(2000)).max(50).default([]),
+};
 export const executionHintsSchema = z
   .object({
     model: z.string().trim().max(128).nullable().optional(),
@@ -45,6 +51,19 @@ const evidence = z
   })
   .strict();
 export const schemas = {
+  run_submit: z
+    .object({
+      ...ticket,
+      ...mutation,
+      claim_token: id,
+      recipe_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$/),
+      checkpoint: z.object(checkpointFields).strict(),
+      completion_condition: z
+        .object({ kind: z.literal('exit_code'), exit_code: z.int().min(0).max(255) })
+        .strict(),
+    })
+    .strict(),
+  run_get: z.object({ ...project, run_id: id }).strict(),
   project_list: z.object(page).strict(),
   project_get: z.object(project).strict(),
   project_create: z
@@ -177,10 +196,7 @@ export const schemas = {
       ...ticket,
       ...mutation,
       claim_token: id,
-      progress: text.max(16000),
-      remaining: z.array(text.max(2000)).max(50).default([]),
-      decisions: z.array(text.max(2000)).max(50).default([]),
-      references: z.array(text.max(2000)).max(50).default([]),
+      ...checkpointFields,
     })
     .strict(),
   ticket_note: z
@@ -273,6 +289,7 @@ export const schemas = {
 export type Operation = keyof typeof schemas;
 export type Input<K extends Operation> = z.infer<(typeof schemas)[K]>;
 export const readOperations = new Set<Operation>([
+  'run_get',
   'project_list',
   'project_get',
   'ticket_get',
@@ -286,6 +303,10 @@ export const readOperations = new Set<Operation>([
   'changes_since',
 ]);
 export const descriptions: Record<Operation, string> = {
+  run_submit:
+    'Atomically persist a checkpoint, registered script execution, and exit-code continuation using your live claim. Available in the full profile; scripts are configured by the operator.',
+  run_get:
+    'Retrieve one exact project execution, authoritative process result, artifacts, checkpoint, and continuation. Available in the full profile.',
   ticket_github_refresh:
     'Link or refresh a PR in the configured trusted repository; retrieve immutable evidence for its exact head SHA. Never approves or merges work.',
   project_list: 'List projects accessible to your authenticated identity.',

@@ -208,6 +208,48 @@ export interface Job {
   lock_token: string | null;
   last_error: string | null;
 }
+export interface ExecutionRecipeRegistration {
+  id: string;
+  fingerprint: string;
+  project_ids: readonly string[];
+}
+export interface ExecutionOutcome {
+  exit_code: number | null;
+  signal: string | null;
+  artifacts: string[];
+  error_code: string | null;
+}
+export interface ExecutionJob extends ExecutionOutcome {
+  id: string;
+  project_id: string;
+  ticket_id: string;
+  actor_id: string;
+  checkpoint_id: string;
+  continuation_id: string;
+  claim_token: string;
+  requirements_revision: number;
+  recipe_id: string;
+  recipe_fingerprint: string;
+  status: 'queued' | 'reserved' | 'running' | 'succeeded' | 'failed';
+  reservation_token: string | null;
+  locked_until: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+}
+export interface Continuation {
+  id: string;
+  project_id: string;
+  ticket_id: string;
+  run_id: string;
+  checkpoint_id: string;
+  requirements_revision: number;
+  completion_condition: { kind: 'exit_code'; exit_code: number };
+  status: 'pending' | 'satisfied' | 'failed';
+  failure_reason: string | null;
+  created_at: string;
+  settled_at: string | null;
+}
 export interface OutboundDelivery {
   id: string;
   event_id: string;
@@ -234,6 +276,8 @@ export interface WebhookTarget {
   send(delivery: OutboundDelivery): Promise<{ error_code: string } | undefined>;
 }
 export interface Tables {
+  execution_jobs: ExecutionJob;
+  continuations: Continuation;
   outbound_deliveries: OutboundDelivery;
   github_evidence: GitHubEvidence;
   actors: Actor;
@@ -283,10 +327,13 @@ export interface Reader {
   find<K extends Table>(table: K, query?: Query<Tables[K]>): Promise<Tables[K][]>;
 }
 export interface Transaction extends Reader {
+  /** Optional durable execution capability; updates only the exact prior ownership/state. */
+  compareExecutionRun?(previous: ExecutionJob, next: ExecutionJob): Promise<boolean>;
   put<K extends Table>(table: K, value: Tables[K]): Promise<void>;
   remove<K extends Table>(table: K, id: string): Promise<void>;
 }
 export interface StorageAdapter extends Reader {
+  readonly executionRuns?: true;
   /** Absent capabilities support only the legacy priority_age ordering. */
   readonly schedulingPolicies?: readonly SchedulingPolicy[];
   /** One consistent read-only view, independent of project mutation locks. */

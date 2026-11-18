@@ -55,6 +55,7 @@ export type HostCapacityRequest = z.input<typeof queueSchema> &
     | { kind: 'script'; project_id: string; timeout_ms?: number }
   );
 export type HostCapacityLease = z.output<typeof leaseSchema>;
+export type HostCapacityClaimScope = { kind: 'agent' | 'script'; queue_ids: readonly string[] };
 export type HostCapacityObservation = z.input<typeof observationSchema> & {
   settlement?: UsageBudgetSettlement;
   script_result?: { outcome: 'succeeded' | 'failed' | 'cancelled'; runtime_ms: number | null };
@@ -303,14 +304,25 @@ class CapacityLedger extends UsageBudget {
     });
   }
 
-  claimNext(hostId: string, ownerId: string) {
+  claimNext(hostId: string, ownerId: string, scope?: HostCapacityClaimScope) {
     const owner = id.parse(ownerId);
+    const filter =
+      scope === undefined
+        ? undefined
+        : z
+            .strictObject({
+              kind: z.enum(['agent', 'script']),
+              queue_ids: z.array(id).max(128),
+            })
+            .parse(scope);
     return this.transaction(() => {
       const host = this.host(hostId),
         before = JSON.stringify(host),
         now = Date.now();
       this.expire(host, now);
-      const waiting = host.entries.filter((entry) => entry.state === 'queued' && entry.eligible);
+      const waiting = host.entries.filter(
+        (entry) => entry.state === 'queued' && entry.eligible && (!filter || entry.kind === filter.kind),
+      );
       const served = (project: string) =>
         Object.hasOwn(host.projects, project) ? host.projects[project]! : 0;
       const projects = [...new Set(waiting.map((entry) => entry.project_id))].sort(
@@ -367,6 +379,17 @@ class CapacityLedger extends UsageBudget {
                 blockedResources.add(field);
             }
             continue;
+          }
+          if (filter && !filter.queue_ids.includes(entry.queue_id)) {
+            if (JSON.stringify(host) !== before) this.saveHost(hostId, host);
+            return {
+              admitted: false as const,
+              start_allowed: false as const,
+              status: 'waiting' as const,
+              revision: host.revision,
+              retry_after_ms: 1000,
+              reasons: [{ queue_id: entry.queue_id, reason: 'dispatch_scope' }],
+            };
           }
           if (entry.admission) {
             const admission = this.admit(entry.run_id, entry.admission);
@@ -606,8 +629,8 @@ export class HostCapacity {
   setEligible(hostId: string, queueId: string, eligible: boolean) {
     return this.ledger.setEligible(hostId, queueId, eligible);
   }
-  claimNext(hostId: string, ownerId: string) {
-    return this.ledger.claimNext(hostId, ownerId);
+  claimNext(hostId: string, ownerId: string, scope?: HostCapacityClaimScope) {
+    return this.ledger.claimNext(hostId, ownerId, scope);
   }
   heartbeat(lease: HostCapacityLease) {
     return this.ledger.heartbeat(lease);

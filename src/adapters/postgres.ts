@@ -38,6 +38,41 @@ const knowledgeColumns = [
   'updated_at',
 ];
 const columns: Record<Table, string[]> = {
+  execution_jobs: [
+    'id',
+    'project_id',
+    'ticket_id',
+    'actor_id',
+    'checkpoint_id',
+    'continuation_id',
+    'claim_token',
+    'requirements_revision',
+    'recipe_id',
+    'recipe_fingerprint',
+    'status',
+    'reservation_token',
+    'locked_until',
+    'started_at',
+    'finished_at',
+    'exit_code',
+    'signal',
+    'artifacts',
+    'error_code',
+    'created_at',
+  ],
+  continuations: [
+    'id',
+    'project_id',
+    'ticket_id',
+    'run_id',
+    'checkpoint_id',
+    'requirements_revision',
+    'completion_condition',
+    'status',
+    'failure_reason',
+    'created_at',
+    'settled_at',
+  ],
   outbound_deliveries: [
     'id',
     'event_id',
@@ -160,6 +195,8 @@ const columns: Record<Table, string[]> = {
   ],
 };
 const jsonColumns = new Set([
+  'artifacts',
+  'completion_condition',
   'metadata',
   'evidence',
   'data',
@@ -183,7 +220,7 @@ function decode(row: Record<string, unknown>) {
         key,
         value instanceof Date
           ? value.toISOString()
-          : key === 'seq' || key === 'event_seq'
+          : key === 'seq' || key === 'event_seq' || (key === 'exit_code' && value !== null)
             ? Number(value)
             : value,
       ]),
@@ -202,6 +239,40 @@ function repository(db: Executor): Transaction {
     return `"${key}"`;
   };
   return {
+    async compareExecutionRun(previous, next) {
+      ensure(
+        previous.id === next.id && previous.project_id === next.project_id,
+        'INVALID_INPUT',
+        'Execution identity cannot change.',
+      );
+      if (previous.status === 'succeeded' || previous.status === 'failed') return false;
+      const keys = [
+        'status',
+        'reservation_token',
+        'locked_until',
+        'started_at',
+        'finished_at',
+        'exit_code',
+        'signal',
+        'artifacts',
+        'error_code',
+      ] as const;
+      const values: unknown[] = keys.map((key) =>
+        jsonColumns.has(key) ? JSON.stringify(next[key]) : next[key],
+      );
+      values.push(
+        previous.id,
+        previous.project_id,
+        previous.status,
+        previous.reservation_token,
+        previous.locked_until,
+      );
+      const result = await db.query(
+        `UPDATE execution_jobs SET ${keys.map((key, i) => `${key}=$${i + 1}`).join(',')} WHERE id=$10 AND project_id=$11 AND status=$12 AND reservation_token IS NOT DISTINCT FROM $13::uuid AND locked_until IS NOT DISTINCT FROM $14::timestamptz`,
+        values,
+      );
+      return result.rowCount === 1;
+    },
     async unansweredQuestions(projectId, ticketId, blocking, limit, offset) {
       ensure(
         Number.isInteger(limit) && limit >= 1 && limit <= 10001 && Number.isInteger(offset) && offset >= 0,
@@ -295,7 +366,10 @@ function repository(db: Executor): Transaction {
       const values = keys.map((key) => (jsonColumns.has(key) ? JSON.stringify(record[key]) : record[key]));
       const names = keys.map((key) => field(table, key));
       const conflict =
-        table === 'github_evidence' || table === 'outbound_deliveries' || table === 'knowledge_revisions'
+        table === 'github_evidence' ||
+        table === 'outbound_deliveries' ||
+        table === 'knowledge_revisions' ||
+        table === 'execution_jobs'
           ? ''
           : ` ON CONFLICT(id) DO UPDATE SET ${names
               .filter((name) => name !== '"id"')
@@ -309,6 +383,11 @@ function repository(db: Executor): Transaction {
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
       ensure(
+        table !== 'execution_jobs' && table !== 'continuations',
+        'IMMUTABLE_EXECUTION',
+        'Execution history cannot be deleted.',
+      );
+      ensure(
         table !== 'knowledge' && table !== 'knowledge_revisions',
         'IMMUTABLE_KNOWLEDGE',
         'Archive knowledge instead of deleting its revision history.',
@@ -321,6 +400,7 @@ function repository(db: Executor): Transaction {
 }
 
 export class PostgresStorage implements StorageAdapter {
+  readonly executionRuns = true as const;
   readonly schedulingPolicies = Object.freeze(['priority_age', 'unblocking'] as const);
   readonly pool: pg.Pool;
   private reader: Transaction;
