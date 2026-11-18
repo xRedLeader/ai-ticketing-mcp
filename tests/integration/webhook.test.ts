@@ -48,7 +48,12 @@ it('persists exact PostgreSQL outbox bodies and protects immutable event/destina
     try {
       await assert.rejects(
         f.storage.transaction(f.project.id, (tx) =>
-          tx.put('outbound_deliveries', { ...row, id: randomUUID(), project_id: otherProject.project.id }),
+          tx.put('outbound_deliveries', {
+            ...row,
+            id: randomUUID(),
+            project_id: otherProject.project.id,
+            target_fingerprint: createHash('sha256').update(randomUUID()).digest('hex'),
+          }),
         ),
         hasCode('INVALID_REFERENCE'),
       );
