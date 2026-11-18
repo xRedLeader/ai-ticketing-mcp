@@ -18,7 +18,7 @@ export function createMcpServer(app: Application, principal: Principal, profile:
     planner:
       'Use project_list, project_get, and ticket_list to inspect authorized work. Search prior decisions, create bounded tickets with explicit criteria and dependencies, and update project knowledge.',
     reviewer:
-      'Use project_list, project_get, and ticket_list to find work awaiting review. Read current requirements and the relevant submission evidence through ticket_context or ticket_history before ticket_review.',
+      'Use project_list, project_get, and ticket_list to find work awaiting review. Read current requirements and the relevant submission evidence through ticket_context or ticket_history before ticket_review. For linked PRs, ticket_github_refresh observes the current head and required checks; compare exact SHAs and observed_at.',
     full: 'Use project_list and project_get to discover authorized work. Plan with tickets_create, execute with work_claim and its returned context, and review independently with ticket_review. Use work_next when explicit candidate selection is needed. Persist claim tokens, heartbeat at least every three minutes, checkpoint progress, and submit evidence for every criterion.',
   };
   const instructions =
@@ -43,7 +43,8 @@ export function createMcpServer(app: Application, principal: Principal, profile:
           readOnlyHint: readOperations.has(operation),
           destructiveHint: !readOperations.has(operation),
           idempotentHint: true,
-          openWorldHint: operation === 'search' || operation === 'ticket_context',
+          openWorldHint:
+            operation === 'search' || operation === 'ticket_context' || operation === 'ticket_github_refresh',
         },
       },
       async (input: unknown) => {

@@ -17,8 +17,14 @@ import {
   type SearchDocument,
   type Submission,
   type ExecutionHints,
+  type GitHubConfiguration,
+  type GitHubProvider,
+  type GitHubEvidence,
+  type GitHubObservation,
+  type GitHubCIStatus,
+  validateGitHubConfiguration,
 } from './contracts.js';
-import { resultSchemas } from './result-schemas.js';
+import { resultSchemas, githubEvidenceSchema } from './result-schemas.js';
 import { serializeSuccessEnvelope } from './envelope.js';
 import { countReferenceTokens, queryExcerpt } from './tokens.js';
 import { CachedEmbeddings } from './query-embeddings.js';
@@ -30,6 +36,7 @@ export interface ApplicationOptions {
   now?: () => Date;
   countReferenceTokens?: (text: string) => number;
   referenceTokenMetrics?: boolean;
+  github?: GitHubConfiguration & { provider: GitHubProvider };
 }
 const LEASE_MS = 600_000;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -51,6 +58,7 @@ export class Application {
   private now: () => Date;
   private countTokens: (text: string) => number;
   private referenceTokenMetrics: boolean;
+  private readonly github?: GitHubConfiguration & { provider: GitHubProvider };
   readonly metrics = {
     requests: 0,
     errors: 0,
@@ -73,6 +81,13 @@ export class Application {
     this.now = options.now ?? (() => new Date());
     this.countTokens = options.countReferenceTokens ?? countReferenceTokens;
     this.referenceTokenMetrics = options.referenceTokenMetrics === true;
+    if (options.github) {
+      validateGitHubConfiguration(options.github);
+      this.github = Object.freeze({
+        ...options.github,
+        required_checks: Object.freeze([...options.github.required_checks]),
+      });
+    }
   }
   recordReferenceTokens(kind: 'request' | 'result', text: string) {
     if (!this.referenceTokenMetrics) return;
@@ -133,12 +148,153 @@ export class Application {
       ? await reader.get('tickets', reference)
       : (await reader.find('tickets', { where: { project_id: projectId, key: reference }, limit: 1 }))[0];
     ensure(ticket && ticket.project_id === projectId, 'NOT_FOUND', 'Ticket not found in this project.');
+    if (ticket.github_pull_request === null) delete ticket.github_pull_request;
     if (!ticket.execution_hints || !Object.keys(ticket.execution_hints).length) delete ticket.execution_hints;
     return ticket;
   }
   private executionHints(project: Project, ticket: Ticket): ExecutionHints | undefined {
     const hints = { ...project.execution_hints, ...ticket.execution_hints };
     return Object.keys(hints).length ? hints : undefined;
+  }
+  private githubStatus(observation: GitHubObservation): GitHubCIStatus {
+    const configuration = this.github!;
+    if (observation.head_sha !== observation.observed_head_sha) return 'stale';
+    const checks = configuration.required_checks.map((name) =>
+      observation.checks.find(
+        (check) =>
+          check.name === name &&
+          check.required_app_id === configuration.check_app_id &&
+          check.app_id === configuration.check_app_id &&
+          check.head_sha === observation.head_sha &&
+          check.run_id,
+      ),
+    );
+    if (checks.some((check) => !check)) return 'missing';
+    if (checks.some((check) => check!.status !== 'completed')) return 'pending';
+    return checks.every((check) => check!.conclusion === 'success') ? 'passed' : 'failed';
+  }
+  private githubView(row: GitHubEvidence, ticket: Ticket, latestId = row.id) {
+    const configured = this.github;
+    const policyMatches =
+      configured &&
+      configured.repository.toLowerCase() === row.repository.toLowerCase() &&
+      configured.required_checks.length === row.checks.length &&
+      configured.required_checks.every((name) =>
+        row.checks.some((check) => check.name === name && check.required_app_id === configured.check_app_id),
+      );
+    return {
+      ...row,
+      stale:
+        !policyMatches ||
+        row.id !== latestId ||
+        row.status === 'stale' ||
+        row.head_sha !== row.observed_head_sha ||
+        row.requirements_revision !== ticket.requirements_revision ||
+        row.repository !== ticket.github_pull_request?.repository ||
+        row.pull_request_number !== ticket.github_pull_request?.number,
+    };
+  }
+  private async githubEvidence(reader: Reader, ticket: Ticket) {
+    if (!ticket.github_pull_request) return undefined;
+    const row = (
+      await reader.find('github_evidence', {
+        where: { project_id: ticket.project_id, ticket_id: ticket.id },
+        order: [
+          { field: 'ticket_revision', direction: 'desc' },
+          { field: 'id', direction: 'desc' },
+        ],
+        limit: 1,
+      })
+    )[0];
+    return row ? this.githubView(row, ticket) : undefined;
+  }
+  private async refreshGithub(actorId: string, input: Input<'ticket_github_refresh'>): Promise<unknown> {
+    const roles: Role[] = ['contributor', 'verifier', 'admin'];
+    const prepared = await this.storage.readSnapshot(async (reader) => {
+      const actor = await this.actor(actorId, reader);
+      await this.access(reader, actor, input.project_id, roles);
+      const receipt = await reader.get(
+        'receipts',
+        digest([actorId, input.project_id, 'ticket_github_refresh', input.idempotency_key]),
+      );
+      if (receipt) return { receipt: true as const };
+      ensure(
+        this.github,
+        'GITHUB_NOT_CONFIGURED',
+        'An operator must configure the trusted GitHub repository and required checks.',
+      );
+      const ticket = await this.ticket(reader, input.project_id, input.ticket_id);
+      const number = input.pull_request_number ?? ticket.github_pull_request?.number;
+      ensure(number, 'INVALID_INPUT', 'Provide pull_request_number when first linking a ticket.');
+      const binding = ticket.github_pull_request ?? null;
+      const changing = binding?.repository !== this.github.repository || binding?.number !== number;
+      if (changing) await this.access(reader, actor, input.project_id, ['contributor', 'admin']);
+      const latest = await this.githubEvidence(reader, ticket);
+      return {
+        receipt: false as const,
+        number,
+        binding,
+        requirements_revision: ticket.requirements_revision,
+        changing,
+        latest_evidence_id: latest?.id ?? null,
+      };
+    });
+    if (prepared.receipt)
+      return this.scoped(actorId, 'ticket_github_refresh', input, roles, async () => {
+        throw new DomainError(
+          'RECEIPT_UNAVAILABLE',
+          'This committed GitHub refresh receipt is unavailable. Do not reexecute it or replace its key.',
+          { committed: true },
+        );
+      });
+    const observation = await this.github!.provider.inspect(this.github!, prepared.number);
+    const status = this.githubStatus(observation);
+    const observedAt = this.timestamp();
+    return this.scoped(actorId, 'ticket_github_refresh', input, roles, async (tx, project, actor) => {
+      const ticket = await this.ticket(tx, project.id, input.ticket_id);
+      const latest = await this.githubEvidence(tx, ticket);
+      ensure(
+        ticket.requirements_revision === prepared.requirements_revision &&
+          digest(ticket.github_pull_request ?? null) === digest(prepared.binding) &&
+          (latest?.id ?? null) === prepared.latest_evidence_id,
+        'VERSION_CONFLICT',
+        'Ticket requirements, pull request binding, or evidence changed. Read current state before another refresh.',
+      );
+      if (prepared.changing) await this.access(tx, actor, project.id, ['contributor', 'admin']);
+      const row: GitHubEvidence = {
+        ...observation,
+        status,
+        id: randomUUID(),
+        project_id: project.id,
+        ticket_id: ticket.id,
+        actor_id: actor.id,
+        repository: this.github!.repository,
+        pull_request_number: prepared.number,
+        requirements_revision: ticket.requirements_revision,
+        ticket_revision: ticket.revision + 1,
+        observed_at: observedAt,
+      };
+      ticket.github_pull_request = { repository: row.repository, number: row.pull_request_number };
+      const verified = githubEvidenceSchema.safeParse(this.githubView(row, ticket));
+      ensure(verified.success, 'GITHUB_INVALID_RESPONSE', 'GitHub returned invalid evidence.');
+      const { stale, ...snapshot } = verified.data;
+      void stale;
+      await tx.put('github_evidence', snapshot);
+      await this.touch(tx, ticket);
+      await this.event(tx, project, actor, 'ticket.github_evidence_refreshed', ticket.id, {
+        evidence_id: row.id,
+        head_sha: row.head_sha,
+        status: row.status,
+      });
+      return {
+        ticket,
+        github_evidence: verified.data,
+        evidence_ref: {
+          tool: 'ticket_history',
+          arguments: { project_id: project.id, ticket_id: ticket.id, kind: 'github', item_id: row.id },
+        },
+      };
+    });
   }
   private version(record: { revision: number }, expected: number) {
     ensure(
@@ -513,6 +669,7 @@ export class Application {
     }
   }
   private async dispatch(actorId: string, operation: Operation, input: any): Promise<unknown> {
+    if (operation === 'ticket_github_refresh') return this.refreshGithub(actorId, input);
     const roles: Role[] = ['contributor', 'admin'];
     if (['project_update', 'member_set'].includes(operation)) roles.splice(0, roles.length, 'admin');
     if (operation === 'ticket_review') roles.splice(0, roles.length, 'verifier', 'admin');
@@ -988,7 +1145,7 @@ export class Application {
     at = this.timestamp(),
   ) {
     const projectId = project.id;
-    const [criteria, links, claim, blockers] = await Promise.all([
+    const [criteria, links, claim, blockers, githubEvidence] = await Promise.all([
       reader.find('criteria', {
         where: { project_id: projectId, ticket_id: ticket.id },
         order: [{ field: 'position', direction: 'asc' }],
@@ -996,11 +1153,13 @@ export class Application {
       reader.find('links', { where: { project_id: projectId, target_id: ticket.id }, limit: 10001 }),
       reader.get('claims', ticket.id),
       this.blockers(reader, ticket),
+      this.githubEvidence(reader, ticket),
     ]);
     const executionHints = this.executionHints(project, ticket);
     return {
       ticket,
       ...(executionHints ? { effective_execution_hints: executionHints } : {}),
+      ...(githubEvidence ? { github_evidence: githubEvidence } : {}),
       criteria,
       links,
       claim: claim
@@ -1087,6 +1246,23 @@ export class Application {
         );
       case 'ticket_history': {
         const ticket = await this.ticket(this.storage, project.id, input.ticket_id);
+        if (input.kind === 'github') {
+          const latest = await this.githubEvidence(this.storage, ticket);
+          const items = await this.storage.find('github_evidence', {
+            where: {
+              project_id: project.id,
+              ticket_id: ticket.id,
+              ...(input.item_id ? { id: input.item_id } : {}),
+            },
+            order: [
+              { field: 'ticket_revision', direction: 'desc' },
+              { field: 'id', direction: 'desc' },
+            ],
+            limit: input.limit,
+            offset: input.offset,
+          });
+          return { items: items.map((row) => this.githubView(row, ticket, latest?.id)) };
+        }
         if (input.unanswered_questions)
           return {
             items: await this.storage.unansweredQuestions(
@@ -1447,6 +1623,7 @@ export class Application {
       blockers: detail.blockers,
       completionBlockers,
       claim: detail.claim,
+      github_evidence: detail.github_evidence,
       checkpoint,
       questions,
       reviews,
@@ -1533,6 +1710,19 @@ export class Application {
         },
       },
     ];
+    if (detail.github_evidence)
+      sections.push({
+        name: 'github_evidence',
+        value: detail.github_evidence,
+        empty: false,
+        omission: {
+          section: 'github_evidence',
+          retrieve_with: 'ticket_history',
+          arguments: { ...history('github', detail.github_evidence.id) },
+          revision: detail.github_evidence.requirements_revision,
+          required_before: 'review',
+        },
+      });
     const overflow: Omission[] = [];
     for (const [name, items] of [
       ['reviews', reviews],

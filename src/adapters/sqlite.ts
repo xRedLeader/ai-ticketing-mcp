@@ -57,6 +57,7 @@ const columns: Record<Table, string[]> = {
     'created_at',
     'updated_at',
     'execution_hints',
+    'github_pull_request',
   ],
   criteria: ['id', 'project_id', 'ticket_id', 'text', 'position'],
   links: ['id', 'project_id', 'source_id', 'target_id', 'kind'],
@@ -112,6 +113,21 @@ const columns: Record<Table, string[]> = {
     'lock_token',
     'last_error',
   ],
+  github_evidence: [
+    'id',
+    'project_id',
+    'ticket_id',
+    'actor_id',
+    'repository',
+    'pull_request_number',
+    'head_sha',
+    'observed_head_sha',
+    'status',
+    'requirements_revision',
+    'ticket_revision',
+    'checks',
+    'observed_at',
+  ],
 };
 const json = new Set([
   'labels',
@@ -120,6 +136,8 @@ const json = new Set([
   'evidence',
   'requirements_snapshot',
   'execution_hints',
+  'github_pull_request',
+  'checks',
   'data',
   'result',
 ]);
@@ -127,7 +145,8 @@ const booleans = new Set(['system_admin', 'blocking', 'archived']);
 function encode(key: string, value: unknown): SQLInputValue {
   if (value === undefined) return null;
   if (json.has(key))
-    return value === null && (key === 'execution_hints' || key === 'requirements_snapshot')
+    return value === null &&
+      (key === 'execution_hints' || key === 'requirements_snapshot' || key === 'github_pull_request')
       ? null
       : JSON.stringify(value);
   if (value === null) return null;
@@ -137,7 +156,7 @@ function encode(key: string, value: unknown): SQLInputValue {
 function decode(row: Record<string, unknown>) {
   return Object.fromEntries(
     Object.entries(row).flatMap(([key, value]) =>
-      key === 'execution_hints' && value === null
+      (key === 'execution_hints' || key === 'github_pull_request') && value === null
         ? []
         : [
             [
@@ -239,15 +258,20 @@ function repository(db: DatabaseSync): Transaction {
         'INVALID_REFERENCE',
         'A record ID is required.',
       );
+      const conflict =
+        table === 'github_evidence'
+          ? ''
+          : ` ON CONFLICT(id) DO UPDATE SET ${keys
+              .filter((key) => key !== 'id')
+              .map((key) => `${field(table, key)}=excluded.${field(table, key)}`)
+              .join(',')}`;
       db.prepare(
-        `INSERT INTO "${table}" (${keys.map((key) => field(table, key)).join(',')}) VALUES (${keys.map(() => '?').join(',')}) ON CONFLICT(id) DO UPDATE SET ${keys
-          .filter((key) => key !== 'id')
-          .map((key) => `${field(table, key)}=excluded.${field(table, key)}`)
-          .join(',')}`,
+        `INSERT INTO "${table}" (${keys.map((key) => field(table, key)).join(',')}) VALUES (${keys.map(() => '?').join(',')})${conflict}`,
       ).run(...keys.map((key) => encode(key, record[key])));
     },
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
+      ensure(table !== 'github_evidence', 'IMMUTABLE_EVIDENCE', 'GitHub evidence records are immutable.');
       db.prepare(`DELETE FROM "${table}" WHERE id=?`).run(id);
     },
   };

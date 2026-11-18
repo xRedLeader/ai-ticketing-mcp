@@ -6,6 +6,37 @@ const id = z.string(),
 const executionHints = z
   .object({ model: z.string().min(1).max(128).optional(), effort: z.string().min(1).max(32).optional() })
   .strict();
+const githubBinding = z.object({ repository: z.string(), number: z.number().int().positive() });
+export const githubEvidenceSchema = z.object({
+  id,
+  project_id: id,
+  ticket_id: id,
+  actor_id: id,
+  repository: z.string(),
+  pull_request_number: z.number().int().positive(),
+  head_sha: z.string().regex(/^[a-f0-9]{40}$/),
+  observed_head_sha: z.string().regex(/^[a-f0-9]{40}$/),
+  status: z.enum(['passed', 'pending', 'failed', 'missing', 'stale']),
+  requirements_revision: z.number().int().positive(),
+  ticket_revision: z.number().int().positive(),
+  checks: z.array(
+    z.object({
+      name: z.string(),
+      required_app_id: z.number().int().positive(),
+      run_id: z.number().int().positive().nullable(),
+      app_id: z.number().int().positive().nullable(),
+      head_sha: z
+        .string()
+        .regex(/^[a-f0-9]{40}$/)
+        .nullable(),
+      status: z.string(),
+      conclusion: z.string().nullable(),
+      url: z.string().nullable(),
+    }),
+  ),
+  observed_at: timestamp,
+  stale: z.boolean(),
+});
 const project = z.object({
   id,
   key: z.string(),
@@ -25,6 +56,7 @@ const ticket = z.object({
   title: z.string(),
   description: z.string(),
   execution_hints: executionHints.optional(),
+  github_pull_request: githubBinding.optional(),
   status: z.enum(['backlog', 'ready', 'in_progress', 'in_review', 'done', 'cancelled']),
   priority: z.number(),
   labels: z.array(z.string()),
@@ -124,6 +156,7 @@ const projectSummary = project.omit({
   created_at: true,
 });
 const ticketSummary = ticket.omit({
+  github_pull_request: true,
   execution_hints: true,
   description: true,
   created_by: true,
@@ -166,6 +199,7 @@ const context = z.discriminatedUnion('not_modified', [
     criteria: z.array(criterion),
     project_instructions: z.object({ text: z.string(), authority: z.string() }),
     effective_execution_hints: executionHints.optional(),
+    github_evidence: githubEvidenceSchema.optional(),
     approval_policy: z.enum(['self', 'independent', 'human']),
     blockers: z.array(blocker),
     completion_blockers: z.array(blocker),
@@ -198,6 +232,20 @@ const search = z.object({
   index_consistency: z.literal('eventual'),
 });
 export const resultSchemas: Record<Operation, z.ZodType> = {
+  ticket_github_refresh: z.object({
+    ticket: ticketReceipt,
+    github_evidence: githubEvidenceSchema.pick({
+      id: true,
+      status: true,
+      head_sha: true,
+      observed_head_sha: true,
+      observed_at: true,
+      requirements_revision: true,
+      ticket_revision: true,
+      stale: true,
+    }),
+    evidence_ref: retrieval,
+  }),
   project_list: z.object({ projects: z.array(projectSummary) }),
   project_get: z.object({
     project,
@@ -213,12 +261,13 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
   ticket_get: z.object({
     ticket,
     effective_execution_hints: executionHints.optional(),
+    github_evidence: githubEvidenceSchema.optional(),
     criteria: z.array(criterion),
     links: z.array(link),
     claim: visibleClaim,
     blockers: z.array(blocker),
   }),
-  ticket_history: z.object({ items: z.array(z.union([note, submission, review])) }),
+  ticket_history: z.object({ items: z.array(z.union([note, submission, review, githubEvidenceSchema])) }),
   ticket_link: z.object({
     source_id: id,
     target_id: id,

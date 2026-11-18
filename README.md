@@ -57,6 +57,22 @@ Connect with `stdio --profile planner` or `/mcp?profile=reviewer`; OAuth tokens 
 
 Ticket references accept a UUID or readable key such as `CORE-42`. Project references use UUIDs. Full [tool and workflow behavior](docs/mcp.md) is documented separately.
 
+## Local SQLite
+
+After `npm ci` and `npm run build`, start a local MCP server without PostgreSQL or an embedding service:
+
+```sh
+node dist/cli.js stdio --sqlite .local/ticketing.sqlite --profile full
+```
+
+Use an absolute file path in MCP client configuration. The server migrates the file and, when no explicit actor is supplied, persists a local agent identity with administrator access. This trusts the local file owner, never impersonates a human reviewer, and does not bootstrap HTTP authentication. Explicit `ACTOR_ID` or `--actor` takes precedence. SQLite stdio indexes its durable queue in the background, so newly created tickets become searchable without another worker. PostgreSQL and HTTP still use the existing worker command.
+
+For other CLI commands, set `STORAGE_ADAPTER=sqlite`, `SQLITE_PATH`, and `EMBEDDING_PROVIDER=none`, or use `--sqlite PATH`. PostgreSQL remains the default. SQLite provides full-text search and reports semantic search as disabled.
+
+## Advisory execution hints
+
+Projects and tickets accept optional `execution_hints` with `model` and `effort` strings. Ticket fields override the corresponding project defaults; `ticket_get` and context expose `effective_execution_hints` only when configured. A provided object replaces the local hints; an omitted object leaves them unchanged. Null, an empty object, or empty/null fields clear local choices so project defaults can apply. Model/effort hints never execute a provider, configure embeddings, grant permissions, or guarantee a model is accepted by the consuming client.
+
 ## Extending the system
 
 ```ts

@@ -12,12 +12,12 @@ The default profile is `worker`. Select `stdio --profile worker|planner|reviewer
 
 Every profile includes `project_list`, `project_get`, `ticket_list`, `ticket_context`, `ticket_get`, `ticket_history`, `search`, `knowledge_get`, `checkpoint_get`, and `changes_since`.
 
-| Profile               | Additional tools                                                                                        | Prompts            |
-| --------------------- | ------------------------------------------------------------------------------------------------------- | ------------------ |
-| `worker` (16 tools)   | `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`, `ticket_note`, `ticket_submit`     | execution, handoff |
-| `planner` (16 tools)  | `tickets_create`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_note`, `knowledge_write` | planning           |
-| `reviewer` (12 tools) | `ticket_review`, `ticket_note`                                                                          | verification       |
-| `full` (26 tools)     | All tools below, including project administration and `work_next`                                       | all four           |
+| Profile               | Additional tools                                                                                                                 | Prompts            |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| `worker` (16 tools)   | `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`, `ticket_note`, `ticket_submit`                              | execution, handoff |
+| `planner` (17 tools)  | `tickets_create`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_note`, `knowledge_write`, `ticket_github_refresh` | planning           |
+| `reviewer` (13 tools) | `ticket_review`, `ticket_note`, `ticket_github_refresh`                                                                          | verification       |
+| `full` (27 tools)     | All tools below, including project administration and `work_next`                                                                | all four           |
 
 Profiles are not an access-control boundary. They select tool exposure; every operation retains its OAuth scope and project-role checks. Resources remain independently authorized and available in every profile. Guides and prompts follow the selected profile; the tool surface works without either.
 
@@ -86,3 +86,15 @@ Mutation receipts retain identifiers, status, revisions, created note/submission
 | `changes_since` events  | 100                        | 25                            |
 | `ticket_context` detail | `standard`                 | `brief`                       |
 | Related knowledge       | Implicit search in context | Explicit `search` when needed |
+
+## GitHub evidence
+
+An operator may configure `TICKETING_GITHUB_REPOSITORY`, comma-separated `TICKETING_GITHUB_REQUIRED_CHECKS`, and numeric `TICKETING_GITHUB_CHECK_APP_ID`. `GITHUB_TOKEN` is an optional private credential for read-only API requests. There is no model-controlled repository URL or check-policy input.
+
+Planner/reviewer/full profiles expose `ticket_github_refresh`. Contributors/admins may link or change a PR using `pull_request_number`; verifiers may refresh an existing binding. Every refresh requires an idempotency key and records a protected immutable snapshot for the exact PR head, trusted app/check identities, conclusions, and `observed_at`. Missing, pending, failed, wrong-origin, or changed-head evidence never becomes a successful verification. Paginated evidence must be complete. Concurrent observations cannot overwrite newer known evidence; retry with reconciled state after a conflict.
+
+`ticket_get` and context expose recorded evidence when available; `ticket_history(kind:github)` retrieves immutable snapshots and supports exact `item_id`. Older snapshots or snapshots invalidated by requirements/head/policy changes are explicitly stale. Context omissions use existing history tools, including for workers; workers can use `ticket_note` to request a planner/reviewer refresh. Evidence is observed state, never continuously verified freshness. An idempotent retry returns the original receipt offline, even after newer snapshots exist. GitHub access does not post comments, merge PRs, complete tickets, or replace independent criterion review. Ordinary notes cannot supply trusted CI snapshot JSON.
+
+## Execution hints
+
+`project_create`, `project_update`, `tickets_create`, and `ticket_update` accept optional `execution_hints:{model,effort}`. Strings are trimmed and bounded to 128/32 characters; empty/null fields and empty/null objects clear the local override. Updates replace the local object; omitted objects remain unchanged. Current ticket details/context merge ticket fields over project defaults as `effective_execution_hints`, omitted when absent. Compact lists/receipts omit hints. These values are advisory and provider-neutral; the real consuming SDK must validate model and effort support. Hint changes update revisions/fingerprints without invalidating requirements or live claims.

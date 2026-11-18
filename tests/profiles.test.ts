@@ -38,8 +38,9 @@ const expected = {
     'ticket_link',
     'ticket_note',
     'knowledge_write',
+    'ticket_github_refresh',
   ],
-  reviewer: [...shared, 'ticket_review', 'ticket_note'],
+  reviewer: [...shared, 'ticket_review', 'ticket_note', 'ticket_github_refresh'],
   full: Object.keys(schemas),
 };
 const prompts = {

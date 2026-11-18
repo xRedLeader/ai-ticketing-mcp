@@ -39,6 +39,7 @@ export interface Ticket {
   title: string;
   description: string;
   execution_hints?: ExecutionHints | null;
+  github_pull_request?: { repository: string; number: number } | null;
   status: Status;
   priority: number;
   labels: string[];
@@ -150,6 +151,42 @@ export interface Receipt {
   result: unknown;
   created_at: string;
 }
+export type GitHubCIStatus = 'passed' | 'pending' | 'failed' | 'missing' | 'stale';
+export interface GitHubCheck {
+  name: string;
+  required_app_id: number;
+  run_id: number | null;
+  app_id: number | null;
+  head_sha: string | null;
+  status: string;
+  conclusion: string | null;
+  url: string | null;
+}
+export interface GitHubObservation {
+  head_sha: string;
+  observed_head_sha: string;
+  status: GitHubCIStatus;
+  checks: GitHubCheck[];
+}
+export interface GitHubConfiguration {
+  repository: string;
+  required_checks: readonly string[];
+  check_app_id: number;
+}
+export interface GitHubProvider {
+  inspect(configuration: GitHubConfiguration, pullRequest: number): Promise<GitHubObservation>;
+}
+export interface GitHubEvidence extends GitHubObservation {
+  id: string;
+  project_id: string;
+  ticket_id: string;
+  actor_id: string;
+  repository: string;
+  pull_request_number: number;
+  requirements_revision: number;
+  ticket_revision: number;
+  observed_at: string;
+}
 export interface Job {
   id: string;
   project_id: string;
@@ -163,6 +200,7 @@ export interface Job {
   last_error: string | null;
 }
 export interface Tables {
+  github_evidence: GitHubEvidence;
   actors: Actor;
   projects: Project;
   members: Member;
@@ -296,4 +334,28 @@ export function ensure(
   details: Record<string, unknown> = {},
 ): asserts condition {
   if (!condition) throw new DomainError(code, message, details);
+}
+export function validateGitHubConfiguration(configuration: GitHubConfiguration): void {
+  ensure(
+    /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/.test(configuration.repository) &&
+      !['.', '..'].includes(configuration.repository.split('/')[1]!),
+    'INVALID_CONFIG',
+    'Configure a trusted owner/repository.',
+  );
+  ensure(
+    Array.isArray(configuration.required_checks) &&
+      configuration.required_checks.length >= 1 &&
+      configuration.required_checks.length <= 20 &&
+      configuration.required_checks.every(
+        (name) => typeof name === 'string' && name.trim().length > 0 && name.length <= 200,
+      ) &&
+      new Set(configuration.required_checks).size === configuration.required_checks.length,
+    'INVALID_CONFIG',
+    'Configure 1–20 distinct required GitHub check names.',
+  );
+  ensure(
+    Number.isSafeInteger(configuration.check_app_id) && configuration.check_app_id > 0,
+    'INVALID_CONFIG',
+    'Configure the trusted GitHub check app ID.',
+  );
 }

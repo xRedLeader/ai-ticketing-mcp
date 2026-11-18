@@ -8,7 +8,7 @@ Do not run automatic migrations from every HTTP process. Compose runs an explici
 
 ## SQLite local operation
 
-Select `STORAGE_ADAPTER=sqlite` and `SQLITE_PATH` for the persistent file, or use the CLI's `--sqlite PATH` convenience flag. SQLite stdio bootstraps its schema automatically. `EMBEDDING_PROVIDER=none` avoids external inference; SQLite search always uses FTS5 and explicitly reports full-text-only capability. Run the indexing worker when source records change so lexical search reaches the latest revisions.
+Select `STORAGE_ADAPTER=sqlite` and `SQLITE_PATH` for the persistent file, or use the CLI's `--sqlite PATH` convenience flag. SQLite stdio bootstraps its schema automatically. `EMBEDDING_PROVIDER=none` avoids external inference; SQLite search always uses FTS5 and explicitly reports full-text-only capability. SQLite stdio drains its durable indexing queue with one in-flight background indexOnce call and awaits it during shutdown; no separate worker is needed. PostgreSQL and HTTP deployments keep the existing worker command.
 
 With Node 24 and dependencies installed, run `npm run build`, then start local MCP stdio with the full tool profile for initial project setup:
 

@@ -34,8 +34,9 @@ export const profileOperations: Readonly<Record<McpProfile, readonly Operation[]
     'ticket_link',
     'ticket_note',
     'knowledge_write',
+    'ticket_github_refresh',
   ] as const),
-  reviewer: Object.freeze([...shared, 'ticket_review', 'ticket_note'] as const),
+  reviewer: Object.freeze([...shared, 'ticket_review', 'ticket_note', 'ticket_github_refresh'] as const),
   full: Object.freeze(Object.keys(schemas) as Operation[]),
 });
 

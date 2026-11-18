@@ -2,6 +2,7 @@ import { PostgresStorage, PostgresSearch } from './adapters/postgres.js';
 import { createSqliteAdapters } from './adapters/sqlite.js';
 import { HttpEmbeddings } from './adapters/embeddings.js';
 import { createApplication } from './application.js';
+import { GitHubClient } from './github.js';
 import { ensure, type StorageAdapter, type SearchAdapter, type EmbeddingProvider } from './contracts.js';
 export function createRuntime(env: NodeJS.ProcessEnv = process.env) {
   const adapter = env.STORAGE_ADAPTER ?? 'postgres';
@@ -50,5 +51,18 @@ export function createRuntime(env: NodeJS.ProcessEnv = process.env) {
     search,
     embeddings,
     referenceTokenMetrics: env.REFERENCE_TOKEN_METRICS === 'true',
+    ...(env.TICKETING_GITHUB_REPOSITORY
+      ? {
+          github: {
+            repository: env.TICKETING_GITHUB_REPOSITORY.trim(),
+            required_checks: (env.TICKETING_GITHUB_REQUIRED_CHECKS ?? '')
+              .split(',')
+              .map((name) => name.trim())
+              .filter(Boolean),
+            check_app_id: Number(env.TICKETING_GITHUB_CHECK_APP_ID),
+            provider: new GitHubClient(env.GITHUB_TOKEN),
+          },
+        }
+      : {}),
   });
 }

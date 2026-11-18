@@ -92,7 +92,7 @@ export const schemas = {
     .object({
       ...ticket,
       ...page,
-      kind: z.enum(['notes', 'submissions', 'reviews']).default('notes'),
+      kind: z.enum(['notes', 'submissions', 'reviews', 'github']).default('notes'),
       item_id: id.optional(),
       unanswered_questions: z.literal(true).optional(),
     })
@@ -133,6 +133,9 @@ export const schemas = {
       status: z.enum(['backlog', 'ready', 'cancelled']),
       reason: text.max(2000),
     })
+    .strict(),
+  ticket_github_refresh: z
+    .object({ ...ticket, ...mutation, pull_request_number: z.int().min(1).max(2147483647).optional() })
     .strict(),
   ticket_link: z
     .object({
@@ -263,6 +266,8 @@ export const readOperations = new Set<Operation>([
   'changes_since',
 ]);
 export const descriptions: Record<Operation, string> = {
+  ticket_github_refresh:
+    'Link or refresh a PR in the configured trusted repository; retrieve immutable evidence for its exact head SHA. Never approves or merges work.',
   project_list: 'List projects accessible to your authenticated identity.',
   project_get: 'Read project instructions, review policy, and member identities.',
   project_create: 'Create a project. Requires system administrator access.',

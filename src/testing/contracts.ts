@@ -11,6 +11,7 @@ import {
   type Project,
   type Ticket,
   type Policy,
+  type GitHubEvidence,
 } from '../contracts.js';
 
 export const testEmbeddings: EmbeddingProvider = {
@@ -368,6 +369,46 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
       assert.ok(Date.parse(complete.observed_at));
       await f.search.indexText({ ...source, revision: source.revision + 1, archived: true });
       assert.equal((await f.search.coverage(f.project.id, testEmbeddings.profile)).documents, 0);
+    });
+    check('retains immutable GitHub evidence and its exact SHA/check metadata', async (f) => {
+      const ticket = await f.ticket();
+      const row: GitHubEvidence = {
+        id: randomUUID(),
+        project_id: f.project.id,
+        ticket_id: ticket.id,
+        actor_id: f.worker.id,
+        repository: 'example/repository',
+        pull_request_number: 1,
+        head_sha: 'a'.repeat(40),
+        observed_head_sha: 'a'.repeat(40),
+        status: 'passed',
+        requirements_revision: 1,
+        ticket_revision: 1,
+        checks: [
+          {
+            name: 'verify',
+            required_app_id: 15368,
+            run_id: 1,
+            app_id: 15368,
+            head_sha: 'a'.repeat(40),
+            status: 'completed',
+            conclusion: 'success',
+            url: 'https://github.com/example/repository/actions/runs/1',
+          },
+        ],
+        observed_at: f.clock.now.toISOString(),
+      };
+      await f.storage.transaction(f.project.id, (tx) => tx.put('github_evidence', row));
+      assert.deepEqual(await f.storage.readSnapshot((reader) => reader.get('github_evidence', row.id)), row);
+      await assert.rejects(
+        f.storage.transaction(f.project.id, (tx) => tx.put('github_evidence', { ...row, status: 'failed' })),
+        hasCode('CONFLICT'),
+      );
+      await assert.rejects(
+        f.storage.transaction(f.project.id, (tx) => tx.remove('github_evidence', row.id)),
+        hasCode('IMMUTABLE_EVIDENCE'),
+      );
+      assert.deepEqual(await f.storage.get('github_evidence', row.id), row);
     });
     check('leases each indexing job once and fences stale job completions', async (f) => {
       const ticket = await f.ticket();

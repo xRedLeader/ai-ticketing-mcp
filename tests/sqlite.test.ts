@@ -1,6 +1,6 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname, basename, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -33,6 +33,94 @@ async function setup() {
   return { ...(await fixture(a)), ...a };
 }
 registerAdapterContractTests('SQLite', adapters);
+
+it('upgrades schema 001 without losing tickets and stores immutable GitHub evidence', async () => {
+  const a = await adapters();
+  try {
+    const actorId = randomUUID(),
+      projectId = randomUUID(),
+      ticketId = randomUUID();
+    const at = new Date().toISOString();
+    const db = new DatabaseSync(a.filename);
+    try {
+      db.exec(await readFile(new URL('../migrations/sqlite/001_initial.sql', import.meta.url), 'utf8'));
+      db.exec('CREATE TABLE schema_migrations(name TEXT PRIMARY KEY,applied_at TEXT NOT NULL)');
+      db.prepare('INSERT INTO schema_migrations VALUES(?,?)').run('001_initial.sql', at);
+      db.prepare('INSERT INTO actors VALUES(?,?,?,?,?,?)').run(
+        actorId,
+        'migration-test',
+        'operator',
+        'Original operator',
+        'human',
+        1,
+      );
+      db.prepare("INSERT INTO projects(id,key,name,policy,revision,created_at) VALUES(?,?,?,'self',1,?)").run(
+        projectId,
+        'OLD',
+        'Original project',
+        at,
+      );
+      db.prepare(
+        "INSERT INTO tickets(id,project_id,key,title,description,status,priority,revision,requirements_revision,created_by,created_at,updated_at) VALUES(?,?,?,?,?,'ready',3,1,1,?,?,?)",
+      ).run(ticketId, projectId, 'OLD-1', 'Original ticket', 'Preserve this existing body.', actorId, at, at);
+    } finally {
+      db.close();
+    }
+    await a.storage.migrate();
+    await a.storage.migrate();
+    const original = (await a.storage.get('tickets', ticketId))!;
+    assert.equal(original.description, 'Preserve this existing body.');
+    assert.equal(original.github_pull_request, undefined);
+    assert.equal((await a.storage.get('actors', actorId))?.name, 'Original operator');
+    const linked = { ...original, github_pull_request: { repository: 'owner/repository', number: 7 } };
+    const evidence = {
+      id: randomUUID(),
+      project_id: projectId,
+      ticket_id: ticketId,
+      actor_id: actorId,
+      repository: 'owner/repository',
+      pull_request_number: 7,
+      head_sha: 'a'.repeat(40),
+      observed_head_sha: 'a'.repeat(40),
+      status: 'passed' as const,
+      requirements_revision: 1,
+      ticket_revision: 1,
+      checks: [
+        {
+          name: 'CI',
+          required_app_id: 15368,
+          run_id: 123,
+          app_id: 15368,
+          head_sha: 'a'.repeat(40),
+          status: 'completed',
+          conclusion: 'success',
+          url: 'https://github.com/owner/repository/actions/runs/123',
+        },
+      ],
+      observed_at: at,
+    };
+    await a.storage.transaction(projectId, async (tx) => {
+      await tx.put('tickets', linked);
+      await tx.put('github_evidence', evidence);
+    });
+    assert.deepEqual(
+      (await a.storage.get('tickets', ticketId))?.github_pull_request,
+      linked.github_pull_request,
+    );
+    assert.deepEqual(await a.storage.get('github_evidence', evidence.id), evidence);
+    await assert.rejects(
+      a.storage.transaction(projectId, (tx) => tx.put('github_evidence', { ...evidence, status: 'failed' })),
+      { code: 'CONFLICT' },
+    );
+    await assert.rejects(
+      a.storage.transaction(projectId, (tx) => tx.remove('github_evidence', evidence.id)),
+      { code: 'IMMUTABLE_EVIDENCE' },
+    );
+    assert.equal((await a.storage.get('github_evidence', evidence.id))?.status, 'passed');
+  } finally {
+    await a.dispose();
+  }
+});
 
 it('rejects paths that cannot provide durable isolated readers', () => {
   for (const filename of ['', '   ', ':memory:'])

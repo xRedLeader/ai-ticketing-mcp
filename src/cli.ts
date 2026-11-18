@@ -42,7 +42,7 @@ async function input() {
 async function main() {
   if (command === 'help') {
     process.stdout.write(
-      `ai-ticketing commands:\n  migrate                 Apply migrations and prepare the configured search profile\n  actor --issuer --subject --name --kind [--admin]   Register an identity (trusted operator)\n  call --actor ID --operation NAME --input-file FILE   Execute as a trusted local operator\n  call --url URL --token-env ACCESS_TOKEN --operation NAME --input-file FILE   Authenticated remote call\n  serve                   Serve authenticated HTTP MCP\n  stdio [--profile NAME]  Local MCP; worker (default), planner, reviewer, full (requires ACTOR_ID)\n  worker [--once]          Process durable indexing jobs\n  reindex --actor ID --project ID   Rebuild project search indexes\n  inspect --actor ID --project ID   Inspect project and queue metrics\n\nUse --input JSON instead of --input-file for short inputs. Secrets belong in environment variables.\n`,
+      `ai-ticketing commands:\n  migrate                 Apply migrations and prepare the configured search profile\n  actor --issuer --subject --name --kind [--admin]   Register an identity (trusted operator)\n  call --actor ID --operation NAME --input-file FILE   Execute as a trusted local operator\n  call --url URL --token-env ACCESS_TOKEN --operation NAME --input-file FILE   Authenticated remote call\n  serve                   Serve authenticated HTTP MCP\n  stdio [--profile NAME]  Local MCP; worker (default), planner, reviewer, full (requires ACTOR_ID)\n  worker [--once]          Process durable indexing jobs\n  reindex --actor ID --project ID   Rebuild project search indexes\n  inspect --actor ID --project ID   Inspect project and queue metrics\n\nUse --sqlite PATH for local storage; SQLite stdio initializes its agent and indexing automatically.\nUse --input JSON instead of --input-file for short inputs. Secrets belong in environment variables.\n`,
     );
     return;
   }
@@ -192,8 +192,34 @@ async function main() {
       );
       await server.connect(new StdioServerTransport());
       keepAlive = true;
+      let closing = false;
+      let indexing: Promise<unknown> | undefined;
+      const index = () => {
+        if (closing || indexing) return;
+        indexing = app
+          .indexOnce(100)
+          .catch((error) => {
+            process.stderr.write(
+              JSON.stringify({
+                level: 'warn',
+                event: 'indexing_failed',
+                code: error instanceof DomainError ? error.code : 'FAILED',
+              }) + '\n',
+            );
+          })
+          .finally(() => {
+            indexing = undefined;
+          });
+      };
+      const indexTimer = runtimeEnv.STORAGE_ADAPTER === 'sqlite' ? setInterval(index, 1000) : undefined;
+      indexTimer?.unref();
+      if (indexTimer) index();
       const shutdown = async () => {
+        if (closing) return;
+        closing = true;
+        clearInterval(indexTimer);
         await server.close();
+        await indexing;
         await app.searchAdapter.close();
         await app.storage.close();
       };

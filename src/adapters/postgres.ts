@@ -20,6 +20,21 @@ import {
 } from '../contracts.js';
 
 const columns: Record<Table, string[]> = {
+  github_evidence: [
+    'id',
+    'project_id',
+    'ticket_id',
+    'actor_id',
+    'repository',
+    'pull_request_number',
+    'head_sha',
+    'observed_head_sha',
+    'status',
+    'requirements_revision',
+    'ticket_revision',
+    'checks',
+    'observed_at',
+  ],
   actors: ['id', 'issuer', 'subject', 'name', 'kind', 'system_admin'],
   projects: [
     'id',
@@ -41,6 +56,7 @@ const columns: Record<Table, string[]> = {
     'title',
     'description',
     'execution_hints',
+    'github_pull_request',
     'status',
     'priority',
     'labels',
@@ -116,12 +132,14 @@ const jsonColumns = new Set([
   'result',
   'requirements_snapshot',
   'execution_hints',
+  'github_pull_request',
+  'checks',
 ]);
 type Executor = Pick<pg.Pool, 'query'> | Pick<pg.PoolClient, 'query'>;
 function decode(row: Record<string, unknown>) {
   return Object.fromEntries(
     Object.entries(row)
-      .filter(([key, value]) => key !== 'execution_hints' || value !== null)
+      .filter(([key, value]) => !['execution_hints', 'github_pull_request'].includes(key) || value !== null)
       .map(([key, value]) => [
         key,
         value instanceof Date
@@ -214,16 +232,21 @@ function repository(db: Executor): Transaction {
       const record = value as unknown as Record<string, unknown>;
       const values = keys.map((key) => (jsonColumns.has(key) ? JSON.stringify(record[key]) : record[key]));
       const names = keys.map((key) => field(table, key));
+      const conflict =
+        table === 'github_evidence'
+          ? ''
+          : ` ON CONFLICT(id) DO UPDATE SET ${names
+              .filter((name) => name !== '"id"')
+              .map((name) => `${name}=EXCLUDED.${name}`)
+              .join(',')}`;
       await db.query(
-        `INSERT INTO "${table}" (${names.join(',')}) VALUES (${keys.map((_, i) => `$${i + 1}`).join(',')}) ON CONFLICT(id) DO UPDATE SET ${names
-          .filter((name) => name !== '"id"')
-          .map((name) => `${name}=EXCLUDED.${name}`)
-          .join(',')}`,
+        `INSERT INTO "${table}" (${names.join(',')}) VALUES (${keys.map((_, i) => `$${i + 1}`).join(',')})${conflict}`,
         values,
       );
     },
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
+      ensure(table !== 'github_evidence', 'IMMUTABLE_EVIDENCE', 'GitHub evidence snapshots are immutable.');
       await db.query(`DELETE FROM "${table}" WHERE id=$1`, [id]);
     },
   };

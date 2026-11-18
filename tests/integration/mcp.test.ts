@@ -9,6 +9,7 @@ import { createHttpServer } from '../../src/http.js';
 import { createAuthenticator } from '../../src/auth.js';
 import { randomUUID } from 'node:crypto';
 import { profileOperations, type McpProfile } from '../../src/profiles.js';
+import { schemas } from '../../src/schemas.js';
 
 it('serves authenticated SDK HTTP clients, resources, prompts, scopes, and discovery', async () => {
   const f = await setup();
@@ -76,7 +77,7 @@ it('serves authenticated SDK HTTP clients, resources, prompts, scopes, and disco
       }),
     );
     const tools = await client.listTools();
-    assert.equal(tools.tools.length, 26);
+    assert.equal(tools.tools.length, Object.keys(schemas).length);
     assert.ok(tools.tools.some((tool) => tool.name === 'ticket_context'));
     assert.ok(tools.tools.every((tool) => tool.inputSchema && tool.outputSchema));
     const created = await client.callTool({
