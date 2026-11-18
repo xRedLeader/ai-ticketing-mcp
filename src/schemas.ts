@@ -75,7 +75,7 @@ export const schemas = {
       ...project,
       ...mutation,
       actor_id: id,
-      role: z.enum(['reader', 'contributor', 'verifier', 'admin']),
+      role: z.enum(['reader', 'contributor', 'verifier', 'admin', 'none']),
     })
     .strict(),
   tickets_create: z
@@ -275,7 +275,8 @@ export const descriptions: Record<Operation, string> = {
   project_get: 'Read project instructions, review policy, and member identities.',
   project_create: 'Create a project. Requires system administrator access.',
   project_update: 'Update project instructions or policy with revision protection. Requires project admin.',
-  member_set: 'Grant a registered identity a project role. Requires project admin.',
+  member_set:
+    'Grant a registered identity a project role, or remove it with role none. The last admin cannot be removed. Requires project admin.',
   tickets_create:
     'Atomically create up to 50 tickets with acceptance criteria. Use status ready to make work claimable.',
   ticket_get:

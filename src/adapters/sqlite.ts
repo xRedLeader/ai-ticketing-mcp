@@ -24,6 +24,7 @@ import {
   type EmbeddingProfile,
   type SchedulingPolicy,
 } from '../contracts.js';
+import { MAX_INDEX_JOB_ATTEMPTS } from './index-job-policy.js';
 
 const columns: Record<Table, string[]> = {
   actors: ['id', 'issuer', 'subject', 'name', 'kind', 'system_admin'],
@@ -511,9 +512,9 @@ class SqliteStorage extends Handle implements StorageAdapter {
       const token = randomUUID();
       const jobs = db
         .prepare(
-          'SELECT * FROM jobs WHERE available_at<=? AND (locked_until IS NULL OR locked_until<?) ORDER BY available_at,id LIMIT ?',
+          'SELECT * FROM jobs WHERE available_at<=? AND attempts<? AND (locked_until IS NULL OR locked_until<?) ORDER BY available_at,id LIMIT ?',
         )
-        .all(now, now, limit)
+        .all(now, MAX_INDEX_JOB_ATTEMPTS, now, limit)
         .map(decode) as unknown as Job[];
       const update = db.prepare('UPDATE jobs SET locked_until=?,lock_token=? WHERE id=?');
       for (const job of jobs) {
@@ -582,6 +583,12 @@ class SqliteStorage extends Handle implements StorageAdapter {
       return deliveries;
     });
   }
+  async pruneReceipts(before: string) {
+    this.open();
+    return write(this.shared, async (db) =>
+      Number(db.prepare('DELETE FROM receipts WHERE created_at<?').run(before).changes),
+    );
+  }
   async finishDelivery(
     delivery: OutboundDelivery,
     outcome: { sent_at: string } | { next_attempt_at: string; error_code: string },
@@ -623,9 +630,9 @@ class SqliteStorage extends Handle implements StorageAdapter {
     const now = new Date().toISOString();
     const row = this.db
       .prepare(
-        `SELECT (SELECT count(*) FROM claims WHERE expires_at>?) active_claims,(SELECT count(*) FROM claims WHERE expires_at<=?) expired_claims,(SELECT count(*) FROM tickets WHERE status='in_review') review_backlog,(SELECT count(*) FROM jobs) indexing_pending,(SELECT coalesce(max(0,(julianday(?) - julianday(min(available_at)))*86400),0) FROM jobs) indexing_lag_seconds`,
+        `SELECT (SELECT count(*) FROM claims WHERE expires_at>?) active_claims,(SELECT count(*) FROM claims WHERE expires_at<=?) expired_claims,(SELECT count(*) FROM tickets WHERE status='in_review') review_backlog,(SELECT count(*) FROM jobs WHERE attempts<?) indexing_pending,(SELECT coalesce(max(0,(julianday(?) - julianday(min(available_at)))*86400),0) FROM jobs WHERE attempts<?) indexing_lag_seconds,(SELECT count(*) FROM jobs WHERE attempts>=?) indexing_failed`,
       )
-      .get(now, now, now)!;
+      .get(now, now, MAX_INDEX_JOB_ATTEMPTS, now, MAX_INDEX_JOB_ATTEMPTS, MAX_INDEX_JOB_ATTEMPTS)!;
     return row as unknown as Awaited<ReturnType<StorageAdapter['metrics']>>;
   }
   async health() {

@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname, basename, resolve } from 'node:path';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { once } from 'node:events';
+import { promisify } from 'node:util';
 import { createSqliteAdapters } from '../src/adapters/sqlite.js';
 import { createApplication } from '../src/application.js';
 import { fixture, registerAdapterContractTests, testEmbeddings } from '../src/testing/contracts.js';
@@ -60,6 +61,47 @@ async function deliveryRecord(
 }
 registerAdapterContractTests('SQLite', adapters);
 
+it('prunes old receipts only when worker retention is configured', async () => {
+  const f = await setup();
+  try {
+    const input = {
+      idempotency_key: randomUUID(),
+      tickets: [{ title: 'Retain a receipt', description: 'Retry safely.', criteria: ['Create once.'] }],
+    };
+    const create = () => f.call(f.worker.id, 'tickets_create', input);
+    const first = await create();
+    await f.storage.transaction(f.project.id, async (tx) => {
+      const [receipt] = await tx.find('receipts', {
+        where: { project_id: f.project.id, operation: 'tickets_create' },
+      });
+      assert.ok(receipt);
+      await tx.put('receipts', { ...receipt, created_at: '2000-01-01T00:00:00.000Z' });
+    });
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      TICKETING_WEBHOOK_URL: '',
+      TICKETING_WEBHOOK_SECRET: '',
+    };
+    delete env.RECEIPT_RETENTION_DAYS;
+    const worker = (env: NodeJS.ProcessEnv) =>
+      promisify(execFile)(
+        process.execPath,
+        ['--import', 'tsx', 'src/cli.ts', 'worker', '--once', '--sqlite', f.filename],
+        {
+          env,
+          timeout: 10000,
+          windowsHide: true,
+        },
+      );
+    await worker(env);
+    assert.deepEqual(await create(), first);
+    await worker({ ...env, RECEIPT_RETENTION_DAYS: '30' });
+    assert.notDeepEqual(await create(), first);
+  } finally {
+    await f.dispose();
+  }
+});
+
 it('upgrades schema 001 without losing tickets and stores immutable GitHub evidence', async () => {
   const a = await adapters();
   try {
@@ -87,8 +129,14 @@ it('upgrades schema 001 without losing tickets and stores immutable GitHub evide
         at,
       );
       db.prepare(
-        "INSERT INTO tickets(id,project_id,key,title,description,status,priority,revision,requirements_revision,created_by,created_at,updated_at) VALUES(?,?,?,?,?,'ready',3,1,1,?,?,?)",
+        "INSERT INTO tickets(id,project_id,key,title,description,status,priority,revision,requirements_revision,created_by,created_at,updated_at) VALUES(?,?,?,?,?,'ready',3,8,1,?,?,?)",
       ).run(ticketId, projectId, 'OLD-1', 'Original ticket', 'Preserve this existing body.', actorId, at, at);
+      db.prepare("INSERT INTO search_documents VALUES(?,?,'ticket',8,?,?,0)").run(
+        ticketId,
+        projectId,
+        'Original ticket',
+        'Preserve this existing body.',
+      );
     } finally {
       db.close();
     }
@@ -96,6 +144,10 @@ it('upgrades schema 001 without losing tickets and stores immutable GitHub evide
     await a.storage.migrate();
     const original = (await a.storage.get('tickets', ticketId))!;
     assert.equal(original.description, 'Preserve this existing body.');
+    assert.equal(original.revision, 8);
+    const app = createApplication({ storage: a.storage, search: a.search });
+    assert.equal(await app.indexOnce(), 1);
+    assert.equal((await a.search.search(projectId, 'existing body', 10))[0]?.revision, 1);
     assert.equal(original.github_pull_request, undefined);
     assert.equal((await a.storage.get('actors', actorId))?.name, 'Original operator');
     assert.equal((await a.storage.get('projects', projectId))?.scheduling_policy, undefined);
@@ -111,7 +163,7 @@ it('upgrades schema 001 without losing tickets and stores immutable GitHub evide
       observed_head_sha: 'a'.repeat(40),
       status: 'passed' as const,
       requirements_revision: 1,
-      ticket_revision: 1,
+      ticket_revision: original.revision,
       checks: [
         {
           name: 'CI',

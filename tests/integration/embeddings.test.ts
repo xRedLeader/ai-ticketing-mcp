@@ -30,9 +30,12 @@ it('skips provider calls for unchanged source text and preserves optional-adapte
       ticket_id: ticket.id,
       body: 'Metadata-only progress observation.',
     });
+    assert.equal(await a.storage.get('jobs', `ticket:${ticket.id}`), null);
+    const reuses = app.metrics.document_embedding_reuses;
+    await app.rebuild(f.admin.id, f.project.id);
     await app.indexOnce(10000);
     assert.equal(calls, before);
-    assert.ok(app.metrics.document_embedding_reuses > 0);
+    assert.equal(app.metrics.document_embedding_reuses, reuses + 1);
     const current = (await a.storage.get('tickets', ticket.id))!;
     await f.call(f.worker.id, 'ticket_update', {
       ticket_id: ticket.id,
@@ -42,10 +45,7 @@ it('skips provider calls for unchanged source text and preserves optional-adapte
     await app.indexOnce(10000);
     assert.equal(calls, before + 1);
     await a.storage.pool.query('UPDATE search_vectors SET input_hash=NULL WHERE document_id=$1', [ticket.id]);
-    await f.call(f.worker.id, 'ticket_note', {
-      ticket_id: ticket.id,
-      body: 'Process a pre-migration vector once.',
-    });
+    await app.rebuild(f.admin.id, f.project.id);
     await app.indexOnce(10000);
     assert.equal(calls, before + 2);
     const fallback = createApplication({
@@ -61,10 +61,7 @@ it('skips provider calls for unchanged source text and preserves optional-adapte
         close: a.search.close.bind(a.search),
       },
     });
-    await f.call(f.worker.id, 'ticket_note', {
-      ticket_id: ticket.id,
-      body: 'The original adapter contract remains usable.',
-    });
+    await fallback.rebuild(f.admin.id, f.project.id);
     await fallback.indexOnce(10000);
     assert.equal(calls, before + 3);
   } finally {

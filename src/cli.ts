@@ -192,6 +192,23 @@ async function main() {
       };
       process.once('SIGINT', stop);
       process.once('SIGTERM', stop);
+      const retention = runtimeEnv.RECEIPT_RETENTION_DAYS?.trim();
+      const retentionMs = retention ? Number(retention) * 86_400_000 : undefined;
+      ensure(
+        retentionMs === undefined ||
+          (retentionMs >= 86_400_000 && Number.isFinite(new Date(Date.now() - retentionMs).getTime())),
+        'INVALID_CONFIG',
+        'RECEIPT_RETENTION_DAYS must be at least 1 and give a valid date.',
+      );
+      let pruneAt = 0;
+      const index = async () => {
+        const now = Date.now();
+        if (retentionMs !== undefined && app.storage.pruneReceipts && now >= pruneAt) {
+          await app.storage.pruneReceipts(new Date(now - retentionMs).toISOString());
+          pruneAt = now + 3_600_000;
+        }
+        return app.indexOnce(10);
+      };
       const run = async (work: () => Promise<number>) => {
         try {
           do {
@@ -203,7 +220,7 @@ async function main() {
           stopped = true;
         }
       };
-      const results = await Promise.allSettled([run(() => app.indexOnce(10)), run(() => app.deliverOnce())]);
+      const results = await Promise.allSettled([run(index), run(() => app.deliverOnce())]);
       const failed = results.find((result) => result.status === 'rejected');
       if (failed?.status === 'rejected') throw failed.reason;
       return;

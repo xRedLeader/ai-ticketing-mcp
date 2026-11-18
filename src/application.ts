@@ -404,7 +404,12 @@ export class Application {
       project_id: entity.project_id,
       entity_id: entity.id,
       kind,
-      revision: 'revision' in entity ? entity.revision : entity.ticket_revision,
+      revision:
+        'requirements_revision' in entity
+          ? entity.requirements_revision
+          : 'revision' in entity
+            ? entity.revision
+            : entity.ticket_revision,
       attempts: 0,
       available_at: this.timestamp(),
       locked_until: null,
@@ -416,7 +421,6 @@ export class Application {
     ticket.revision++;
     ticket.updated_at = this.timestamp();
     await tx.put('tickets', ticket);
-    await this.queue(tx, ticket, 'ticket');
   }
   private async scoped(
     actorId: string,
@@ -671,6 +675,7 @@ export class Application {
       if (['done', 'in_review', 'in_progress'].includes(current.status)) current.status = 'ready';
       await tx.remove('claims', current.id);
       await this.touch(tx, current);
+      await this.queue(tx, current, 'ticket');
       await this.event(tx, project, actor, 'ticket.invalidated', current.id, {
         reason,
         revision: current.revision,
@@ -805,7 +810,16 @@ export class Application {
             actor_id: input.actor_id,
             role: input.role,
           };
-          await tx.put('members', member);
+          const current = await tx.get('members', member.id);
+          if (current?.role === 'admin' && input.role !== 'admin') {
+            const admins = await tx.find('members', {
+              where: { project_id: project.id, role: 'admin' },
+              limit: 2,
+            });
+            ensure(admins.length > 1, 'LAST_ADMIN', 'Grant another admin before removing the last one.');
+          }
+          if (input.role === 'none') await tx.remove('members', member.id);
+          else await tx.put('members', member);
           await this.event(tx, project, actor, 'member.updated', input.actor_id, { role: input.role });
           return member;
         }
@@ -964,8 +978,10 @@ export class Application {
         kind: input.kind,
       });
     else await tx.remove('links', id);
-    if (input.kind === 'blocks')
+    // Removing a prerequisite only relaxes constraints, so finished work stays finished.
+    if (input.kind === 'blocks' && input.action === 'add')
       await this.invalidate(tx, project, actor, target, 'Blocking dependencies changed.');
+    else if (input.kind === 'blocks') await this.touch(tx, target);
     await this.event(tx, project, actor, 'ticket.linked', target.id, {
       source_id: source.id,
       kind: input.kind,
@@ -1012,6 +1028,14 @@ export class Application {
         const requirementsChanged = ['title', 'description', 'criteria', 'parent_id'].some(
           (key) => input[key] !== undefined,
         );
+        // Reassignment revokes a live claim held by anyone other than the new assignee.
+        if (ticket.assignee_id && !requirementsChanged) {
+          const claim = await tx.get('claims', ticket.id);
+          if (claim && claim.actor_id !== ticket.assignee_id) {
+            await tx.remove('claims', ticket.id);
+            if (ticket.status === 'in_progress') ticket.status = 'ready';
+          }
+        }
         if (requirementsChanged)
           await this.invalidate(tx, project, actor, ticket, 'Ticket requirements changed.');
         else {
@@ -1050,7 +1074,7 @@ export class Application {
         const claim = await this.liveClaim(tx, ticket, actor, input.claim_token);
         claim.expires_at = new Date(this.now().getTime() + LEASE_MS).toISOString();
         await tx.put('claims', claim);
-        await this.event(tx, project, actor, 'work.heartbeat', ticket.id, { expires_at: claim.expires_at });
+        // No audit event: heartbeats are frequent liveness signals, not state changes.
         return claim;
       }
       case 'work_release': {
@@ -1089,6 +1113,15 @@ export class Application {
             'NOT_FOUND',
             'Question not found on this ticket.',
           );
+          // An asker cannot unblock its own question unless it holds review authority.
+          if (question.blocking && question.actor_id === actor.id)
+            await this.access(tx, actor, project.id, ['verifier', 'admin']).catch((error: unknown) => {
+              if (!(error instanceof DomainError) || error.code !== 'FORBIDDEN') throw error;
+              throw new DomainError(
+                'INDEPENDENT_ANSWER_REQUIRED',
+                'A different identity, verifier, or admin must answer your own blocking question.',
+              );
+            });
         } else ensure(!input.answer_to, 'INVALID_INPUT', 'Only answers may set answer_to.');
         const note = await this.note(tx, actor, ticket, input.kind, input.body, {
           blocking: input.blocking,
@@ -1504,7 +1537,8 @@ export class Application {
       id,
       project_id: ticket.project_id,
       kind,
-      revision: ticket.revision,
+      // Content revision: notes, claims, and checkpoints must not hide a ticket from search.
+      revision: ticket.requirements_revision,
       title: ticket.title,
       text: [ticket.description, ...criteria.map((item) => item.text)].join('\n\n'),
       archived: ticket.status === 'cancelled',

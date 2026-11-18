@@ -139,6 +139,38 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
           await adapters.dispose?.();
         }
       });
+    check('queues ticket indexing only for requirements changes and explicit rebuilds', async (f) => {
+      const ticket = await f.ticket();
+      const id = `ticket:${ticket.id}`;
+      const claim = await f.claim(ticket.id);
+      const job = await f.storage.get('jobs', id);
+      assert.ok(job);
+      const exhausted = { ...job, attempts: 12, last_error: 'EMBEDDING_UNAVAILABLE' };
+      await f.storage.transaction(f.project.id, (tx) => tx.put('jobs', exhausted));
+      await f.call(f.worker.id, 'ticket_note', { ticket_id: ticket.id, body: 'Comment during work.' });
+      const checkpoint = (await f.call(f.worker.id, 'ticket_checkpoint', {
+        ticket_id: ticket.id,
+        claim_token: claim.claim.token,
+        progress: 'Checkpoint during work.',
+      })) as { checkpoint: { id: string }; ticket: { revision: number } };
+      assert.deepEqual(await f.storage.get('jobs', id), exhausted);
+      assert.ok(await f.storage.get('jobs', `checkpoint:${checkpoint.checkpoint.id}`));
+
+      await f.call(f.worker.id, 'ticket_update', {
+        ticket_id: ticket.id,
+        expected_revision: checkpoint.ticket.revision,
+        title: 'Changed search content',
+      });
+      const updated = await f.storage.get('jobs', id);
+      assert.ok(updated);
+      assert.equal(updated.attempts, 0);
+      assert.equal(updated.revision, job.revision + 1);
+      await f.storage.transaction(f.project.id, (tx) =>
+        tx.put('jobs', { ...updated, attempts: exhausted.attempts, last_error: exhausted.last_error }),
+      );
+      await f.app.rebuild(f.admin.id, f.project.id);
+      assert.equal((await f.storage.get('jobs', id))?.attempts, 0);
+    });
     check('rolls back all records when an atomic operation fails', async (f) => {
       const id = randomUUID();
       await assert.rejects(

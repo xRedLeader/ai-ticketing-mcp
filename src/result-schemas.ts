@@ -254,7 +254,7 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
   }),
   project_create: projectSummary,
   project_update: projectSummary,
-  member_set: member,
+  member_set: member.extend({ role: z.enum(['reader', 'contributor', 'verifier', 'admin', 'none']) }),
   tickets_create: z.object({ tickets: z.array(ticketReceipt) }),
   ticket_list: z.object({ tickets: z.array(ticketSummary) }),
   ticket_update: ticketReceipt,

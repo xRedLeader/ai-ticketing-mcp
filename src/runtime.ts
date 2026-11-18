@@ -53,6 +53,7 @@ export function createRuntime(env: NodeJS.ProcessEnv = process.env) {
       revision: env.EMBEDDING_REVISION ?? '1',
       spaceId: env.EMBEDDING_SPACE_ID?.trim() || undefined,
       timeoutMs: Number(env.EMBEDDING_TIMEOUT_MS ?? 30000),
+      queryTimeoutMs: Number(env.EMBEDDING_QUERY_TIMEOUT_MS ?? 2000),
     });
   }
   return createApplication({

@@ -21,6 +21,7 @@ import {
   type Note,
   type SchedulingPolicy,
 } from '../contracts.js';
+import { MAX_INDEX_JOB_ATTEMPTS } from './index-job-policy.js';
 
 const columns: Record<Table, string[]> = {
   outbound_deliveries: [
@@ -389,8 +390,8 @@ export class PostgresStorage implements StorageAdapter {
   }
   async leaseJobs(limit: number, leaseMs: number): Promise<Job[]> {
     const result = await this.pool.query(
-      `UPDATE jobs SET locked_until=now()+($2 * interval '1 millisecond'), lock_token=$3 WHERE id IN (SELECT id FROM jobs WHERE available_at<=now() AND (locked_until IS NULL OR locked_until<now()) ORDER BY available_at,id FOR UPDATE SKIP LOCKED LIMIT $1) RETURNING *`,
-      [limit, leaseMs, randomUUID()],
+      `UPDATE jobs SET locked_until=now()+($2 * interval '1 millisecond'), lock_token=$3 WHERE id IN (SELECT id FROM jobs WHERE available_at<=now() AND attempts<$4 AND (locked_until IS NULL OR locked_until<now()) ORDER BY available_at,id FOR UPDATE SKIP LOCKED LIMIT $1) RETURNING *`,
+      [limit, leaseMs, randomUUID(), MAX_INDEX_JOB_ATTEMPTS],
     );
     return result.rows.map(decode) as unknown as Job[];
   }
@@ -413,6 +414,9 @@ export class PostgresStorage implements StorageAdapter {
         error.slice(0, 500),
       ],
     );
+  }
+  async pruneReceipts(before: string) {
+    return (await this.pool.query('DELETE FROM receipts WHERE created_at<$1', [before])).rowCount ?? 0;
   }
   async health() {
     await this.pool.query('SELECT 1 FROM schema_migrations LIMIT 1');
@@ -465,7 +469,8 @@ export class PostgresStorage implements StorageAdapter {
   }
   async metrics() {
     const result = await this.pool.query(
-      `SELECT (SELECT count(*)::integer FROM claims WHERE expires_at>now()) active_claims,(SELECT count(*)::integer FROM claims WHERE expires_at<=now()) expired_claims,(SELECT count(*)::integer FROM tickets WHERE status='in_review') review_backlog,(SELECT count(*)::integer FROM jobs) indexing_pending,(SELECT coalesce(greatest(0,extract(epoch FROM now()-min(available_at))),0)::float FROM jobs) indexing_lag_seconds`,
+      `SELECT (SELECT count(*)::integer FROM claims WHERE expires_at>now()) active_claims,(SELECT count(*)::integer FROM claims WHERE expires_at<=now()) expired_claims,(SELECT count(*)::integer FROM tickets WHERE status='in_review') review_backlog,(SELECT count(*)::integer FROM jobs WHERE attempts<$1) indexing_pending,(SELECT coalesce(greatest(0,extract(epoch FROM now()-min(available_at))),0)::float FROM jobs WHERE attempts<$1) indexing_lag_seconds,(SELECT count(*)::integer FROM jobs WHERE attempts>=$1) indexing_failed`,
+      [MAX_INDEX_JOB_ATTEMPTS],
     );
     return result.rows[0];
   }

@@ -53,7 +53,15 @@ export async function createAuthenticator(storage: StorageAdapter, config: AuthC
       'UNAUTHENTICATED',
       'This identity is not registered. Ask an operator to map its issuer and subject.',
     );
-    const scopes = new Set(typeof payload.scope === 'string' ? payload.scope.split(' ') : []);
+    // Issuers may use a space-delimited scope or an scp string or array.
+    const raw = payload.scope ?? payload.scp;
+    const scopes = new Set(
+      typeof raw === 'string'
+        ? raw.split(' ')
+        : Array.isArray(raw)
+          ? raw.filter((s): s is string => typeof s === 'string')
+          : [],
+    );
     ensure(scopes.has('ticketing:read'), 'INSUFFICIENT_SCOPE', 'ticketing:read scope is required.');
     return { actorId: actor.id, scopes };
   };

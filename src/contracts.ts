@@ -287,7 +287,10 @@ export interface StorageAdapter extends Reader {
   transaction<T>(scope: string, work: (tx: Transaction) => Promise<T>): Promise<T>;
   /** Atomically leases durable jobs, including abandoned jobs whose lease expired. */
   leaseJobs(limit: number, leaseMs: number): Promise<Job[]>;
+  /** Records success, or schedules a bounded retry; repeatedly failing jobs may stop being leased. */
   finishJob(job: Job, error?: string): Promise<void>;
+  /** Optional: deletes idempotency receipts created before the timestamp and returns the count. */
+  pruneReceipts?(before: string): Promise<number>;
   /** Atomically leases 1–100 due rows for this target; lease is 1–3,600,000 ms. */
   leaseDeliveries?(targetFingerprint: string, limit: number, leaseMs: number): Promise<OutboundDelivery[]>;
   finishDelivery?(delivery: OutboundDelivery, outcome: DeliveryOutcome): Promise<void>;
@@ -298,6 +301,7 @@ export interface StorageAdapter extends Reader {
     review_backlog: number;
     indexing_pending: number;
     indexing_lag_seconds: number;
+    indexing_failed?: number;
   }>;
   migrate(): Promise<void>;
   health(): Promise<void>;

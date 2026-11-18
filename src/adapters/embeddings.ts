@@ -8,6 +8,8 @@ export interface EmbeddingConfig {
   dimensions: number;
   apiKey?: string;
   timeoutMs?: number;
+  /** Interactive searches fall back to full text quickly instead of waiting for document-sized timeouts. */
+  queryTimeoutMs?: number;
   revision?: string;
   spaceId?: string;
 }
@@ -92,7 +94,9 @@ export class HttpEmbeddings implements EmbeddingProvider {
                 encoding_format: 'float',
               },
         ),
-        signal: AbortSignal.timeout(this.config.timeoutMs ?? 30000),
+        signal: AbortSignal.timeout(
+          purpose === 'query' ? (this.config.queryTimeoutMs ?? 2000) : (this.config.timeoutMs ?? 30000),
+        ),
       });
       if (!response.ok)
         throw new DomainError(

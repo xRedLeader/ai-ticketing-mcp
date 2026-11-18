@@ -23,6 +23,6 @@ Query embedding caches use exact text keys within each immutable profile instanc
 
 ### Operational follow-up
 
-Combined claims still pack context within the project transaction so an oversized context rolls back ownership, revisions, events, jobs, and receipts together. Moving packing after commit would change that guarantee and needs a separate design. Indefinite receipt retention protects retry idempotency; do not prune receipts to recover space.
+Combined claims still pack context within the project transaction so an oversized context rolls back ownership, revisions, events, jobs, and receipts together. Moving packing after commit would change that guarantee and needs a separate design. The worker retains idempotency receipts indefinitely by default. If you opt in to pruning, set `RECEIPT_RETENTION_DAYS` to cover your clients' retry window and reconcile old operations before retrying them if their receipt may have been pruned.
 
 Use the new [claim/heartbeat benchmark and receipt capacity procedure](operations.md#claim-contention-and-receipt-capacity) before rollout. CI checks budgets, successful concurrent operations, ownership, and byte-stable replay; its latency measurements are observations, not a production service-level guarantee. See the dated [verification record](verification.md) for measured results and limitations.
