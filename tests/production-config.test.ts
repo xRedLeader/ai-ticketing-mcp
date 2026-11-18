@@ -37,6 +37,31 @@ it('checks exact production identities, assigned realm audience, private ports a
     },
   };
   assert.deepEqual(checkProductionConfig(env, compose, realm), []);
+  for (const name of ['ticketing:read', 'ticketing:write']) {
+    for (const change of [
+      (scope: any) => delete scope.protocol,
+      (scope: any) => (scope.protocol = 'saml'),
+      (scope: any) => delete scope.attributes,
+      (scope: any) => delete scope.attributes['include.in.token.scope'],
+      (scope: any) => (scope.attributes['include.in.token.scope'] = 'false'),
+      (scope: any) => (scope.attributes['include.in.token.scope'] = true),
+    ]) {
+      const invalid = structuredClone(realm);
+      change(invalid.clientScopes.find((scope: any) => scope.name === name));
+      assert.ok(
+        checkProductionConfig(env, compose, invalid).some(
+          (message: string) => message.startsWith('Keycloak scopes:') && message.includes(name),
+        ),
+      );
+    }
+    const missing = structuredClone(realm);
+    missing.clientScopes = missing.clientScopes.filter((scope: any) => scope.name !== name);
+    assert.ok(
+      checkProductionConfig(env, compose, missing).some(
+        (message: string) => message.startsWith('Keycloak scopes:') && message.includes(name),
+      ),
+    );
+  }
   for (const change of [
     (proxy: any) =>
       proxy.ports.forEach((port: any) => {

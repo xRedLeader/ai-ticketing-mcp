@@ -69,6 +69,13 @@ export function checkProductionConfig(env, compose, realm) {
       realm.realm === 'ticketing' && mapper,
       'Keycloak realm: update ticketing:read > ticketing-audience to the exact OAUTH_AUDIENCE with access-token claim enabled, then export the current realm again.',
     );
+    for (const name of ['ticketing:read', 'ticketing:write']) {
+      const scope = realm.clientScopes?.find((scope) => scope.name === name);
+      fail(
+        scope?.protocol === 'openid-connect' && scope.attributes?.['include.in.token.scope'] === 'true',
+        `Keycloak scopes: set ${name} protocol to openid-connect and include.in.token.scope to true, then export the current realm again.`,
+      );
+    }
     fail(
       realm.clients?.filter((c) => ['ai-ticketing-cli', 'ai-ticketing-agent'].includes(c.clientId)).length ===
         2 &&

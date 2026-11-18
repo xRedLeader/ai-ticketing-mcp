@@ -2,9 +2,13 @@ import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+// @ts-expect-error Operator script is plain Node ESM.
+import { checkProductionConfig } from '../../scripts/check-production.mjs';
 
 it(
   'imports the public production realm as the pinned non-owner Keycloak user',
@@ -15,6 +19,16 @@ it(
     const volume = `${name}-staging`;
     const audience = 'https://tickets.acme.org/mcp';
     const login = 'https://login.acme.org';
+    const env = {
+      TICKETING_DOMAIN: 'tickets.acme.org',
+      LOGIN_DOMAIN: 'login.acme.org',
+      PUBLIC_URL: 'https://tickets.acme.org',
+      OAUTH_ISSUER: `${login}/realms/ticketing`,
+      OAUTH_AUDIENCE: audience,
+      OAUTH_JWKS_URL: 'http://keycloak:8080/realms/ticketing/protocol/openid-connect/certs',
+      ALLOWED_ORIGIN_HOSTS: 'tickets.acme.org',
+      KEYCLOAK_PUBLIC_URL: login,
+    };
     const docker = async (...args: string[]) =>
       (await promisify(execFile)('docker', args, { windowsHide: true, timeout: 120000 })).stdout.trim();
     try {
@@ -40,13 +54,7 @@ it(
             APP_DB_PASSWORD: 'fixture-only',
             KEYCLOAK_DB_PASSWORD: 'fixture-only',
             KEYCLOAK_ADMIN_PASSWORD: 'fixture-only',
-            TICKETING_DOMAIN: 'tickets.acme.org',
-            LOGIN_DOMAIN: 'login.acme.org',
-            PUBLIC_URL: 'https://tickets.acme.org',
-            OAUTH_ISSUER: `${login}/realms/ticketing`,
-            OAUTH_AUDIENCE: audience,
-            ALLOWED_ORIGIN_HOSTS: 'tickets.acme.org',
-            KEYCLOAK_PUBLIC_URL: login,
+            ...env,
           },
         },
       );
@@ -128,6 +136,10 @@ it(
         'KC_DB=dev-file',
         '-e',
         `KC_HOSTNAME=${keycloak.environment.KC_HOSTNAME}`,
+        '-e',
+        'KC_BOOTSTRAP_ADMIN_USERNAME=fixture-admin',
+        '-e',
+        'KC_BOOTSTRAP_ADMIN_PASSWORD=fixture-only',
         keycloak.image,
         ...keycloak.command,
       );
@@ -151,8 +163,77 @@ it(
       const logs = await docker('logs', name);
       assert.equal(issuer, `${login}/realms/ticketing`, logs);
       assert.match(logs, /Realm 'ticketing' imported/);
+      const base = `http://127.0.0.1:${port}`;
+      const token = async (realm: string, parameters: Record<string, string>) => {
+        const response = await fetch(`${base}/realms/${realm}/protocol/openid-connect/token`, {
+          method: 'POST',
+          body: new URLSearchParams(parameters),
+          signal: AbortSignal.timeout(10000),
+        });
+        assert.equal(response.status, 200);
+        const body = await response.json();
+        assert.equal(typeof body.access_token, 'string');
+        return body.access_token as string;
+      };
+      const adminToken = await token('master', {
+        grant_type: 'password',
+        client_id: 'admin-cli',
+        username: 'fixture-admin',
+        password: 'fixture-only',
+      });
+      const admin = async (path: string, init: RequestInit = {}) => {
+        const response = await fetch(`${base}/admin/realms/ticketing/${path}`, {
+          ...init,
+          headers: { Authorization: `Bearer ${adminToken}`, 'Content-Type': 'application/json' },
+          signal: AbortSignal.timeout(10000),
+        });
+        assert.ok(response.ok, `Keycloak fixture admin request failed (${response.status})`);
+        return response;
+      };
+      const clients = await (await admin('clients?clientId=ai-ticketing-agent')).json();
+      assert.equal(clients.length, 1);
+      const credential = await (
+        await admin(`clients/${clients[0].id}/client-secret`, { method: 'POST' })
+      ).json();
+      assert.equal(typeof credential.value, 'string');
+      const jwks = createRemoteJWKSet(new URL(`${base}/realms/ticketing/protocol/openid-connect/certs`));
+      const verifyScopes = async (expected: string[]) => {
+        const accessToken = await token('ticketing', {
+          grant_type: 'client_credentials',
+          client_id: 'ai-ticketing-agent',
+          client_secret: credential.value,
+        });
+        const { payload } = await jwtVerify(accessToken, jwks, {
+          issuer: env.OAUTH_ISSUER,
+          audience,
+        });
+        assert.equal(payload.iss, env.OAUTH_ISSUER);
+        assert.equal(payload.aud, audience);
+        assert.equal(typeof payload.scope, 'string');
+        assert.deepEqual((payload.scope as string).split(' ').sort(), [...expected].sort());
+      };
+      const realm = JSON.parse(await readFile('deploy/keycloak-realm.json', 'utf8'));
+      realm.clientScopes[0].protocolMappers[0].config['included.custom.audience'] = audience;
+      assert.deepEqual(checkProductionConfig(env, undefined, realm), []);
+      await verifyScopes(['ticketing:read', 'ticketing:write']);
+      const scopes = await (await admin('client-scopes')).json();
+      for (const name of ['ticketing:read', 'ticketing:write']) {
+        const scope = scopes.find((scope: any) => scope.name === name);
+        assert.ok(scope);
+        scope.attributes['include.in.token.scope'] = 'false';
+        await admin(`client-scopes/${scope.id}`, { method: 'PUT', body: JSON.stringify(scope) });
+        const invalid = structuredClone(realm);
+        invalid.clientScopes.find((scope: any) => scope.name === name).attributes = scope.attributes;
+        const errors = checkProductionConfig(env, undefined, invalid);
+        assert.equal(errors.length, 1);
+        assert.ok(errors[0].startsWith('Keycloak scopes:') && errors[0].includes(name));
+        await verifyScopes(['ticketing:read', 'ticketing:write'].filter((scope) => scope !== name));
+        scope.attributes['include.in.token.scope'] = 'true';
+        await admin(`client-scopes/${scope.id}`, { method: 'PUT', body: JSON.stringify(scope) });
+      }
+      await verifyScopes(['ticketing:read', 'ticketing:write']);
       process.stdout.write(
-        'Verified fresh production-command realm import and public issuer with Keycloak 26.4.7 UID 1000 reading a root-owned 0644 file bind mount.\n',
+        'Verified Keycloak 26.4.7 UID 1000 imports a root-owned 0644 production realm; real default-scope tokens retain exact public issuer/audience while false read/write emission settings omit their scope and fail preflight.\n',
       );
     } finally {
       await docker('rm', '-f', name).catch(() => {});
