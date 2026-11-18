@@ -36,6 +36,7 @@
     "benchmark": "tsx scripts/benchmark.ts",
     "benchmark:protocol": "tsx scripts/protocol-benchmark.ts",
     "benchmark:claims": "tsx scripts/claim-benchmark.ts",
+    "profile:report": "tsx src/cli.ts profile-report",
     "walkthrough": "tsx scripts/walkthrough.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

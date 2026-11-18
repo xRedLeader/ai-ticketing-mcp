@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
+import { write } from 'node:fs';
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { createRuntime } from './runtime.js';
@@ -11,6 +12,7 @@ import { createMcpServer } from './mcp.js';
 import { DomainError, ensure, type Actor } from './contracts.js';
 import type { Operation } from './schemas.js';
 import { parseMcpProfile } from './profiles.js';
+import type { ProfileRecorder } from './profiling.js';
 
 const { positionals, values } = parseArgs({
   allowPositionals: true,
@@ -26,6 +28,7 @@ const { positionals, values } = parseArgs({
     sqlite: { type: 'string' },
     operation: { type: 'string' },
     input: { type: 'string' },
+    output: { type: 'string' },
     'input-file': { type: 'string' },
     url: { type: 'string' },
     'token-env': { type: 'string' },
@@ -39,11 +42,56 @@ async function input() {
     values['input-file'] ? await readFile(values['input-file'], 'utf8') : (values.input ?? '{}'),
   );
 }
+async function capture(env: NodeJS.ProcessEnv) {
+  ensure(
+    ['true', 'false'].includes(env.MCP_PROFILE_CAPTURE ?? 'false'),
+    'INVALID_CONFIG',
+    'MCP_PROFILE_CAPTURE must be true or false.',
+  );
+  if (env.MCP_PROFILE_CAPTURE !== 'true') return undefined;
+  const { createProfileRecorder } = await import('./profiling.js');
+  const number = (key: string) => {
+    if (env[key] === undefined) return undefined;
+    const value = Number(env[key]);
+    ensure(Number.isSafeInteger(value) && value > 0, 'INVALID_CONFIG', `${key} must be a positive integer.`);
+    return value;
+  };
+  const directory = env.MCP_PROFILE_DIRECTORY ?? '.local/token-profiles';
+  ensure(directory.trim().length > 0, 'INVALID_CONFIG', 'MCP_PROFILE_DIRECTORY requires a directory.');
+  const recorder = await createProfileRecorder({
+    directory,
+    maxFileBytes: number('MCP_PROFILE_MAX_FILE_BYTES'),
+    maxFiles: number('MCP_PROFILE_MAX_FILES'),
+    maxQueueBytes: number('MCP_PROFILE_MAX_QUEUE_BYTES'),
+  });
+  try {
+    write(
+      2,
+      JSON.stringify({ event: 'mcp_profile_capture', directory: recorder.runDirectory, raw_payloads: true }) +
+        '\n',
+      () => {},
+    );
+  } catch {}
+  return recorder;
+}
 async function main() {
   if (command === 'help') {
     process.stdout.write(
-      `ai-ticketing commands:\n  migrate                 Apply migrations and prepare the configured search profile\n  actor --issuer --subject --name --kind [--admin]   Register an identity (trusted operator)\n  call --actor ID --operation NAME --input-file FILE   Execute as a trusted local operator\n  call --url URL --token-env ACCESS_TOKEN --operation NAME --input-file FILE   Authenticated remote call\n  serve                   Serve authenticated HTTP MCP\n  stdio [--profile NAME]  Local MCP; worker (default), planner, reviewer, full (actor required outside SQLite)\n  worker [--once]          Process durable indexing and configured webhook deliveries\n  reindex --actor ID --project ID   Rebuild project search indexes\n  inspect --actor ID --project ID   Inspect project and queue metrics\n\nUse --sqlite PATH for local storage; SQLite stdio initializes its agent and indexing automatically.\nUse --input JSON instead of --input-file for short inputs. Secrets belong in environment variables.\n`,
+      `ai-ticketing commands:\n  migrate                 Apply migrations and prepare the configured search profile\n  actor --issuer --subject --name --kind [--admin]   Register an identity (trusted operator)\n  call --actor ID --operation NAME --input-file FILE   Execute as a trusted local operator\n  call --url URL --token-env ACCESS_TOKEN --operation NAME --input-file FILE   Authenticated remote call\n  serve                   Serve authenticated HTTP MCP\n  stdio [--profile NAME]  Local MCP; worker (default), planner, reviewer, full (actor required outside SQLite)\n  worker [--once]          Process durable indexing and configured webhook deliveries\n  reindex --actor ID --project ID   Rebuild project search indexes\n  inspect --actor ID --project ID   Inspect project and queue metrics\n  profile-report --input DIR --output FILE   Analyze captured MCP traffic offline\n\nUse --sqlite PATH for local storage; SQLite stdio initializes its agent and indexing automatically.\nUse --input JSON instead of --input-file for short inputs. Secrets belong in environment variables.\nSet MCP_PROFILE_CAPTURE=true to capture raw MCP payloads locally without adding model-visible output.\n`,
     );
+    return;
+  }
+  if (command === 'profile-report') {
+    ensure(
+      values.input && values.output,
+      'INVALID_INPUT',
+      'profile-report requires --input DIR and --output FILE.',
+    );
+    const { analyzeProfile } = await import('./profile-report.js');
+    const report = await analyzeProfile(values.input);
+    await writeFile(values.output, JSON.stringify(report, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    print({ report: values.output, complete: report.complete });
+    if (!report.complete) process.exitCode = 2;
     return;
   }
   if (command === 'call' && values.url) {
@@ -78,8 +126,10 @@ async function main() {
       ? process.env
       : { ...process.env, STORAGE_ADAPTER: 'sqlite', SQLITE_PATH: values.sqlite };
   const app = createRuntime(runtimeEnv);
+  let profiler: ProfileRecorder | undefined;
   let keepAlive = false;
   try {
+    if (command === 'stdio' || command === 'serve') profiler = await capture(runtimeEnv);
     if (command === 'migrate') {
       await app.storage.migrate();
       if (app.embeddings && app.searchAdapter.capabilities?.semantic !== false)
@@ -199,7 +249,14 @@ async function main() {
         },
         parseMcpProfile(values.profile),
       );
-      await server.connect(new StdioServerTransport());
+      const transport = new StdioServerTransport();
+      await server.connect(
+        profiler?.wrapTransport(transport, {
+          transport: 'stdio',
+          profile: parseMcpProfile(values.profile),
+          actorId,
+        }) ?? transport,
+      );
       keepAlive = true;
       let closing = false;
       let indexing: Promise<unknown> | undefined;
@@ -247,6 +304,7 @@ async function main() {
         clearInterval(deliveryTimer);
         await server.close();
         await Promise.all([indexing, delivering]);
+        await profiler?.close();
         await app.searchAdapter.close();
         await app.storage.close();
       };
@@ -273,15 +331,23 @@ async function main() {
         issuer: process.env.OAUTH_ISSUER,
         authenticate,
         allowedOrigins: process.env.ALLOWED_ORIGIN_HOSTS?.split(','),
+        profiler,
       });
       await new Promise<void>((resolve) =>
         server.listen(Number(process.env.PORT ?? 3000), process.env.HOST ?? '127.0.0.1', resolve),
       );
       keepAlive = true;
       process.stderr.write(JSON.stringify({ level: 'info', event: 'listening', url: publicUrl }) + '\n');
+      let closing = false;
       const shutdown = () => {
+        if (closing) return;
+        closing = true;
         server.close(() => {
-          void app.storage.close();
+          void (async () => {
+            await profiler?.close();
+            await app.searchAdapter.close();
+            await app.storage.close();
+          })();
         });
         setTimeout(() => server.closeAllConnections(), 10000).unref();
       };
@@ -292,6 +358,7 @@ async function main() {
     throw new DomainError('INVALID_INPUT', `Unknown command: ${command}`);
   } finally {
     if (!keepAlive) {
+      await profiler?.close();
       await app.searchAdapter.close();
       await app.storage.close();
     }
@@ -305,7 +372,9 @@ main().catch((error) => {
       message:
         error instanceof DomainError
           ? error.message
-          : 'Command failed. Check database availability and configuration.',
+          : command === 'profile-report'
+            ? 'Profile report failed. Check the capture directory and use a new writable output file.'
+            : 'Command failed. Check database availability and configuration.',
     }) + '\n',
   );
   if (process.env.DEBUG === '1') process.stderr.write(String(error) + '\n');

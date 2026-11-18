@@ -14,6 +14,11 @@ x-runtime: &runtime
     EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-768}
     EMBEDDING_REVISION: ${EMBEDDING_REVISION:-1}
     REFERENCE_TOKEN_METRICS: ${REFERENCE_TOKEN_METRICS:-false}
+    MCP_PROFILE_CAPTURE: ${MCP_PROFILE_CAPTURE:-false}
+    MCP_PROFILE_DIRECTORY: /app/.local/token-profiles
+    MCP_PROFILE_MAX_FILE_BYTES: ${MCP_PROFILE_MAX_FILE_BYTES:-8388608}
+    MCP_PROFILE_MAX_FILES: ${MCP_PROFILE_MAX_FILES:-8}
+    MCP_PROFILE_MAX_QUEUE_BYTES: ${MCP_PROFILE_MAX_QUEUE_BYTES:-16777216}
     TICKETING_GITHUB_REPOSITORY: ${TICKETING_GITHUB_REPOSITORY:-}
     TICKETING_GITHUB_REQUIRED_CHECKS: ${TICKETING_GITHUB_REQUIRED_CHECKS:-}
     TICKETING_GITHUB_CHECK_APP_ID: ${TICKETING_GITHUB_CHECK_APP_ID:-}
@@ -57,6 +62,7 @@ services:
         condition: service_healthy
   app:
     <<: *runtime
+    volumes: ['token_profiles:/app/.local/token-profiles']
     environment:
       <<: *environment
       HOST: 0.0.0.0
@@ -116,3 +122,4 @@ services:
 volumes:
   database:
   models:
+  token_profiles:

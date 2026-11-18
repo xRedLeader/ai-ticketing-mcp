@@ -8,6 +8,7 @@ import { DomainError, ensure } from './contracts.js';
 import { createMcpServer, type Principal } from './mcp.js';
 import type { Application } from './application.js';
 import { parseMcpProfile } from './profiles.js';
+import type { ProfileRecorder } from './profiling.js';
 
 export interface HttpConfig {
   publicUrl: string;
@@ -15,6 +16,7 @@ export interface HttpConfig {
   host?: string;
   port?: number;
   allowedOrigins?: string[];
+  profiler?: ProfileRecorder;
   authenticate: (authorization: string | undefined) => Promise<Principal>;
 }
 function json(res: ServerResponse, status: number, value: unknown) {
@@ -125,6 +127,7 @@ export function createHttpServer(app: Application, config: HttpConfig) {
         const metrics = {
           ...app.metrics,
           ...app.embeddings?.metrics,
+          ...config.profiler?.metrics,
           ...(await app.storage.metrics()),
           ...(await app.storage.deliveryMetrics?.()),
         };
@@ -161,7 +164,13 @@ export function createHttpServer(app: Application, config: HttpConfig) {
       res.once('close', () => {
         void mcp.close();
       });
-      await mcp.connect(transport);
+      await mcp.connect(
+        config.profiler?.wrapTransport(transport, {
+          transport: 'http',
+          profile,
+          actorId: principal.actorId,
+        }) ?? transport,
+      );
       await transport.handleRequest(req, res, parsed);
     } catch (error) {
       if (res.headersSent) {

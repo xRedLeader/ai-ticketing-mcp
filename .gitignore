@@ -5,6 +5,7 @@ coverage/
 .env.*
 !.env.example
 .local/
+token-profiles/
 *.log
 *.dump
 *.sql.gz

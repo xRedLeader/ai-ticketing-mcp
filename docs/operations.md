@@ -58,9 +58,49 @@ The SHA256 fingerprint of the canonical URL binds queued rows to their original 
 - `/readyz`: storage and search schema connectivity.
 - `/metrics`: authenticated system-administrator-only Prometheus metrics for requests/errors/time, indexing, active/expired claims, review backlog, pending jobs, and lag. Numeric embedding counters report provider `embed` invocations, document/query reuse, provider failures, and cache saturation. Reference-token metric accounting is off by default; opt in with `REFERENCE_TOKEN_METRICS=true` to count validated tool inputs (SDK defaults may be materialized), canonical-envelope results, and accounting failures. Context budgets and excerpt limits always remain enforced. These are local reference counts, not billed tokens or exact wire/client costs. No content labels are collected.
 
-Readiness does not imply the embedding provider or identity provider is available; alert on authentication failures, indexing error increases, and growing job lag. HTTP logs include only method, recognized route, status, and duration. Tokens, database URLs, ticket bodies, and evidence are not logged.
+Readiness does not imply the embedding provider or identity provider is available; alert on authentication failures, indexing error increases, and growing job lag. Ordinary HTTP logs include only method, recognized route, status, and duration. Tokens, database URLs, ticket bodies, and evidence are excluded from those logs. Explicit raw MCP profiling below has a separate content-bearing capture directory.
 
 Built-in adapters also expose `webhook_pending` (all unsent rows, including old destinations), `webhook_failed` (unsent rows with a failure code), and `webhook_attempts` (safely bounded total attempt count) through authenticated `/metrics` and administrator CLI `inspect`. These metrics contain no destination or content labels.
+
+## MCP profiling
+
+Enable automatic capture in the server process environment and restart the server:
+
+```env
+MCP_PROFILE_CAPTURE=true
+MCP_PROFILE_DIRECTORY=.local/token-profiles
+REFERENCE_TOKEN_METRICS=false
+```
+
+`MCP_PROFILE_CAPTURE=false` is the default and creates no capture files. Capture records requests, responses and notifications behind the MCP transport for both stdio and HTTP: initialization, discovery, tool calls, prompts, resources and protocol error responses. It adds no tools, prompts, response fields or model-visible logging. Tokenization happens in the offline report command; the existing context-budget checks still run normally. `REFERENCE_TOKEN_METRICS` remains an independent switch for immediate aggregate counting.
+
+Each server process creates a unique run directory under `MCP_PROFILE_DIRECTORY` and prints its location to stderr. Numbered `events-*.jsonl` files store the parsed JSON-RPC messages as serialized JSON strings, with sequence numbers, connection IDs, timestamps, transport and profile. Each HTTP POST gets its own connection ID, so repeated numeric request IDs from different clients cannot collide. Outgoing snapshots have separate send outcomes; a snapshot alone does not prove successful delivery. Authorization headers, environment variables and SDK connection extras are never captured. Requests rejected before the authenticated HTTP MCP transport, and malformed input that the transport cannot parse, have no captured raw body. Existing HTTP status logs and transport diagnostics cover those boundaries without retaining credentials from headers.
+
+Raw payloads preserve exact ticket text and can contain claim credentials or secrets supplied as tool arguments. Use a private local directory; default `.local/` and directories named `token-profiles` are Git-ignored. New files use mode `0600` and directories `0700` where the operating system supports these modes; restrict Windows directory ACLs as appropriate. Reports omit raw message bodies. Do not publish raw captures as CI artifacts or ordinary application logs.
+
+Stop the server gracefully to flush the capture, then run:
+
+```sh
+node dist/cli.js profile-report --input .local/token-profiles/RUN_DIRECTORY --output .local/token-report.json
+# From a source checkout with development dependencies installed:
+npm run profile:report -- --input .local/token-profiles/RUN_DIRECTORY --output .local/token-report.json
+```
+
+The command needs no database or provider connection and refuses to overwrite an existing output file. It writes the diagnostic report even when incomplete, returning exit code 0 for a complete report, 2 for an incomplete capture/call history, and 1 if analysis or output writing fails. Reports account for every retained message and correlate individual calls within each connection, keeping discovery, notifications, retries, unmatched requests and orphan responses visible. Counts distinguish serialized JSON-RPC messages, SDK result payloads, and canonical tool-response text. Per-operation totals and server-observed timing support comparisons without loading capture content into an agent's context. The tokenizer is `js-tiktoken/o200k_base`, including ordinary handling of special-token-looking user text. These are reference counts for the captured serialization, not original network framing, client-rendered prompts, provider billing or model comprehension.
+
+Capture performs JSON serialization and asynchronous file I/O, so it has host CPU and disk cost even though it adds no AI input/output tokens. The hot path never waits for disk writes or calls a tokenizer. The defaults bound each process run to eight retained 8 MiB segments and a 16 MiB queue:
+
+```env
+MCP_PROFILE_MAX_FILE_BYTES=8388608
+MCP_PROFILE_MAX_FILES=8
+MCP_PROFILE_MAX_QUEUE_BYTES=16777216
+```
+
+Oversized records, full queues, write failures and rotated-out segments are recorded as losses. Sequence gaps, pending sends, unmatched messages and an unclosed run keep an incomplete capture from looking complete. Capture failures do not turn a successful ticket operation into a failure; inspect `run.json` status/counters and content-free stderr diagnostics before trusting totals. HTTP `/metrics` also exports `ai_ticketing_profile_*` numeric counters. Rotation bounds one run, not the number of runs across restarts. Archive or remove closed run directories according to your retention policy; there is no cross-process cleanup service. Analyze closed runs for reproducible totals. Metadata and sequence checks detect inconsistent captures; analysis-time hashes are fingerprints, not authenticated evidence against deliberate edits.
+
+Compose passes these settings to the app and retains runs in the `token_profiles` volume at `/app/.local/token-profiles`. Set `MCP_PROFILE_CAPTURE=true` in `.env`, then recreate the app container to apply it. The image prepares that directory for the unprivileged `node` user. Analyze inside the container with `node dist/cli.js profile-report` or copy a closed run locally. Explicit capture is for MCP server traffic; direct trusted `call --actor`, indexing workers and provider-side requests do not pass through this recorder.
+
+Library consumers can create a recorder with `createProfileRecorder`, supply it as `HttpConfig.profiler`, or wrap a stdio transport before `createMcpServer(...).connect(...)`. The caller owns `recorder.close()` after transports stop. `analyzeProfile(runDirectory)` provides the same offline analysis as the CLI.
 
 ## Backup and restore
 

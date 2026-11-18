@@ -16,6 +16,8 @@ Headless ticketing built for agents: find useful work, claim it safely, recover 
 - Attributable events and durable polling cursors, without keeping an MCP connection alive.
 - Local stdio and OAuth-protected Streamable HTTP; no frontend or agent runtime required.
 
+For automatic server-side traffic capture and offline token reports, see [MCP profiling](docs/operations.md#mcp-profiling). It adds no tools or response fields to the agent's context.
+
 ## Quickstart
 
 Install Docker with Compose and Node.js 24 or newer. From a clean checkout:
