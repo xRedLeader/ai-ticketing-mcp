@@ -1,15 +1,31 @@
-import { closeSync, fstatSync, fsyncSync, openSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  fstatSync,
+  fsyncSync,
+  linkSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import type { ExecutionProcessIdentity } from './contracts.js';
 
-/** Write once: a partially written journal is ambiguous, never evidence of non-execution. */
+/** Publish only complete journals, without replacing immutable evidence. */
 export function durableExecutionFile(path: string, value: unknown) {
-  const fd = openSync(path, 'wx', 0o600);
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  const fd = openSync(temporary, 'wx', 0o600);
   try {
-    writeFileSync(fd, JSON.stringify(value) + '\n');
-    fsyncSync(fd);
+    try {
+      writeFileSync(fd, JSON.stringify(value) + '\n');
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    linkSync(temporary, path);
   } finally {
-    closeSync(fd);
+    unlinkSync(temporary);
   }
 }
 export function readExecutionFile(path: string): unknown {

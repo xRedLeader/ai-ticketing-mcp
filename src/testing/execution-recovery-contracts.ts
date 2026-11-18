@@ -568,6 +568,7 @@ export function registerExecutionRecoveryContractTests(
         );
         await new ExecutionCompanion(f.options).runOnce();
         assert.equal(f.capacity.inspect('test').entries[0]!.state, occupied ? 'running' : 'queued');
+        delete proof.capacity.state;
         await writeFile(proofFile, JSON.stringify(proof));
         await new ExecutionCompanion(f.options).runOnce();
         assert.equal(f.capacity.inspect('test').occupied.script, 0);
@@ -575,6 +576,246 @@ export function registerExecutionRecoveryContractTests(
         assert.equal(existsSync(f.marker), false);
       },
     );
+  for (const completed of [false, true])
+    check(
+      `retains a same-millisecond admission after ${completed ? 'terminal' : 'reserved'} never-started proof`,
+      async (f) => {
+        const controller = (await f.app.acquireExecutionController(
+          f.admin.id,
+          f.project.id,
+          'fixture',
+          60_000,
+        ))!;
+        await f.app.reserveExecutionRun(f.admin.id, f.project.id, f.runId, 60_000, controller);
+        f.capacity.enqueue('test', {
+          queue_id: f.runId,
+          run_id: f.runId,
+          project_id: f.project.id,
+          kind: 'script',
+          resources: {},
+          timeout_ms: 5000,
+          created_at: Date.now(),
+        });
+        await f.app.releaseExecutionController(f.admin.id, f.project.id, controller);
+        if (completed) {
+          const application = new Proxy(f.app, {
+            get(target, key) {
+              if (key === 'recoverExecutionRun')
+                return async (...args: Parameters<typeof target.recoverExecutionRun>) => {
+                  assert.equal(await target.recoverExecutionRun(...args), true);
+                  throw new Error('Crash before capacity cleanup.');
+                };
+              const value = Reflect.get(target, key);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+          await assert.rejects(
+            new ExecutionCompanion({ ...f.options, application }).runOnce(),
+            /Crash before capacity cleanup/,
+          );
+        }
+        const dispatcher = new HostCapacity(f.capacityFile);
+        let raced = false;
+        const capacity = new Proxy(f.capacity, {
+          get(target, key) {
+            if (key === 'reconcileNeverStarted')
+              return (...args: Parameters<typeof target.reconcileNeverStarted>) => {
+                assert.equal(args[0].state, 'queued');
+                const originalNow = Date.now;
+                try {
+                  Date.now = () => args[1];
+                  assert.equal(dispatcher.claimNext('test', 'racing-dispatcher').admitted, true);
+                  raced = true;
+                  return target.reconcileNeverStarted(...args);
+                } finally {
+                  Date.now = originalNow;
+                }
+              };
+            const value = Reflect.get(target, key);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+        try {
+          await new ExecutionCompanion({ ...f.options, capacity }).runOnce();
+          assert.equal(raced, true);
+          assert.equal((await f.view()).run.error_code, 'RECOVERED_NOT_DISPATCHED');
+          assert.equal(f.capacity.inspect('test').entries[0]!.state, 'running');
+          assert.equal(f.capacity.inspect('test').occupied.script, 1);
+          await new ExecutionCompanion(f.options).runOnce();
+          assert.equal(f.capacity.inspect('test').occupied.script, 1);
+          assert.equal(existsSync(f.marker), false);
+        } finally {
+          dispatcher.close();
+        }
+      },
+    );
+
+  for (const occupied of [false, true])
+    check(
+      `repairs a legacy torn never-started proof only while undispatched (${occupied ? 'occupied' : 'queued'})`,
+      async (f) => {
+        const controller = (await f.app.acquireExecutionController(
+          f.admin.id,
+          f.project.id,
+          'fixture',
+          60_000,
+        ))!;
+        await f.app.reserveExecutionRun(f.admin.id, f.project.id, f.runId, 60_000, controller);
+        f.capacity.enqueue('test', {
+          queue_id: f.runId,
+          run_id: f.runId,
+          project_id: f.project.id,
+          kind: 'script',
+          resources: {},
+          timeout_ms: 5000,
+          created_at: Date.now(),
+        });
+        if (occupied) assert.equal(f.capacity.claimNext('test', 'original').admitted, true);
+        const state = (await f.app.listExecutionReconciliations(f.admin.id, f.project.id))[0]!;
+        const directory = join(f.options.artifacts_directory, f.runId, state.attempt!.id);
+        mkdirSync(directory, { recursive: true });
+        const proofFile = join(directory, 'never-started.json');
+        await writeFile(proofFile, '');
+        await f.app.releaseExecutionController(f.admin.id, f.project.id, controller);
+        const application = new Proxy(f.app, {
+          get(target, key) {
+            if (key === 'recoverExecutionRun')
+              return async (...args: Parameters<typeof target.recoverExecutionRun>) => {
+                assert.equal(await target.recoverExecutionRun(...args), true);
+                throw new Error('Crash after repaired settlement.');
+              };
+            const value = Reflect.get(target, key);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+        await assert.rejects(
+          new ExecutionCompanion({ ...f.options, application }).runOnce(),
+          /Crash after repaired settlement/,
+        );
+        assert.equal(await readFile(proofFile, 'utf8'), '');
+        const repairFile = join(directory, 'never-started-recovered.json');
+        const repaired = await readFile(repairFile, 'utf8');
+        assert.equal(
+          JSON.parse(repaired).capacity.execution_token,
+          f.capacity.inspect('test').entries[0]!.execution_token,
+        );
+        await new ExecutionCompanion(f.options).runOnce();
+        await new ExecutionCompanion(f.options).runOnce();
+        assert.equal(await readFile(proofFile, 'utf8'), '');
+        assert.equal(await readFile(repairFile, 'utf8'), repaired);
+        assert.equal(f.capacity.inspect('test').occupied.script, 0);
+        assert.equal(f.capacity.inspect('test').entries[0]!.state, occupied ? 'settled' : 'cancelled');
+        assert.equal(existsSync(f.marker), false);
+      },
+    );
+
+  for (const settled of [false, true])
+    check(
+      `completes undispatched recovery with already ${settled ? 'settled' : 'cancelled'} capacity`,
+      async (f) => {
+        const controller = (await f.app.acquireExecutionController(
+          f.admin.id,
+          f.project.id,
+          'fixture',
+          60_000,
+        ))!;
+        await f.app.reserveExecutionRun(f.admin.id, f.project.id, f.runId, 60_000, controller);
+        f.capacity.enqueue('test', {
+          queue_id: f.runId,
+          run_id: f.runId,
+          project_id: f.project.id,
+          kind: 'script',
+          resources: {},
+          timeout_ms: 5000,
+          created_at: Date.now(),
+        });
+        if (settled) {
+          const claim = f.capacity.claimNext('test', 'fixture');
+          assert.equal(claim.admitted, true);
+          if (claim.admitted)
+            f.capacity.reconcile(claim.lease, {
+              source: 'fixture',
+              execution_token: claim.request.execution_token!,
+              observed_at: Date.now(),
+              state: 'never_started',
+              script_result: { outcome: 'cancelled', runtime_ms: 0 },
+            });
+        } else f.capacity.cancel('test', f.runId);
+        await f.app.releaseExecutionController(f.admin.id, f.project.id, controller);
+        await new ExecutionCompanion(f.options).runOnce();
+        assert.equal((await f.view()).run.error_code, 'RECOVERED_NOT_DISPATCHED');
+        assert.equal(f.capacity.inspect('test').entries[0]!.state, settled ? 'settled' : 'cancelled');
+        const state = (await f.app.listExecutionReconciliations(f.admin.id, f.project.id, [f.runId]))[0]!;
+        const proof = JSON.parse(
+          await readFile(
+            join(f.options.artifacts_directory, f.runId, state.attempt!.id, 'never-started.json'),
+            'utf8',
+          ),
+        );
+        assert.equal(proof.capacity, null);
+        assert.equal(existsSync(f.marker), false);
+      },
+    );
+
+  for (const dispatched of [false, true])
+    check(
+      `does not fabricate a missing proof after ${dispatched ? 'dispatch intent' : 'terminal settlement'}`,
+      async (f) => {
+        const controller = (await f.app.acquireExecutionController(
+          f.admin.id,
+          f.project.id,
+          'fixture',
+          60_000,
+        ))!;
+        const run = (await f.app.reserveExecutionRun(f.admin.id, f.project.id, f.runId, 60_000, controller))!;
+        f.capacity.enqueue('test', {
+          queue_id: f.runId,
+          run_id: f.runId,
+          project_id: f.project.id,
+          kind: 'script',
+          resources: {},
+          timeout_ms: 5000,
+          created_at: Date.now(),
+        });
+        assert.equal(f.capacity.claimNext('test', 'original').admitted, true);
+        const state = (await f.app.listExecutionReconciliations(f.admin.id, f.project.id))[0]!;
+        const directory = join(f.options.artifacts_directory, f.runId, state.attempt!.id);
+        mkdirSync(directory, { recursive: true });
+        await writeFile(join(directory, 'never-started.json'), '');
+        if (dispatched) {
+          await f.app.startExecutionRun(
+            f.admin.id,
+            f.project.id,
+            f.runId,
+            run.reservation_token!,
+            60_000,
+            controller,
+          );
+        } else {
+          assert.equal(
+            await f.app.recoverExecutionRun(
+              f.admin.id,
+              f.project.id,
+              f.runId,
+              run.reservation_token!,
+              state.attempt!.id,
+              state.attempt!.process_token,
+              { exit_code: null, signal: null, artifacts: [], error_code: 'RECOVERED_NOT_DISPATCHED' },
+              controller,
+            ),
+            true,
+          );
+        }
+        await f.app.releaseExecutionController(f.admin.id, f.project.id, controller);
+        await new ExecutionCompanion(f.options).runOnce();
+        await new ExecutionCompanion(f.options).runOnce();
+        assert.equal(await readFile(join(directory, 'never-started.json'), 'utf8'), '');
+        assert.equal(existsSync(join(directory, 'never-started-recovered.json')), false);
+        assert.equal(f.capacity.inspect('test').occupied.script, 1);
+        assert.equal(existsSync(f.marker), false);
+      },
+    );
+
   for (const cancel of [true, false])
     check(
       `${cancel ? 'cancels' : 'waits without acknowledging running'} before actual spawn while the supervisor awaits its launch transaction`,

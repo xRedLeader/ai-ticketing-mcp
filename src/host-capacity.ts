@@ -47,6 +47,15 @@ const observationSchema = z.strictObject({
   observed_at: timestamp,
   state: z.enum(['terminated', 'never_started']),
 });
+const neverStartedSchema = z.strictObject({
+  host_id: id,
+  queue_id: id,
+  run_id: id,
+  project_id: id,
+  state: z.enum(['queued', 'running', 'reconciling']),
+  execution_token: z.uuid().nullable(),
+});
+export type HostCapacityNeverStartedProof = z.output<typeof neverStartedSchema>;
 
 export type HostCapacityLimits = z.input<typeof hostSchema>;
 export type HostCapacityRequest = z.input<typeof queueSchema> &
@@ -561,6 +570,36 @@ class CapacityLedger extends UsageBudget {
     });
   }
 
+  reconcileNeverStarted(input: HostCapacityNeverStartedProof, observedAt: number) {
+    const proof = neverStartedSchema.parse(input);
+    timestamp.parse(observedAt);
+    return this.transaction(() => {
+      const host = this.host(proof.host_id);
+      const entry = host.entries.find((entry) => entry.queue_id === proof.queue_id);
+      if (
+        !entry ||
+        entry.kind !== 'script' ||
+        entry.run_id !== proof.run_id ||
+        entry.project_id !== proof.project_id ||
+        entry.execution_token !== proof.execution_token ||
+        (proof.state === 'queued' ? proof.execution_token !== null : proof.execution_token === null) ||
+        !(entry.state === proof.state || (proof.state === 'running' && entry.state === 'reconciling'))
+      )
+        return { released: false };
+      if (entry.state === 'queued') {
+        this.cancel(proof.host_id, proof.queue_id);
+        return { released: true };
+      }
+      return this.reconcile(entry.lease!, {
+        source: 'execution-companion-recovery',
+        execution_token: proof.execution_token!,
+        observed_at: observedAt,
+        state: 'never_started',
+        script_result: { outcome: 'cancelled', runtime_ms: 0 },
+      });
+    });
+  }
+
   inspect(hostId: string) {
     return this.transaction(() => {
       const host = this.host(hostId),
@@ -643,6 +682,9 @@ export class HostCapacity {
   }
   reconcile(lease: HostCapacityLease, observation: HostCapacityObservation) {
     return this.ledger.reconcile(lease, observation);
+  }
+  reconcileNeverStarted(proof: HostCapacityNeverStartedProof, observedAt: number) {
+    return this.ledger.reconcileNeverStarted(proof, observedAt);
   }
   inspect(hostId: string) {
     return this.ledger.inspect(hostId);

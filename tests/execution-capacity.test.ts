@@ -1,5 +1,6 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -73,6 +74,88 @@ it('scoped admission waits for an earlier eligible script outside its IDs rather
     );
     assert.equal(capacity.inspect('host').occupied.script, 0);
     assert.ok(capacity.inspect('host').entries.every((entry) => entry.state === 'queued'));
+  } finally {
+    f.dispose();
+  }
+});
+
+it('never-started proof cannot release a queued entry claimed in the same millisecond', () => {
+  const f = fixture(),
+    capacity = f.capacity;
+  const originalNow = Date.now;
+  try {
+    const now = Date.now();
+    Date.now = () => now;
+    capacity.configureHost('host');
+    capacity.enqueue('host', {
+      queue_id: 'queue',
+      run_id: 'run',
+      project_id: 'project',
+      kind: 'script',
+      created_at: now,
+    });
+    const entry = capacity.inspect('host').entries[0]!;
+    const proof = {
+      host_id: 'host',
+      queue_id: entry.queue_id,
+      run_id: entry.run_id,
+      project_id: entry.project_id,
+      state: 'queued' as const,
+      execution_token: entry.execution_token,
+    };
+    const claim = capacity.claimNext('host', 'dispatcher');
+    assert.equal(claim.admitted, true);
+    assert.deepEqual(capacity.reconcileNeverStarted(proof, now), { released: false });
+    assert.equal(capacity.inspect('host').occupied.script, 1);
+    if (claim.admitted) assert.deepEqual(capacity.inspect('host').entries[0]!.lease, claim.lease);
+  } finally {
+    Date.now = originalNow;
+    f.dispose();
+  }
+});
+
+it('never-started cleanup matches host/run/project/token and allows running to reconciling once', () => {
+  const f = fixture(),
+    capacity = f.capacity;
+  try {
+    for (const host of ['host', 'other']) {
+      capacity.configureHost(host);
+      capacity.enqueue(host, {
+        queue_id: 'queue',
+        run_id: 'run',
+        project_id: 'project',
+        kind: 'script',
+        created_at: Date.now(),
+      });
+      assert.equal(capacity.claimNext(host, 'dispatcher').admitted, true);
+    }
+    const entry = capacity.inspect('host').entries[0]!;
+    const proof = {
+      host_id: 'host',
+      queue_id: entry.queue_id,
+      run_id: entry.run_id,
+      project_id: entry.project_id,
+      state: 'running' as const,
+      execution_token: entry.execution_token,
+    };
+    for (const mismatch of [
+      { host_id: 'other' },
+      { queue_id: 'other' },
+      { run_id: 'other' },
+      { project_id: 'other' },
+      { execution_token: randomUUID() },
+      { state: 'queued' as const },
+    ])
+      assert.deepEqual(capacity.reconcileNeverStarted({ ...proof, ...mismatch }, Date.now()), {
+        released: false,
+      });
+    assert.equal(capacity.inspect('host').occupied.script, 1);
+    capacity.cancel('host', 'queue');
+    assert.equal(capacity.inspect('host').entries[0]!.state, 'reconciling');
+    assert.deepEqual(capacity.reconcileNeverStarted(proof, Date.now()), { released: true });
+    assert.deepEqual(capacity.reconcileNeverStarted(proof, Date.now()), { released: false });
+    assert.equal(capacity.inspect('host').occupied.script, 0);
+    assert.equal(capacity.inspect('other').occupied.script, 1);
   } finally {
     f.dispose();
   }

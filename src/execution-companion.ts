@@ -13,7 +13,7 @@ import {
   type ExecutionProcessIdentity,
   type ExecutionReconciliation,
 } from './contracts.js';
-import { HostCapacity } from './host-capacity.js';
+import { HostCapacity, type HostCapacityNeverStartedProof } from './host-capacity.js';
 import { ExecutionRecipeRegistry } from './execution-recipes.js';
 import { durableExecutionFile, executionProcessIdentity, readExecutionFile } from './execution-journal.js';
 import type { ExecutionLaunch, ExecutionManifest } from './execution-supervisor.js';
@@ -56,13 +56,7 @@ type ResultJournal = ExecutionOutcome & {
   spawned?: boolean;
 };
 type NeverStartedJournal = ResultJournal & {
-  capacity: {
-    host_id: string;
-    queue_id: string;
-    run_id: string;
-    project_id: string;
-    execution_token: string | null;
-  } | null;
+  capacity: HostCapacityNeverStartedProof | null;
 };
 
 /** One renewable controller per store; recovered attempts are inspected, never relaunched. */
@@ -432,9 +426,9 @@ export class ExecutionCompanion {
         result?.cleanup_verified &&
         JSON.stringify(this.outcome(result)) === JSON.stringify(this.outcome(original.run))
       ) {
-        const entry = capacity.inspect(host).entries.find((entry) => entry.queue_id === original.run.id);
-        if (proof && entry?.state === 'queued') capacity.cancel(host, original.run.id);
-        else this.releaseCapacity(original.run.id, result);
+        if (result.error_code === 'RECOVERED_NOT_DISPATCHED') {
+          if (proof?.capacity) capacity.reconcileNeverStarted(proof.capacity, proof.finished_at);
+        } else this.releaseCapacity(original.run.id, result);
       }
       return;
     }
@@ -442,7 +436,7 @@ export class ExecutionCompanion {
     if (!state?.attempt) return;
     const directory = join(this.directory, state.run.id, state.attempt.id);
     const result = this.result(state, directory) ?? this.legacyResult(state);
-    if (result?.cleanup_verified) {
+    if (result?.cleanup_verified && result.error_code !== 'RECOVERED_NOT_DISPATCHED') {
       if (
         await app.recoverExecutionRun(
           actor,
@@ -458,7 +452,7 @@ export class ExecutionCompanion {
         this.releaseCapacity(state.run.id, result);
       return;
     }
-    if (state.next_step === 'dispatch') {
+    if (state.run.status === 'reserved' && state.next_step === 'dispatch') {
       const outcome = {
         exit_code: null,
         signal: null,
@@ -466,9 +460,23 @@ export class ExecutionCompanion {
         error_code: 'RECOVERED_NOT_DISPATCHED',
       };
       mkdirSync(directory, { recursive: true, mode: 0o700 });
-      if (!existsSync(join(directory, 'never-started.json'))) {
+      let proof = this.neverStarted(state, directory);
+      if (!proof) {
         const entry = capacity.inspect(host).entries.find((entry) => entry.queue_id === state.run.id);
-        durableExecutionFile(join(directory, 'never-started.json'), {
+        if (
+          entry &&
+          (entry.kind !== 'script' ||
+            entry.run_id !== state.run.id ||
+            entry.project_id !== state.run.project_id)
+        )
+          return;
+        const active = entry && ['queued', 'running', 'reconciling'].includes(entry.state) ? entry : null;
+        // Legacy torn journals stay untouched; only the database's undispatched fence permits repair.
+        const filename = existsSync(join(directory, 'never-started.json'))
+          ? 'never-started-recovered.json'
+          : 'never-started.json';
+        if (existsSync(join(directory, filename))) return;
+        durableExecutionFile(join(directory, filename), {
           run_id: state.run.id,
           attempt_id: state.attempt.id,
           process_token: state.attempt.process_token,
@@ -478,19 +486,20 @@ export class ExecutionCompanion {
           finished_at: Date.now(),
           cleanup_verified: true,
           spawned: false,
-          capacity: entry
+          capacity: active
             ? {
                 host_id: host,
-                queue_id: entry.queue_id,
-                run_id: entry.run_id,
-                project_id: entry.project_id,
-                execution_token: entry.execution_token,
+                queue_id: active.queue_id,
+                run_id: active.run_id,
+                project_id: active.project_id,
+                state: active.state as HostCapacityNeverStartedProof['state'],
+                execution_token: active.execution_token,
               }
             : null,
         } satisfies NeverStartedJournal);
       }
-      const proof = this.neverStarted(state, directory);
-      ensure(proof, 'CONFLICT', 'Never-started capacity proof is missing or does not match this attempt.');
+      proof = this.neverStarted(state, directory);
+      if (!proof) return;
       if (
         await app.recoverExecutionRun(
           actor,
@@ -503,9 +512,7 @@ export class ExecutionCompanion {
           controller,
         )
       ) {
-        const entry = capacity.inspect(host).entries.find((entry) => entry.queue_id === state.run.id);
-        if (entry?.state === 'queued') capacity.cancel(host, state.run.id);
-        else this.releaseCapacity(state.run.id, proof);
+        if (proof.capacity) capacity.reconcileNeverStarted(proof.capacity, proof.finished_at);
       }
       return;
     }
@@ -523,31 +530,44 @@ export class ExecutionCompanion {
     );
   }
   private neverStarted(state: ExecutionReconciliation, directory: string): NeverStartedJournal | null {
-    const proof = this.journal(directory, 'never-started.json');
-    if (
-      !this.matches(state, proof) ||
-      !this.validResult(proof) ||
-      proof.cleanup_verified !== true ||
-      proof.spawned !== false ||
-      proof.started_at !== 0 ||
-      proof.error_code !== 'RECOVERED_NOT_DISPATCHED' ||
-      proof.exit_code !== null ||
-      proof.signal !== null ||
-      proof.artifacts.length !== 0
-    )
-      return null;
-    const { capacity, host_id: host } = this.options;
-    const entry = capacity.inspect(host).entries.find((entry) => entry.queue_id === state.run.id);
-    const never = proof as NeverStartedJournal;
-    if (!entry) return never.capacity === null ? never : null;
-    if (entry.run_id !== state.run.id || entry.project_id !== state.run.project_id) return null;
-    return never.capacity?.host_id === host &&
-      never.capacity.queue_id === entry.queue_id &&
-      never.capacity.run_id === entry.run_id &&
-      never.capacity.project_id === entry.project_id &&
-      never.capacity.execution_token === entry.execution_token
-      ? never
-      : null;
+    for (const name of ['never-started.json', 'never-started-recovered.json']) {
+      const proof = this.journal(directory, name);
+      if (
+        !this.matches(state, proof) ||
+        !this.validResult(proof) ||
+        proof.cleanup_verified !== true ||
+        proof.spawned !== false ||
+        proof.started_at !== 0 ||
+        proof.error_code !== 'RECOVERED_NOT_DISPATCHED' ||
+        proof.exit_code !== null ||
+        proof.signal !== null ||
+        proof.artifacts.length !== 0
+      )
+        continue;
+      const { host_id: host } = this.options;
+      const never = proof as NeverStartedJournal;
+      if (never.capacity === null) return never;
+      const capacity = never.capacity;
+      if (
+        capacity?.host_id !== host ||
+        capacity.queue_id !== state.run.id ||
+        capacity.run_id !== state.run.id ||
+        capacity.project_id !== state.run.project_id ||
+        !(
+          capacity.execution_token === null ||
+          (typeof capacity.execution_token === 'string' &&
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+              capacity.execution_token,
+            ))
+        )
+      )
+        continue;
+      // Earlier immutable proofs encoded queued/occupied state in their nullable execution token.
+      const expectedState = capacity.state ?? (capacity.execution_token === null ? 'queued' : 'running');
+      if (!['queued', 'running', 'reconciling'].includes(expectedState)) continue;
+      return { ...never, capacity: { ...capacity, state: expectedState } };
+    }
+    return null;
   }
   private legacyResult(state: ExecutionReconciliation): ResultJournal | null {
     const directory = join(this.directory, state.run.id);

@@ -78,6 +78,8 @@ Timeout, cancellation, native signals and unverified cleanup retain occupied cap
 
 ## Restart and the next safe step
 
+Journals publish a fully written, fsynced temporary file without replacing existing evidence. Never-started cleanup matches the proof's host, queue, run, project, state and execution token in one capacity transaction; a later admission remains occupied. A legacy torn `never-started.json` can gain an immutable `never-started-recovered.json` only while the database still proves the attempt is reserved and undispatched. Terminal attempts without a valid proof retain capacity for manual investigation.
+
 `run_get.reconciliation` exposes `state` (`queued`, `running`, `completed`, `unresolved`), `attempt_id`, and `next_step` through both PostgreSQL and SQLite. The trusted `listExecutionReconciliations` API provides the same state together with the immutable attempt and latest observation. Restart inspects at most 100 active runs plus 100 queued or occupied script entries for its project per pass; unchanged observations do not append rows on every poll.
 
 | Durable evidence                                            | Recovery action / next step                                                                                    |
