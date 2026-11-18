@@ -252,7 +252,7 @@ function validEvent(value: any): value is Event {
   );
 }
 
-/** Reads only the opted-in recording directory. Output contains no captured content or identifiers. */
+/** Reads only the selected recording directory. Output contains no captured content or identifiers. */
 export async function analyzeProfile(directory: string): Promise<ProfileReport> {
   const metadataBytes = await readFile(join(directory, 'run.json'));
   if (!isUtf8(metadataBytes)) throw new Error('Profile run metadata is invalid.');

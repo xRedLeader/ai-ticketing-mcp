@@ -43,12 +43,9 @@ async function input() {
   );
 }
 async function capture(env: NodeJS.ProcessEnv) {
-  ensure(
-    ['true', 'false'].includes(env.MCP_PROFILE_CAPTURE ?? 'false'),
-    'INVALID_CONFIG',
-    'MCP_PROFILE_CAPTURE must be true or false.',
-  );
-  if (env.MCP_PROFILE_CAPTURE !== 'true') return undefined;
+  const enabled = env.MCP_PROFILE_CAPTURE ?? 'true';
+  ensure(['true', 'false'].includes(enabled), 'INVALID_CONFIG', 'MCP_PROFILE_CAPTURE must be true or false.');
+  if (enabled === 'false') return undefined;
   const { createProfileRecorder } = await import('./profiling.js');
   const number = (key: string) => {
     if (env[key] === undefined) return undefined;
@@ -77,7 +74,7 @@ async function capture(env: NodeJS.ProcessEnv) {
 async function main() {
   if (command === 'help') {
     process.stdout.write(
-      `ai-ticketing commands:\n  migrate                 Apply migrations and prepare the configured search profile\n  actor --issuer --subject --name --kind [--admin]   Register an identity (trusted operator)\n  call --actor ID --operation NAME --input-file FILE   Execute as a trusted local operator\n  call --url URL --token-env ACCESS_TOKEN --operation NAME --input-file FILE   Authenticated remote call\n  serve                   Serve authenticated HTTP MCP\n  stdio [--profile NAME]  Local MCP; worker (default), planner, reviewer, full (actor required outside SQLite)\n  worker [--once]          Process durable indexing and configured webhook deliveries\n  reindex --actor ID --project ID   Rebuild project search indexes\n  inspect --actor ID --project ID   Inspect project and queue metrics\n  profile-report --input DIR --output FILE   Analyze captured MCP traffic offline\n\nUse --sqlite PATH for local storage; SQLite stdio initializes its agent and indexing automatically.\nUse --input JSON instead of --input-file for short inputs. Secrets belong in environment variables.\nSet MCP_PROFILE_CAPTURE=true to capture raw MCP payloads locally without adding model-visible output.\n`,
+      `ai-ticketing commands:\n  migrate                 Apply migrations and prepare the configured search profile\n  actor --issuer --subject --name --kind [--admin]   Register an identity (trusted operator)\n  call --actor ID --operation NAME --input-file FILE   Execute as a trusted local operator\n  call --url URL --token-env ACCESS_TOKEN --operation NAME --input-file FILE   Authenticated remote call\n  serve                   Serve authenticated HTTP MCP\n  stdio [--profile NAME]  Local MCP; worker (default), planner, reviewer, full (actor required outside SQLite)\n  worker [--once]          Process durable indexing and configured webhook deliveries\n  reindex --actor ID --project ID   Rebuild project search indexes\n  inspect --actor ID --project ID   Inspect project and queue metrics\n  profile-report --input DIR --output FILE   Analyze captured MCP traffic offline\n\nUse --sqlite PATH for local storage; SQLite stdio initializes its agent and indexing automatically.\nUse --input JSON instead of --input-file for short inputs. Secrets belong in environment variables.\nMCP capture is on by default; set MCP_PROFILE_CAPTURE=false to opt out. Raw payloads stay local without model-visible output.\n`,
     );
     return;
   }
