@@ -3,6 +3,7 @@ import { serializeSuccessEnvelope } from '../src/envelope.js';
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { artifactIdentity } from '../src/execution-artifacts.js';
+import { verifiedRecoveryEvidence } from '../src/verification-pipeline.js';
 
 export function createMaintenanceLedger(path: string) {
   writeFileSync(path, '', { flag: 'wx', mode: 0o600 });
@@ -255,7 +256,8 @@ export function observeArtifactEvidence(item: any, args: any, data: any) {
                   step.signal === null &&
                   step.error_code === null &&
                   Array.isArray(step.blocked_by) &&
-                  step.blocked_by.length === 0,
+                  step.blocked_by.length === 0 &&
+                  verifiedRecoveryEvidence(step),
               )));
       } catch {
         unverified = true;

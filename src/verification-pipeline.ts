@@ -21,6 +21,88 @@ export const recoveryFailureSchema = z.strictObject({
   effects: z.enum(['none', 'unknown']),
   approval_required: z.boolean(),
 });
+const recoveryAttempt = z.object({
+  number: z.number().int(),
+  runtime_ms: z.number().nonnegative(),
+  status: z.string(),
+  error_code: z.string().nullable(),
+  exit_code: z.number().int(),
+  signal: z.null(),
+  diagnostics: z.json(),
+  stderr_proof: z.object({
+    encoding: z.literal('base64'),
+    data: z.string().max(684),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    complete: z.boolean(),
+  }),
+});
+const recoveryEvidence = z.object({
+  attempts: z.array(recoveryAttempt).min(1).max(2),
+  recovery: recovery.extend({
+    budget_ms: z.number().positive(),
+    max_attempts: z.literal(2),
+    state: z.enum(['not_needed', 'recovered']),
+    stop_reason: z.null(),
+  }),
+  diagnostics: z.json(),
+});
+
+export function verifiedRecoveryEvidence(
+  step: { attempts?: unknown; recovery?: unknown; diagnostics?: unknown },
+  expected?: z.output<typeof recovery> & { budget_ms: number },
+) {
+  if (step.attempts === undefined && step.recovery === undefined) return expected === undefined;
+  const evidence = recoveryEvidence.safeParse(step);
+  if (!evidence.success) return false;
+  const { attempts, recovery: declaration, diagnostics } = evidence.data;
+  if (
+    expected &&
+    Object.entries(expected).some(([key, value]) => declaration[key as keyof typeof declaration] !== value)
+  )
+    return false;
+  if (attempts.length !== (declaration.state === 'recovered' ? 2 : 1)) return false;
+  if (attempts.reduce((elapsed, attempt) => elapsed + attempt.runtime_ms, 0) > declaration.budget_ms)
+    return false;
+  const proof = attempts.map(({ stderr_proof }) => {
+    const bytes = Buffer.from(stderr_proof.data, 'base64');
+    return bytes.length <= 512 &&
+      bytes.toString('base64') === stderr_proof.data &&
+      createHash('sha256').update(bytes).digest('hex') === stderr_proof.sha256
+      ? bytes
+      : null;
+  });
+  if (proof.some((bytes) => bytes === null)) return false;
+  const last = attempts.at(-1)!;
+  if (
+    last.number !== attempts.length ||
+    last.status !== 'passed' ||
+    last.error_code !== null ||
+    last.exit_code !== 0 ||
+    digest(last.diagnostics) !== digest(diagnostics)
+  )
+    return false;
+  if (declaration.state === 'not_needed') return true;
+  const first = attempts[0]!;
+  if (
+    first.number !== 1 ||
+    first.status !== 'failed' ||
+    first.error_code !== 'EXIT_FAILED' ||
+    first.exit_code !== declaration.exit_code ||
+    !first.stderr_proof.complete
+  )
+    return false;
+  try {
+    const failure = recoveryFailureSchema.safeParse(JSON.parse(proof[0]!.toString('utf8')));
+    return (
+      failure.success &&
+      failure.data.signature === declaration.signature &&
+      failure.data.effects === 'none' &&
+      !failure.data.approval_required
+    );
+  } catch {
+    return false;
+  }
+}
 export const verificationPipelineSchema = z.strictObject({
   id,
   cacheable: z.literal(true).optional(),

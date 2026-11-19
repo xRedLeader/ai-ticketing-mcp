@@ -836,9 +836,25 @@ it('settles one admitted run with a registered recovery and publishes both attem
       pending: null,
       unverified: false,
     });
+    const delivered = JSON.parse(Buffer.from(independent.range.data, 'base64').toString());
+    assert.deepEqual(delivered.verification, outcome.verification);
+    delivered.verification.steps[0].recovery.signature = 'UNREGISTERED';
+    const contradiction = Buffer.from(JSON.stringify(delivered));
+    const sha256 = createHash('sha256').update(contradiction).digest('hex');
     assert.deepEqual(
-      JSON.parse(Buffer.from(independent.range.data, 'base64').toString()).verification,
-      outcome.verification,
+      observeArtifactEvidence(reference, reference.arguments, {
+        ...independent,
+        sha256,
+        size_bytes: contradiction.length,
+        total_bytes: contradiction.length,
+        range: {
+          ...independent.range,
+          sha256,
+          data: contradiction.toString('base64'),
+          returned_length: contradiction.length,
+        },
+      }),
+      { pending: null, unverified: true },
     );
   } finally {
     capacity.close();

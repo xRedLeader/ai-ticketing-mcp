@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { ensure, type ExecutionAttempt, type ExecutionCacheHit, type ExecutionJob } from './contracts.js';
 import { ExecutionArtifacts } from './execution-artifacts.js';
-import type { VerificationPipeline } from './verification-pipeline.js';
+import { verifiedRecoveryEvidence, type VerificationPipeline } from './verification-pipeline.js';
 
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
@@ -90,7 +90,12 @@ export function inspectVerificationCache(
                 result.signal === null &&
                 result.error_code === null &&
                 Array.isArray(result.blocked_by) &&
-                result.blocked_by.length === 0
+                result.blocked_by.length === 0 &&
+                (step.recovery || (!result.recovery && !result.attempts)) &&
+                verifiedRecoveryEvidence(
+                  result,
+                  step.recovery && { ...step.recovery, budget_ms: step.command.timeout_ms },
+                )
               );
             }),
           'INVALID_ARTIFACT',
