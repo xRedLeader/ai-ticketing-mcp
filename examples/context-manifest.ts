@@ -9,6 +9,7 @@ import { schemas } from '../src/schemas.js';
 type Arguments = Record<string, unknown>;
 interface Context extends Record<string, unknown> {
   fingerprint: string;
+  authorization_binding: string;
   not_modified: false;
   ticket: Ticket;
   omitted: {
@@ -54,7 +55,11 @@ export function createContextManifest(client: Client) {
       );
   };
   const call = async (operation: string, args: Arguments): Promise<any> => {
-    const response = await client.callTool({ name: operation, arguments: args });
+    const response = await client.callTool({
+      name: operation,
+      arguments: args,
+      _meta: { 'ticketing/context-manifest': true },
+    });
     const envelope = response.structuredContent as any;
     ensure(
       envelope && typeof envelope.ok === 'boolean',
@@ -81,11 +86,18 @@ export function createContextManifest(client: Client) {
             ...args,
             ...(previous ? { if_none_match: previous.context.fingerprint } : {}),
           }),
-        ) as Context | { fingerprint: string; not_modified: true };
+        ) as Context | { fingerprint: string; not_modified: true; authorization_binding?: string };
+        ensure(
+          /^[a-f0-9]{64}$/.test(context.authorization_binding ?? ''),
+          'INVALID_RESPONSE',
+          'Context requires a server authorization binding.',
+        );
         if (context.not_modified) {
           connected();
           ensure(
-            previous && context.fingerprint === previous.context.fingerprint,
+            previous &&
+              context.fingerprint === previous.context.fingerprint &&
+              context.authorization_binding === previous.context.authorization_binding,
             'MISSING_CONTEXT',
             'A conditional response requires the exact retained packet.',
           );
@@ -103,6 +115,12 @@ export function createContextManifest(client: Client) {
           for (;;) {
             const operation = omission.retrieve_with as 'checkpoint_get' | 'ticket_history';
             const data = resultSchemas[operation].parse(await call(operation, args));
+            ensure(
+              (data as { authorization_binding?: string }).authorization_binding ===
+                context.authorization_binding,
+              'CONTEXT_CHANGED',
+              'Required context was read under different authorization.',
+            );
             if (operation === 'checkpoint_get') {
               const checkpoint = data as Note;
               ensure(
@@ -126,10 +144,26 @@ export function createContextManifest(client: Client) {
           }
         }
         connected();
+        if (packet.retrieved.length) {
+          const current = resultSchemas.ticket_context.parse(
+            await call('ticket_context', {
+              ...args,
+              if_none_match: context.fingerprint,
+            }),
+          ) as { not_modified: boolean; fingerprint: string; authorization_binding?: string };
+          connected();
+          ensure(
+            current.not_modified &&
+              current.fingerprint === context.fingerprint &&
+              current.authorization_binding === context.authorization_binding,
+            'CONTEXT_CHANGED',
+            'Requirements or authorization changed while recovering context. Read again.',
+          );
+        }
         retained.set(key, serializeSuccessEnvelope(packet));
         return packet;
       } catch (error) {
-        retained.delete(key);
+        retained.clear();
         throw error;
       }
     },

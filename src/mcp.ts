@@ -1,4 +1,4 @@
-import { McpServer, ResourceTemplate } from '@modelcontextprotocol/server';
+import { McpServer, ResourceTemplate, type ServerContext } from '@modelcontextprotocol/server';
 import type { Application } from './application.js';
 import { DomainError, ensure } from './contracts.js';
 import { schemas, descriptions, readOperations } from './schemas.js';
@@ -49,7 +49,7 @@ export function createMcpServer(app: Application, principal: Principal, profile:
             operation === 'search' || operation === 'ticket_context' || operation === 'ticket_github_refresh',
         },
       },
-      async (input: unknown) => {
+      async (input: unknown, context: ServerContext) => {
         app.recordReferenceTokens?.('request', JSON.stringify({ operation, input }));
         try {
           requireRead();
@@ -59,7 +59,13 @@ export function createMcpServer(app: Application, principal: Principal, profile:
               'INSUFFICIENT_SCOPE',
               'ticketing:write scope is required.',
             );
-          const result = await app.execute(principal.actorId, operation, input, profile);
+          const result = await app.execute(
+            principal.actorId,
+            operation,
+            input,
+            profile,
+            context.mcpReq._meta?.['ticketing/context-manifest'] === true,
+          );
           const text = serializeSuccessEnvelope(result);
           app.recordReferenceTokens?.('result', text);
           return {

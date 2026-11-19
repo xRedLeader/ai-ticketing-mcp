@@ -118,6 +118,13 @@ function canonical(value: unknown): string {
   return JSON.stringify(value);
 }
 const digest = (value: unknown) => createHash('sha256').update(canonical(value)).digest('hex');
+const authorizationBinding = (actor: Actor, projectId: string, role: Role | null, profile?: McpProfile) =>
+  digest({
+    actor: { id: actor.id, kind: actor.kind, system_admin: actor.system_admin },
+    project_id: projectId,
+    role,
+    profile: profile ?? null,
+  });
 export class Application {
   readonly storage: StorageAdapter;
   readonly searchAdapter: SearchAdapter;
@@ -2514,6 +2521,7 @@ export class Application {
     operation: Operation,
     raw: unknown,
     viewerProfile?: McpProfile,
+    bindContext = false,
   ): Promise<unknown> {
     const started = performance.now();
     this.metrics.requests++;
@@ -2525,7 +2533,10 @@ export class Application {
           issues: result.error.issues,
         });
       if (readOperations.has(operation))
-        return this.result(operation, await this.read(actorId, operation, result.data, viewerProfile));
+        return this.result(
+          operation,
+          await this.read(actorId, operation, result.data, viewerProfile, bindContext),
+        );
       return await this.dispatch(actorId, operation, result.data);
     } catch (error) {
       this.metrics.errors++;
@@ -3575,11 +3586,12 @@ export class Application {
     operation: Operation,
     input: any,
     viewerProfile?: McpProfile,
+    bindContext = false,
   ): Promise<unknown> {
     if (operation === 'run_wait') {
       const deadline = performance.now() + input.timeout_ms;
       for (;;) {
-        const result = (await this.read(actorId, 'run_get', input, viewerProfile)) as {
+        const result = (await this.read(actorId, 'run_get', input, viewerProfile, bindContext)) as {
           run: { status: string };
           reconciliation: { state: string };
         };
@@ -3652,12 +3664,12 @@ export class Application {
           input.offset,
           input.length,
         );
-        artifact.authorization_binding = digest({
-          actor: { id: actor.id, kind: actor.kind, system_admin: actor.system_admin },
-          project_id: input.project_id,
-          role: member?.role ?? null,
-          profile: viewerProfile ?? null,
-        });
+        artifact.authorization_binding = authorizationBinding(
+          actor,
+          input.project_id,
+          member?.role ?? null,
+          viewerProfile,
+        );
         return packArtifactRange(artifact, input.max_tokens, (value) => this.responseTokens(value));
       });
     if (operation === 'run_timeline') return this.executionTimeline(actorId, input);
@@ -3781,16 +3793,31 @@ export class Application {
       const snapshot = await this.storage.readSnapshot(async (reader) => {
         const actor = await this.actor(actorId, reader);
         const project = await this.access(reader, actor, input.project_id);
-        return this.collectContext(
-          reader,
-          actor,
-          project,
-          input,
-          viewerProfile === 'reviewer' ? 'reviewer' : undefined,
-        );
+        return this.collectContext(reader, actor, project, input, viewerProfile, bindContext);
       });
       return this.packContext(snapshot, input);
     }
+    if (bindContext && viewerProfile && ['checkpoint_get', 'ticket_history'].includes(operation))
+      return this.storage.readSnapshot(async (reader) => {
+        const actor = await this.actor(actorId, reader);
+        const project = await this.access(reader, actor, input.project_id);
+        const member = await reader.get('members', `${project.id}:${actor.id}`);
+        let data: unknown;
+        if (operation === 'ticket_history') data = await this.ticketHistory(reader, project, input);
+        else {
+          const note = await reader.get('notes', input.checkpoint_id);
+          ensure(
+            note && note.project_id === project.id && note.kind === 'checkpoint',
+            'NOT_FOUND',
+            'Checkpoint not found.',
+          );
+          data = note;
+        }
+        return {
+          ...(data as object),
+          authorization_binding: authorizationBinding(actor, project.id, member?.role ?? null, viewerProfile),
+        };
+      });
     const actor = await this.actor(actorId);
     if (operation === 'project_list') {
       if (actor.system_admin)
@@ -3854,93 +3881,12 @@ export class Application {
           actor,
         );
       case 'ticket_history': {
-        const ticket = await this.ticket(this.storage, project.id, input.ticket_id);
         if (['checkpoints', 'executions', 'changes'].includes(input.kind))
           return this.storage.readSnapshot(async (reader) => {
             await this.access(reader, await this.actor(actorId, reader), project.id);
-            const pageInput = { limit: input.limit + 1, offset: input.offset };
-            const where = { project_id: project.id, ...(input.item_id ? { id: input.item_id } : {}) };
-            const rows =
-              input.kind === 'changes'
-                ? await reader.find('events', {
-                    ...pageInput,
-                    where: {
-                      ...where,
-                      entity_id: ticket.id,
-                      seq: { gt: input.after_sequence ?? 0 },
-                      type: { in: resumeChangeTypes },
-                    },
-                    order: [{ field: 'seq', direction: 'desc' }],
-                  })
-                : input.kind === 'executions'
-                  ? await reader.find('execution_jobs', {
-                      ...pageInput,
-                      where: { ...where, ticket_id: ticket.id },
-                      order: [
-                        { field: 'created_at', direction: 'desc' },
-                        { field: 'id', direction: 'desc' },
-                      ],
-                    })
-                  : await reader.find('notes', {
-                      ...pageInput,
-                      where: { ...where, ticket_id: ticket.id, kind: 'checkpoint' },
-                      order: [
-                        { field: 'ticket_revision', direction: 'desc' },
-                        { field: 'id', direction: 'desc' },
-                      ],
-                    });
-            const page = rows.slice(0, input.limit);
-            return {
-              items:
-                input.kind === 'executions'
-                  ? await Promise.all(page.map((run) => this.executionResume(reader, run as ExecutionJob)))
-                  : page,
-              has_more: rows.length > input.limit,
-              next_offset: input.offset + page.length,
-            };
+            return this.ticketHistory(reader, project, input);
           });
-        if (input.kind === 'github') {
-          const latest = await this.githubEvidence(this.storage, ticket);
-          const items = await this.storage.find('github_evidence', {
-            where: {
-              project_id: project.id,
-              ticket_id: ticket.id,
-              ...(input.item_id ? { id: input.item_id } : {}),
-            },
-            order: [
-              { field: 'ticket_revision', direction: 'desc' },
-              { field: 'id', direction: 'desc' },
-            ],
-            limit: input.limit,
-            offset: input.offset,
-          });
-          return { items: items.map((row) => this.githubView(row, ticket, latest?.id)) };
-        }
-        if (input.nonblocking_unanswered)
-          return {
-            items: await this.storage.unansweredQuestions(
-              project.id,
-              ticket.id,
-              false,
-              input.limit,
-              input.offset,
-            ),
-          };
-        return {
-          items: await this.storage.find(input.kind as 'notes' | 'submissions' | 'reviews', {
-            where: {
-              project_id: project.id,
-              ticket_id: ticket.id,
-              ...(input.item_id ? { id: input.item_id } : {}),
-            },
-            order: [
-              { field: 'ticket_revision', direction: 'desc' },
-              { field: 'id', direction: 'desc' },
-            ],
-            limit: input.limit,
-            offset: input.offset,
-          }),
-        };
+        return this.ticketHistory(this.storage, project, input);
       }
       case 'work_next': {
         if (input.mode === 'execution') {
@@ -4218,6 +4164,87 @@ export class Application {
       degraded = 'Semantic indexing is incomplete; full-text results remain available.';
     return { results, degraded, coverage, index_consistency: 'eventual' };
   }
+  private async ticketHistory(reader: Reader, project: Project, input: Input<'ticket_history'>) {
+    const ticket = await this.ticket(reader, project.id, input.ticket_id);
+    if (['checkpoints', 'executions', 'changes'].includes(input.kind)) {
+      const pageInput = { limit: input.limit + 1, offset: input.offset };
+      const where = { project_id: project.id, ...(input.item_id ? { id: input.item_id } : {}) };
+      const rows =
+        input.kind === 'changes'
+          ? await reader.find('events', {
+              ...pageInput,
+              where: {
+                ...where,
+                entity_id: ticket.id,
+                seq: { gt: input.after_sequence ?? 0 },
+                type: { in: resumeChangeTypes },
+              },
+              order: [{ field: 'seq', direction: 'desc' }],
+            })
+          : input.kind === 'executions'
+            ? await reader.find('execution_jobs', {
+                ...pageInput,
+                where: { ...where, ticket_id: ticket.id },
+                order: [
+                  { field: 'created_at', direction: 'desc' },
+                  { field: 'id', direction: 'desc' },
+                ],
+              })
+            : await reader.find('notes', {
+                ...pageInput,
+                where: { ...where, ticket_id: ticket.id, kind: 'checkpoint' },
+                order: [
+                  { field: 'ticket_revision', direction: 'desc' },
+                  { field: 'id', direction: 'desc' },
+                ],
+              });
+      const page = rows.slice(0, input.limit);
+      return {
+        items:
+          input.kind === 'executions'
+            ? await Promise.all(page.map((run) => this.executionResume(reader, run as ExecutionJob)))
+            : page,
+        has_more: rows.length > input.limit,
+        next_offset: input.offset + page.length,
+      };
+    }
+    if (input.kind === 'github') {
+      const latest = await this.githubEvidence(reader, ticket);
+      const items = await reader.find('github_evidence', {
+        where: {
+          project_id: project.id,
+          ticket_id: ticket.id,
+          ...(input.item_id ? { id: input.item_id } : {}),
+        },
+        order: [
+          { field: 'ticket_revision', direction: 'desc' },
+          { field: 'id', direction: 'desc' },
+        ],
+        limit: input.limit,
+        offset: input.offset,
+      });
+      return { items: items.map((row) => this.githubView(row, ticket, latest?.id)) };
+    }
+    if (input.nonblocking_unanswered)
+      return {
+        items: await reader.unansweredQuestions(project.id, ticket.id, false, input.limit, input.offset),
+      };
+    return {
+      items: await reader.find(input.kind as 'notes' | 'submissions' | 'reviews', {
+        where: {
+          project_id: project.id,
+          ticket_id: ticket.id,
+          ...(input.item_id ? { id: input.item_id } : {}),
+        },
+        order: [
+          { field: 'ticket_revision', direction: 'desc' },
+          { field: 'id', direction: 'desc' },
+        ],
+        limit: input.limit,
+        offset: input.offset,
+      }),
+    };
+  }
   private async context(
     reader: Reader,
     actor: Actor,
@@ -4232,7 +4259,8 @@ export class Application {
     actor: Actor,
     project: Project,
     input: Input<'ticket_context'>,
-    viewer?: 'reviewer',
+    viewerProfile?: McpProfile,
+    bindContext = false,
   ) {
     const at = this.timestamp();
     const ticket = await this.ticket(reader, project.id, input.ticket_id);
@@ -4250,7 +4278,7 @@ export class Application {
     ];
     const [checkpoints, questions, reviews, submissions, member, unfinishedChildren, dependencies, runs] =
       await Promise.all([
-        viewer === 'reviewer'
+        viewerProfile === 'reviewer'
           ? []
           : reader.find('notes', {
               where: { project_id: project.id, ticket_id: ticket.id, kind: 'checkpoint' },
@@ -4283,7 +4311,7 @@ export class Application {
               limit: 10001,
             })
           : [],
-        resumable && viewer !== 'reviewer'
+        resumable && viewerProfile !== 'reviewer'
           ? reader.find('execution_jobs', {
               where: { project_id: project.id, ticket_id: ticket.id },
               order: [
@@ -4313,7 +4341,7 @@ export class Application {
       runs.slice(0, limit).map((run) => this.executionResume(reader, run)),
     );
     return {
-      reviewer: viewer === 'reviewer',
+      reviewer: viewerProfile === 'reviewer',
       actor,
       project,
       ticket,
@@ -4330,6 +4358,10 @@ export class Application {
       executions,
       changes,
       afterSequence,
+      authorization_binding:
+        bindContext && viewerProfile
+          ? authorizationBinding(actor, project.id, member?.role ?? null, viewerProfile)
+          : undefined,
     };
   }
   private packContext(
@@ -4355,6 +4387,7 @@ export class Application {
       executions,
       changes,
       afterSequence,
+      authorization_binding,
     } = snapshot;
     const sourceSummaries = resultSchemas.ticket_list.parse({ tickets: dependencies }) as {
       tickets: { id: string }[];
@@ -4378,6 +4411,7 @@ export class Application {
     const maxTokens = input.max_tokens ?? { brief: 4096, standard: 8192, full: 32768 }[input.detail];
     const fingerprint = digest({
       ...(reviewer ? { reviewer: true } : {}),
+      authorization_binding,
       actor: { id: actor.id, kind: actor.kind, system_admin: actor.system_admin },
       role: member?.role ?? null,
       project,
@@ -4398,7 +4432,8 @@ export class Application {
       detail: input.detail,
       max_tokens: maxTokens,
     });
-    if (input.if_none_match === fingerprint) return { fingerprint, not_modified: true };
+    if (input.if_none_match === fingerprint)
+      return { fingerprint, not_modified: true, authorization_binding };
     const reviewBlockers = [];
     if (reviewer) {
       const submission = submissions[0];
@@ -4450,6 +4485,7 @@ export class Application {
     }
     const base = {
       fingerprint,
+      authorization_binding,
       not_modified: false,
       ticket: reviewer ? { ...ticket, execution_hints: undefined } : ticket,
       ...(reviewer ? { review_blockers: reviewBlockers } : {}),

@@ -168,10 +168,16 @@ it('delivers exact retained context and all required pages after an authorized c
   assert.equal(cold[0]!.arguments.if_none_match, undefined);
   assert.equal(
     first.retrieved.length,
-    cold.length - 1,
+    cold.length - 2,
     'Every required fetch is recorded in workflow usage.',
   );
   const canonical = serializeSuccessEnvelope(first);
+  assert.equal(cold.at(-1)!.name, 'ticket_context');
+  assert.equal(
+    cold.at(-1)!.data.not_modified,
+    true,
+    'Multi-call recovery rechecks the final authorized fingerprint.',
+  );
   first.context.ticket.description = 'Caller mutation must not replace retained requirements.';
   const warm = await manifest.context(f.input, 'execution');
   assert.equal(serializeSuccessEnvelope(warm), canonical);
@@ -210,6 +216,68 @@ it('delivers exact retained context and all required pages after an authorized c
   assert.equal(f.calls[reviewer]!.arguments.if_none_match, undefined);
   assert.notEqual(reviewed.context.fingerprint, warm.context.fingerprint);
 });
+
+for (const change of ['bearer', 'transient_bearer', 'profile', 'role', 'requirements'] as const)
+  it(`rejects ${change} changes during required context recovery without returning the old owner token`, async (t) => {
+    const f = await setup(t);
+    const client = await f.connect();
+    const session = f.sessions.get(client)!;
+    const originalTransport = client.transport;
+    const originalInstructions = client.getInstructions();
+    const member = (await f.storage.get('members', `${f.project.id}:${f.worker.id}`))!;
+    const callTool = client.callTool.bind(client);
+    let switched = false;
+    client.callTool = async (request, ...rest) => {
+      const response = await callTool(request, ...rest);
+      if (!switched && request.name === 'ticket_context') {
+        switched = true;
+        const context = (response.structuredContent as any).data;
+        assert.equal(context.claim.token, f.initialClaim.claim.token);
+        if (change === 'bearer' || change === 'transient_bearer') session.actor = 'reviewer';
+        if (change === 'profile') session.profile = 'full';
+        if (change === 'role')
+          await f.storage.transaction(f.project.id, (tx) => tx.put('members', { ...member, role: 'reader' }));
+        if (change === 'requirements')
+          await f.call(f.worker.id, 'ticket_update', {
+            ticket_id: f.ticket.id,
+            expected_revision: context.ticket.revision,
+            description: 'Requirements changed while recovering required evidence.',
+          });
+      } else if (change === 'transient_bearer') session.actor = 'worker';
+      return response;
+    };
+    const manifest = createContextManifest(client);
+    await assert.rejects(manifest.context(f.input, 'execution'), hasCode('CONTEXT_CHANGED'));
+    assert.equal(client.transport, originalTransport);
+    assert.equal(client.getInstructions(), originalInstructions);
+    if (change === 'transient_bearer') {
+      assert.equal(session.actor, 'worker');
+      assert.notEqual(f.calls[0]!.data.authorization_binding, f.calls[1]!.data.authorization_binding);
+    }
+    if (change === 'requirements') {
+      assert.equal(f.calls.at(-1)!.name, 'ticket_context');
+      assert.equal(f.calls.at(-1)!.data.not_modified, false);
+    }
+    client.callTool = callTool;
+    session.actor = 'reviewer';
+    const reviewer = await client.callTool({ name: 'ticket_context', arguments: f.input });
+    assert.equal((reviewer.structuredContent as any).data.claim?.token, undefined);
+    assert.equal(
+      (reviewer.structuredContent as any).data.authorization_binding,
+      undefined,
+      'Ordinary reads do not opt in.',
+    );
+    session.actor = 'worker';
+    session.profile = 'executor';
+    await f.storage.transaction(f.project.id, (tx) => tx.put('members', member));
+    const start = f.calls.length;
+    await manifest.context(f.input, 'execution');
+    assert.equal(
+      f.calls[start]!.arguments.if_none_match,
+      undefined,
+      'Failed recovery clears retained state.',
+    );
+  });
 
 it('rechecks revisions, checkpoint identities, access and mutation fences instead of trusting a manifest', async (t) => {
   const f = await setup(t);

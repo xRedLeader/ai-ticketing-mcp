@@ -320,9 +320,14 @@ const omission = z.object({
   required_before: z.enum(['execution', 'review']).optional(),
 });
 const context = z.discriminatedUnion('not_modified', [
-  z.object({ fingerprint: z.string(), not_modified: z.literal(true) }),
   z.object({
     fingerprint: z.string(),
+    not_modified: z.literal(true),
+    authorization_binding: z.string().optional(),
+  }),
+  z.object({
+    fingerprint: z.string(),
+    authorization_binding: z.string().optional(),
     not_modified: z.literal(false),
     ticket,
     criteria: z.array(criterion),
@@ -629,6 +634,7 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
     blockers: z.array(blocker),
   }),
   ticket_history: z.object({
+    authorization_binding: z.string().optional(),
     items: z.array(z.union([note, submission, review, githubEvidenceSchema, executionResumeSchema, change])),
     has_more: z.boolean().optional(),
     next_offset: z.number().optional(),
@@ -714,7 +720,7 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
       trusted_reuse: z.literal(false).default(false),
       verification_state: z.enum(['unverified', 'verified']).default('unverified'),
     }),
-  checkpoint_get: note,
+  checkpoint_get: note.extend({ authorization_binding: z.string().optional() }),
   changes_since: z.object({
     events: z.array(change),
     next_cursor: z.number(),
