@@ -130,6 +130,9 @@ export interface Knowledge {
   body: string;
   kind: 'policy' | 'decision' | 'convention' | 'pitfall' | 'runbook' | 'architecture' | 'note';
   sources: { kind: 'ticket' | 'knowledge' | 'checkpoint'; id: string; revision: number }[];
+  fact: { key: string; value: string } | null;
+  expires_at: string | null;
+  supersedes: { id: string; revision: number }[];
   status: 'proposed' | 'accepted';
   verification:
     { state: 'unverified' } | { state: 'verified'; actor_id: string; verified_at: string; evidence: string };
@@ -425,9 +428,13 @@ export interface SearchDocument {
   memory?: {
     status: Knowledge['status'];
     verification_state: Knowledge['verification']['state'];
-    trusted_reuse: false;
+    trusted_reuse: boolean;
+    validity: MemoryValidity;
+    contradiction_count: number;
   };
 }
+export type MemoryValidity =
+  'current' | 'unsupported' | 'stale' | 'expired' | 'superseded' | 'disputed' | 'archived' | 'unavailable';
 export interface SearchHit {
   id: string;
   kind: SearchDocument['kind'];

@@ -27,6 +27,7 @@ export function registerExecutionUpgradeContractTests(
             (file) =>
               file.endsWith('.sql') &&
               !file.includes('execution_recovery') &&
+              !file.includes('memory_validity') &&
               (history === 'main'
                 ? !file.includes('project_memory') && !file.includes('execution_runs')
                 : !file.includes('review_fixes')),

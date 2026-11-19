@@ -30,6 +30,9 @@ const knowledgeColumns = [
   'body',
   'kind',
   'sources',
+  'fact',
+  'expires_at',
+  'supersedes',
   'status',
   'verification',
   'revision',
@@ -231,6 +234,8 @@ const jsonColumns = new Set([
   'github_pull_request',
   'checks',
   'sources',
+  'fact',
+  'supersedes',
   'verification',
 ]);
 type Executor = Pick<pg.Pool, 'query'> | Pick<pg.PoolClient, 'query'>;

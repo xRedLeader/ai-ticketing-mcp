@@ -37,6 +37,7 @@ import {
   validateGitHubConfiguration,
 } from './contracts.js';
 import { resultSchemas, githubEvidenceSchema } from './result-schemas.js';
+import { inspectMemory } from './memory.js';
 import { serializeSuccessEnvelope } from './envelope.js';
 import { countReferenceTokens, queryExcerpt } from './tokens.js';
 import { CachedEmbeddings } from './query-embeddings.js';
@@ -1563,10 +1564,22 @@ export class Application {
           if (input.kind === 'policy' || previous?.kind === 'policy')
             await this.access(tx, actor, project.id, ['admin']);
           const sources: Knowledge['sources'] = input.sources ?? previous?.sources ?? [];
+          const fact: Knowledge['fact'] = input.fact === undefined ? (previous?.fact ?? null) : input.fact;
+          const expires_at =
+            input.expires_at === undefined ? (previous?.expires_at ?? null) : input.expires_at;
+          const supersedes: Knowledge['supersedes'] = input.supersedes ?? previous?.supersedes ?? [];
           const changed =
             !previous ||
-            digest([input.title, input.body, input.kind, sources]) !==
-              digest([previous.title, previous.body, previous.kind, previous.sources]);
+            digest([input.title, input.body, input.kind, sources, fact, expires_at, supersedes]) !==
+              digest([
+                previous.title,
+                previous.body,
+                previous.kind,
+                previous.sources,
+                previous.fact,
+                previous.expires_at,
+                previous.supersedes,
+              ]);
           if (changed || input.archived !== previous?.archived)
             await this.access(tx, actor, project.id, ['contributor', 'admin']);
           let verification: Knowledge['verification'] = changed
@@ -1633,6 +1646,16 @@ export class Application {
               'Acceptance requires explicitly verified supporting evidence.',
             );
           }
+          if (input.supersedes !== undefined || input.status === 'accepted')
+            for (const target of supersedes) {
+              const current = await tx.get('knowledge', target.id);
+              ensure(
+                current && current.project_id === project.id && current.id !== previous?.id,
+                'INVALID_REFERENCE',
+                'Supersession must identify another same-project knowledge revision.',
+              );
+              this.version(current, target.revision);
+            }
           const document: Knowledge = {
             id: previous?.id ?? randomUUID(),
             project_id: project.id,
@@ -1640,6 +1663,9 @@ export class Application {
             body: input.body,
             kind: input.kind,
             sources,
+            fact,
+            expires_at,
+            supersedes,
             status,
             verification,
             revision: (previous?.revision ?? 0) + 1,
@@ -1660,7 +1686,20 @@ export class Application {
             status: document.status,
             verification_state: document.verification.state,
           });
-          return { ...document, verification_state: document.verification.state };
+          if (input.status === 'accepted' && supersedes.length) {
+            const assessment = await (await inspectMemory(tx, project.id, this.timestamp()))(document);
+            ensure(
+              ['current', 'disputed'].includes(assessment.validity),
+              'INVALID_REFERENCE',
+              'Supersession requires a current supported structured fact.',
+            );
+          }
+          // Durable mutation receipts describe the write; only a fresh read can authorize reuse.
+          return {
+            ...document,
+            trusted_reuse: false,
+            verification_state: document.verification.state,
+          };
         }
         case 'work_claim': {
           const ticket = input.ticket_id
@@ -1784,6 +1823,7 @@ export class Application {
             remaining: input.checkpoint.remaining,
             decisions: input.checkpoint.decisions,
             references: input.checkpoint.references,
+            requirements_revision: ticket.requirements_revision,
           },
         });
         await this.touch(tx, ticket);
@@ -1936,7 +1976,12 @@ export class Application {
       case 'ticket_checkpoint': {
         await this.liveClaim(tx, ticket, actor, input.claim_token);
         const note = await this.note(tx, actor, ticket, 'checkpoint', input.progress, {
-          metadata: { remaining: input.remaining, decisions: input.decisions, references: input.references },
+          metadata: {
+            remaining: input.remaining,
+            decisions: input.decisions,
+            references: input.references,
+            requirements_revision: ticket.requirements_revision,
+          },
         });
         await this.touch(tx, ticket);
         await this.queue(tx, note, 'checkpoint');
@@ -2352,12 +2397,39 @@ export class Application {
         return note;
       }
       case 'knowledge_get': {
-        const document =
-          input.revision === undefined
-            ? await this.storage.get('knowledge', input.knowledge_id)
-            : await this.storage.get('knowledge_revisions', `${input.knowledge_id}:${input.revision}`);
-        ensure(document && document.project_id === project.id, 'NOT_FOUND', 'Knowledge document not found.');
-        return { ...document, id: input.knowledge_id };
+        return this.storage.transaction(project.id, async (tx) => {
+          await this.access(tx, await this.actor(actorId, tx), project.id);
+          const document =
+            input.revision === undefined
+              ? await tx.get('knowledge', input.knowledge_id)
+              : await tx.get('knowledge_revisions', `${input.knowledge_id}:${input.revision}`);
+          ensure(
+            document && document.project_id === project.id,
+            'NOT_FOUND',
+            'Knowledge document not found.',
+          );
+          if (!document.fact) {
+            const current =
+              input.revision === undefined ? document : await tx.get('knowledge', input.knowledge_id);
+            const validity =
+              document.archived || current?.archived
+                ? 'archived'
+                : current?.revision !== document.revision
+                  ? 'stale'
+                  : document.expires_at && Date.parse(document.expires_at) <= this.now().getTime()
+                    ? 'expired'
+                    : 'unsupported';
+            return {
+              ...document,
+              id: input.knowledge_id,
+              validity,
+              trusted_reuse: false,
+              contradictions: [],
+            };
+          }
+          const inspect = await inspectMemory(tx, project.id, this.timestamp());
+          return { ...document, id: input.knowledge_id, ...(await inspect(document)) };
+        });
       }
       case 'changes_since': {
         const events = await this.storage.find('events', {
@@ -2413,6 +2485,8 @@ export class Application {
               status: item.status,
               verification_state: item.verification.state,
               trusted_reuse: false,
+              validity: 'unsupported',
+              contradiction_count: 0,
             },
           }
         : null;
@@ -2451,59 +2525,86 @@ export class Application {
       Math.min(100, input.limit * 3),
       semantic,
     );
-    const results = [];
-    for (const hit of hits) {
-      if (input.kind && input.kind !== hit.kind) continue;
-      const source = await this.sourceDocument(this.storage, hit.kind, hit.id);
-      if (
-        !source ||
-        source.project_id !== input.project_id ||
-        source.archived ||
-        source.revision !== hit.revision
-      )
-        continue;
-      if (hit.kind === 'ticket' || hit.kind === 'checkpoint') {
-        const ticket = await this.storage.get('tickets', source.ticket_id ?? hit.id);
-        if (ticket?.status === 'cancelled') continue;
+    const results = await this.storage.readSnapshot(async (tx) => {
+      await this.access(tx, await this.actor(actor.id, tx), input.project_id);
+      let inspect: Awaited<ReturnType<typeof inspectMemory>> | undefined;
+      const results = [];
+      for (const hit of hits) {
+        if (input.kind && input.kind !== hit.kind) continue;
+        const source = await this.sourceDocument(tx, hit.kind, hit.id);
         if (
-          (input.status && ticket?.status !== input.status) ||
-          !input.labels.every((label) => ticket?.labels.includes(label))
+          !source ||
+          source.project_id !== input.project_id ||
+          source.archived ||
+          source.revision !== hit.revision
         )
           continue;
-      } else if (input.status || input.labels.length) continue;
-      results.push({
-        id: source.id,
-        kind: source.kind,
-        title: source.title,
-        revision: source.revision,
-        excerpt: queryExcerpt(source.text, input.query, this.countTokens),
-        score: hit.score,
-        resource_uri: `ticketing://${hit.kind}/${source.project_id}/${source.id}`,
-        retrieval: {
-          tool:
-            hit.kind === 'ticket'
-              ? 'ticket_get'
-              : hit.kind === 'checkpoint'
-                ? 'checkpoint_get'
-                : 'knowledge_get',
-          arguments: {
-            project_id: source.project_id,
-            [hit.kind === 'ticket'
-              ? 'ticket_id'
-              : hit.kind === 'checkpoint'
-                ? 'checkpoint_id'
-                : 'knowledge_id']: source.id,
-            ...(hit.kind === 'knowledge' ? { revision: source.revision } : {}),
+        if (hit.kind === 'knowledge') {
+          const document = (await tx.get('knowledge', hit.id))!;
+          const uncited =
+            !document.fact && !document.sources.length && !document.expires_at && !document.supersedes.length;
+          if (!uncited) inspect ??= await inspectMemory(tx, input.project_id, this.timestamp());
+          const assessment = uncited
+            ? { validity: 'unsupported' as const, trusted_reuse: false, contradictions: [] }
+            : await inspect!(document);
+          if (assessment.validity === 'unavailable') {
+            degraded =
+              'Memory validity is unavailable above 1,000 project records or accepted revisions; knowledge results are withheld.';
+            continue;
+          }
+          if (['stale', 'expired', 'superseded', 'archived'].includes(assessment.validity)) continue;
+          source.memory = {
+            status: document.status,
+            verification_state: document.verification.state,
+            validity: assessment.validity,
+            trusted_reuse: assessment.trusted_reuse,
+            contradiction_count: assessment.contradictions.length,
+          };
+        }
+        if (hit.kind === 'ticket' || hit.kind === 'checkpoint') {
+          const ticket = await tx.get('tickets', source.ticket_id ?? hit.id);
+          if (ticket?.status === 'cancelled') continue;
+          if (
+            (input.status && ticket?.status !== input.status) ||
+            !input.labels.every((label) => ticket?.labels.includes(label))
+          )
+            continue;
+        } else if (input.status || input.labels.length) continue;
+        results.push({
+          id: source.id,
+          kind: source.kind,
+          title: source.title,
+          revision: source.revision,
+          excerpt: queryExcerpt(source.text, input.query, this.countTokens),
+          score: hit.score,
+          resource_uri: `ticketing://${hit.kind}/${source.project_id}/${source.id}`,
+          retrieval: {
+            tool:
+              hit.kind === 'ticket'
+                ? 'ticket_get'
+                : hit.kind === 'checkpoint'
+                  ? 'checkpoint_get'
+                  : 'knowledge_get',
+            arguments: {
+              project_id: source.project_id,
+              [hit.kind === 'ticket'
+                ? 'ticket_id'
+                : hit.kind === 'checkpoint'
+                  ? 'checkpoint_id'
+                  : 'knowledge_id']: source.id,
+              ...(hit.kind === 'knowledge' ? { revision: source.revision } : {}),
+            },
           },
-        },
-        untrusted_content: true,
-        ...(source.memory ? { memory: source.memory } : {}),
-      });
-      if (results.length === input.limit) break;
-    }
-    // Recheck grants after provider/network calls so a revoked identity cannot receive cached candidates.
-    await this.access(this.storage, actor, input.project_id);
+          untrusted_content: true,
+          ...(source.memory ? { memory: source.memory } : {}),
+        });
+        if (results.length === input.limit) break;
+      }
+      return results;
+    });
     const coverage = await this.searchAdapter.coverage(input.project_id, embeddings?.profile);
+    // Recheck live grants after providers and the authorized snapshot complete.
+    await this.access(this.storage, await this.actor(actor.id), input.project_id);
     if (!degraded && coverage.embedded < coverage.documents)
       degraded = 'Semantic indexing is incomplete; full-text results remain available.';
     return { results, degraded, coverage, index_consistency: 'eventual' };
