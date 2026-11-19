@@ -290,6 +290,42 @@ export function registerContinuationDispatchContractTests(
     assert.equal(f.calls(), 1);
   });
 
+  check(
+    'evaluates a requested continuation beyond the first registration page without a sweep',
+    async (f) => {
+      await f.settleScript();
+      await f.register();
+      f.exitPredecessor();
+      await f.storage.transaction(f.project.id, async (tx) => {
+        const registration = (await tx.get('wake_conditions', f.ticket.id))!;
+        for (let index = 0; index < 100; index++) {
+          const id = `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`;
+          assert.ok(id < f.ticket.id);
+          await tx.put('tickets', { ...f.ticket, id, key: `${f.project.key}-${index + 1000}` });
+          await tx.put('wake_conditions', {
+            ...registration,
+            id,
+            ticket_id: id,
+            condition: { kind: 'events', types: ['ticket.note_added'] },
+          });
+        }
+      });
+      const first = await f.app.evaluateWakeConditions(f.admin.id, f.project.id);
+      assert.equal(first.evaluated, 100);
+      assert.equal(first.has_more, true);
+      assert.deepEqual((await f.get()).pending, []);
+      await assert.rejects(
+        f.app.evaluateWakeConditions(f.admin.id, f.project.id, {
+          ticket_id: f.ticket.id,
+          after: first.next_cursor,
+        }),
+        hasCode('INVALID_INPUT'),
+      );
+      assert.equal((await f.dispatcher().runOnce(f.request)).state, 'running');
+      assert.equal(f.calls(), 1);
+    },
+  );
+
   for (const failure of [
     'deadline',
     'requirements',
@@ -391,20 +427,18 @@ export function registerContinuationDispatchContractTests(
       assert.equal(f.capacity().inspect('host').occupied.agent, 1);
       const active = (await f.get()).active!;
       const fence: WakeFence = { ticket_id: f.ticket.id, generation: active.generation, token: active.token };
-      await f
-        .dispatcher()
-        .reconcile(fence, {
-          source: 'independent-fake-supervisor',
-          execution_token: active.dispatch!.invocation!.execution_token,
-          observed_at: Date.now(),
-          state: 'never_started',
-          settlement: {
-            outcome: 'cancelled',
-            runtime_ms: 0,
-            usage_source: 'independent-fake-supervisor',
-            usage: { input_tokens: 0, output_tokens: 0 },
-          },
-        });
+      await f.dispatcher().reconcile(fence, {
+        source: 'independent-fake-supervisor',
+        execution_token: active.dispatch!.invocation!.execution_token,
+        observed_at: Date.now(),
+        state: 'never_started',
+        settlement: {
+          outcome: 'cancelled',
+          runtime_ms: 0,
+          usage_source: 'independent-fake-supervisor',
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      });
       assert.equal((await f.get()).active!.dispatch!.state, 'completed');
       assert.equal(f.capacity().inspect('host').occupied.agent, 0);
     },

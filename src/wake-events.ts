@@ -37,6 +37,7 @@ const registrationInput = z.strictObject({
   expected_revision: z.int().positive().optional(),
 });
 const evaluationInput = z.strictObject({
+  ticket_id: z.uuid().optional(),
   after: z.uuid().optional(),
   limit: z.int().min(1).max(100).default(100),
   event_limit: z.int().min(1).max(100).default(100),
@@ -141,8 +142,12 @@ export async function registerWake(
 
 export async function evaluateWakes(tx: Transaction, project: Project, raw: unknown, now: string) {
   const input = parse(evaluationInput, raw);
+  ensure(!input.ticket_id || !input.after, 'INVALID_INPUT', 'Choose a ticket or registration page.');
   const page = await tx.find('wake_conditions', {
-    where: { project_id: project.id, ...(input.after ? { id: { gt: input.after } } : {}) },
+    where: {
+      project_id: project.id,
+      ...(input.ticket_id ? { id: input.ticket_id } : input.after ? { id: { gt: input.after } } : {}),
+    },
     order: [{ field: 'id', direction: 'asc' }],
     limit: input.limit + 1,
   });

@@ -48,7 +48,7 @@ export class ContinuationDispatcher {
   async runOnce(raw: ContinuationDispatchRequest) {
     const input = requestSchema.parse(raw);
     const { application: app, capacity, actor_id: actor, project_id: project, host_id: host } = this.options;
-    await app.evaluateWakeConditions(actor, project);
+    await app.evaluateWakeConditions(actor, project, { ticket_id: input.ticket_id });
     const row = await app.getWakeCondition(actor, project, input.ticket_id);
     const decision =
       row.active ??
