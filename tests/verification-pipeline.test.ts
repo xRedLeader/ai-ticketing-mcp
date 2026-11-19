@@ -17,6 +17,7 @@ import { HostCapacity } from '../src/host-capacity.js';
 import { durableExecutionFile, executionProcessIdentity } from '../src/execution-journal.js';
 import { fileSha256 } from '../src/verification-pipeline.js';
 import { readVerificationTimeout, recordVerificationTimeout } from '../src/verification-timeout.js';
+import { observeArtifactEvidence } from '../scripts/real-client-observation.js';
 
 async function fixture(scripts: string[], project: string = randomUUID()) {
   const directory = realpathSync(await mkdtemp(join(tmpdir(), 'ticketing-pipeline-'))),
@@ -541,6 +542,10 @@ it('publishes a fenced native pipeline result for independent review without aut
       'reviewer',
     )) as any;
     assert.equal(independent.sha256, result.sha256);
+    assert.deepEqual(observeArtifactEvidence(reference, reference.arguments, independent), {
+      pending: null,
+      unverified: false,
+    });
     assert.deepEqual(
       JSON.parse(Buffer.from(independent.range.data, 'base64').toString()).verification,
       outcome.verification,

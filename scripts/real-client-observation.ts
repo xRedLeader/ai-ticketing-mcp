@@ -2,6 +2,7 @@ import { countReferenceTokens } from '../src/tokens.js';
 import { serializeSuccessEnvelope } from '../src/envelope.js';
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { artifactIdentity } from '../src/execution-artifacts.js';
 
 export function createMaintenanceLedger(path: string) {
   writeFileSync(path, '', { flag: 'wx', mode: 0o600 });
@@ -218,6 +219,7 @@ export function observeArtifactEvidence(item: any, args: any, data: any) {
     (args.offset ?? 0) === offset &&
     range?.offset === offset &&
     range.returned_length === bytes.length &&
+    bytes.length <= (args.length ?? 4096) &&
     range.data === bytes.toString('base64') &&
     range.sha256 === createHash('sha256').update(bytes).digest('hex') &&
     Number.isSafeInteger(data.size_bytes) &&
@@ -240,7 +242,21 @@ export function observeArtifactEvidence(item: any, args: any, data: any) {
           outcome.exit_code !== 0 ||
           !!outcome.signal ||
           !!outcome.error_code ||
-          (!!outcome.verification && outcome.verification.status !== 'passed');
+          (!!outcome.verification &&
+            (outcome.verification.status !== 'passed' ||
+              outcome.verification.error_code !== null ||
+              outcome.verification.cleanup_verified !== true ||
+              !Array.isArray(outcome.verification.steps) ||
+              !outcome.verification.steps.length ||
+              !outcome.verification.steps.every(
+                (step: any) =>
+                  step.status === 'passed' &&
+                  step.exit_code === 0 &&
+                  step.signal === null &&
+                  step.error_code === null &&
+                  Array.isArray(step.blocked_by) &&
+                  step.blocked_by.length === 0,
+              )));
       } catch {
         unverified = true;
       }
@@ -254,6 +270,39 @@ export function observeArtifactEvidence(item: any, args: any, data: any) {
   };
 }
 
+export function submissionArtifactProof(calls: ObservedCall[], submission: any, projectId: string) {
+  const references = [
+    ...new Set<string>(
+      (submission?.evidence ?? []).flatMap((item: any) =>
+        (item.references ?? []).filter((reference: string) => artifactIdentity.test(reference)),
+      ),
+    ),
+  ];
+  const missing: string[] = [],
+    unverified: string[] = [];
+  for (const reference of references) {
+    let item: any = { arguments: { project_id: projectId, artifact_id: reference, offset: 0 } };
+    let complete = false,
+      verified = false;
+    for (const call of calls) {
+      if (
+        call.tool !== 'artifact_read' ||
+        !call.envelope?.ok ||
+        call.arguments.project_id !== projectId ||
+        call.arguments.artifact_id !== reference
+      )
+        continue;
+      if (!item) item = { arguments: { project_id: projectId, artifact_id: reference, offset: 0 } };
+      const result = observeArtifactEvidence(item, call.arguments, call.envelope.data);
+      item = result.pending;
+      complete = !item;
+      verified = complete && !result.unverified;
+    }
+    if (!complete) missing.push(reference);
+    else if (!verified) unverified.push(reference);
+  }
+  return { references, missing, unverified };
+}
 function delivered(calls: ObservedCall[], expected: ExpectedWorkflow, role: 'worker' | 'reviewer') {
   const state: any = {
     ticket: {},
@@ -264,11 +313,11 @@ function delivered(calls: ObservedCall[], expected: ExpectedWorkflow, role: 'wor
     policy: undefined,
     checkpoint: null,
     submission: null,
+    submissionObservedAt: Infinity,
     resumeReceived: false,
     requirementsFloor: 0,
     pending: [],
     reviewBlockers: [],
-    unavailableEvidence: false,
     githubEvidence: null,
   };
   const target = (ticket: any) =>
@@ -288,9 +337,9 @@ function delivered(calls: ObservedCall[], expected: ExpectedWorkflow, role: 'wor
       state.resumeReceived = false;
       state.checkpoint = null;
       state.submission = null;
+      state.submissionObservedAt = Infinity;
       state.pending = [];
       state.reviewBlockers = [];
-      state.unavailableEvidence = false;
       state.githubEvidence = null;
       state.requirementsFloor = revision > 1 ? (ticket.revision ?? Number.MAX_SAFE_INTEGER) : 0;
     }
@@ -315,9 +364,10 @@ function delivered(calls: ObservedCall[], expected: ExpectedWorkflow, role: 'wor
         if (role === 'reviewer') {
           state.reviewBlockers = context.review_blockers ?? [];
           state.pending = (context.omitted ?? [])
-            .filter((item: any) => item.required_before === 'review')
-            .map((item: any) => ({ ...item, nextOffset: item.arguments?.offset ?? 0, chunks: [] }));
-          state.unavailableEvidence = false;
+            .filter(
+              (item: any) => item.required_before === 'review' && item.retrieve_with !== 'artifact_read',
+            )
+            .map((item: any) => ({ ...item, nextOffset: item.arguments?.offset ?? 0 }));
         }
       } else context = null;
     }
@@ -360,8 +410,10 @@ function delivered(calls: ObservedCall[], expected: ExpectedWorkflow, role: 'wor
     }
     for (const submission of items.filter((item: any) => Array.isArray(item.evidence))) {
       if (submission.ticket_id && submission.ticket_id !== expected.ticket.id) continue;
-      if (!state.submission || submission.ticket_revision > state.submission.ticket_revision)
+      if (!state.submission || submission.ticket_revision > state.submission.ticket_revision) {
         state.submission = submission;
+        state.submissionObservedAt = call.completed;
+      }
     }
     for (const evidence of items.filter((item: any) => Array.isArray(item.checks)))
       if (
@@ -372,18 +424,13 @@ function delivered(calls: ObservedCall[], expected: ExpectedWorkflow, role: 'wor
         state.githubEvidence = evidence;
     state.pending = state.pending.flatMap((item: any) => {
       if (call.tool !== item.retrieve_with) return [item];
-      const paged = ['ticket_history', 'artifact_read'].includes(call.tool) && !item.arguments.item_id;
+      const paged = call.tool === 'ticket_history' && !item.arguments.item_id;
       if (
         !Object.keys({ ...item.arguments, ...call.arguments }).every(
           (key) => (paged && key === 'offset') || item.arguments[key] === call.arguments[key],
         )
       )
         return [item];
-      if (call.tool === 'artifact_read') {
-        const result = observeArtifactEvidence(item, call.arguments, data);
-        state.unavailableEvidence ||= result.unverified;
-        return result.pending ? [result.pending] : [];
-      }
       if (call.tool === 'ticket_history') {
         if (!Array.isArray(data?.items)) return [item];
         if (item.arguments.item_id)
@@ -405,9 +452,16 @@ function delivered(calls: ObservedCall[], expected: ExpectedWorkflow, role: 'wor
     requirements:
       state.ticket.id === expected.ticket.id &&
       state.ticket.description === expected.description &&
-      state.criteria.length === 1 &&
-      typeof state.criteria[0].id === 'string' &&
-      state.criteria[0].text === criterion,
+      (expected.contract.project.criteria
+        ? state.criteria.length === expected.contract.project.criteria.length &&
+          state.criteria.every(
+            (item: any, index: number) =>
+              item.id === expected.contract.project.criteria[index].id &&
+              item.text === expected.contract.project.criteria[index].text,
+          )
+        : state.criteria.length === 1 &&
+          typeof state.criteria[0].id === 'string' &&
+          state.criteria[0].text === criterion),
     instructions_policy:
       state.projectInstructions === expected.contract.project.instructions &&
       state.policy === expected.workflow.policy,
@@ -424,10 +478,12 @@ export function validateRole(
   observation: ReturnType<typeof parseCodexInvocation>,
   role: 'worker' | 'reviewer',
   expected: ExpectedWorkflow,
+  attempt?: Pick<ObservedCall, 'tool' | 'arguments' | 'started'>,
 ) {
   const errors = [...observation.errors];
   const proofs: any[] = [];
-  for (const call of observation.calls) {
+  const calls = attempt ? [{ ...attempt, id: 'pending-attempt', envelope: null }] : observation.calls;
+  for (const call of calls) {
     if (!['ticket_checkpoint', 'ticket_submit', 'ticket_review', 'ticket_note'].includes(call.tool)) continue;
     if (call.tool === 'ticket_note' && call.arguments.kind !== 'answer') continue;
     const { state, facts } = delivered(
@@ -438,10 +494,21 @@ export function validateRole(
     const missing = Object.entries(facts)
       .filter(([, value]) => !value)
       .map(([key]) => key);
+    let artifacts: ReturnType<typeof submissionArtifactProof> | undefined;
     if (role === 'reviewer') {
       const submission = state.submission;
+      artifacts = submissionArtifactProof(
+        observation.calls.filter(
+          (prior) => prior.started > state.submissionObservedAt && prior.completed < call.started,
+        ),
+        submission,
+        expected.project.id,
+      );
+      if (artifacts.missing.length) missing.push('submitted_artifact_bytes');
+      if (call.arguments.decision === 'approve' && artifacts.unverified.length)
+        missing.push('submitted_artifact_failed');
       if (state.pending.length) missing.push('required_review_omission_recovery');
-      if (call.arguments.decision === 'approve' && (state.reviewBlockers.length || state.unavailableEvidence))
+      if (call.arguments.decision === 'approve' && state.reviewBlockers.length)
         missing.push('review_evidence_unverified');
       if (call.arguments.decision === 'approve' && state.ticket.github_pull_request) {
         const github = state.githubEvidence;
@@ -541,11 +608,12 @@ export function validateRole(
       item_id: call.id,
       all_required_received_before_start: missing.length === 0,
       missing,
+      ...(artifacts ? { artifacts } : {}),
     });
   }
   const successful = (tool: string) =>
     observation.calls.filter((call) => call.tool === tool && call.envelope?.ok);
-  if (role === 'worker') {
+  if (!attempt && role === 'worker') {
     for (const tool of ['work_claim', 'ticket_checkpoint', 'ticket_submit'])
       if (!successful(tool).length) errors.push(`Worker did not successfully complete ${tool}.`);
     if (
@@ -564,7 +632,7 @@ export function validateRole(
       )
     )
       errors.push('Requirement-change workflow did not observe its forced stale checkpoint failure.');
-  } else if (!successful('ticket_review').length)
+  } else if (!attempt && !successful('ticket_review').length)
     errors.push('Reviewer did not successfully review the submission.');
   return { success: errors.length === 0, errors, proofs };
 }

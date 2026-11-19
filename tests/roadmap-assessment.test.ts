@@ -355,3 +355,100 @@ it('recovers all native result bytes before review and never accepts unavailable
     /unavailable/,
   );
 });
+
+it('shares reviewer validation for direct project, ticket and exact submission reads without packet omissions', () => {
+  const artifact =
+    'execution:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222:result';
+  const submission = {
+    id: 'submission',
+    project_id: 'project',
+    ticket_id: 'ticket',
+    actor_id: 'worker',
+    requirements_revision: 2,
+    ticket_revision: 10,
+    evidence: [
+      {
+        criterion_id: 'criterion',
+        result: 'pass',
+        summary: 'Worker reports all native checks passed.',
+        references: [artifact],
+      },
+    ],
+  };
+  const calls = [
+    observed(
+      'project_get',
+      { project_id: 'project' },
+      { project: { id: 'project', instructions: context.project_instructions.text, policy: 'independent' } },
+    ),
+    observed(
+      'ticket_get',
+      { project_id: 'project', ticket_id: 'ticket' },
+      { ticket: context.ticket, criteria: context.criteria, blockers: [], links: [] },
+    ),
+    observed(
+      'ticket_history',
+      { project_id: 'project', ticket_id: 'ticket', kind: 'submissions', item_id: submission.id },
+      { items: [submission] },
+    ),
+  ];
+  const mutation = {
+    project_id: 'project',
+    ticket_id: 'ticket',
+    submission_id: submission.id,
+    expected_revision: 10,
+    decision: 'approve',
+  };
+  const args = { project_id: 'project', artifact_id: artifact, offset: 0, length: 16 };
+  const hash = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
+  const read = (exit_code: number, offset = 0, end?: number) => {
+    const bytes = Buffer.from(JSON.stringify({ exit_code })),
+      range = bytes.subarray(offset, end ?? bytes.length);
+    return observed(
+      'artifact_read',
+      { ...args, offset },
+      {
+        artifact_id: artifact,
+        status: 'available',
+        size_bytes: bytes.length,
+        total_bytes: bytes.length,
+        omitted_bytes: 0,
+        truncated: false,
+        sha256: hash(bytes),
+        range: { offset, returned_length: range.length, sha256: hash(range), data: range.toString('base64') },
+      },
+    );
+  };
+  const missing = deliveryProof(calls, 'reviewer', 'reviewer', 'ticket_review', mutation);
+  assert.equal(missing.success, false);
+  assert.equal(missing.facts.submitted_artifacts_verified, false);
+  assert.ok(missing.review_validation?.proofs[0].missing.includes('submitted_artifact_bytes'));
+  const failed = deliveryProof([...calls, read(7)], 'reviewer', 'reviewer', 'ticket_review', mutation);
+  assert.equal(failed.success, false);
+  assert.equal(failed.facts.submitted_artifacts_verified, false);
+  assert.ok(failed.review_validation?.proofs[0].missing.includes('submitted_artifact_failed'));
+  assert.equal(
+    deliveryProof([...calls, read(0, 0, 8)], 'reviewer', 'reviewer', 'ticket_review', mutation).success,
+    false,
+  );
+  assert.equal(
+    deliveryProof([...calls, read(0, 0, 8), read(0, 8)], 'reviewer', 'reviewer', 'ticket_review', mutation)
+      .success,
+    true,
+  );
+  assert.equal(
+    deliveryProof([calls[0], calls[1], read(0), calls[2]], 'reviewer', 'reviewer', 'ticket_review', mutation)
+      .success,
+    false,
+  );
+  assert.equal(
+    deliveryProof(
+      [...calls, { ...read(0), actor_id: 'worker' }],
+      'reviewer',
+      'reviewer',
+      'ticket_review',
+      mutation,
+    ).success,
+    false,
+  );
+});
