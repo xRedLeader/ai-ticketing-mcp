@@ -6,6 +6,11 @@ import { fixture, hasCode, type ContractAdapters } from './contracts.js';
 import { countReferenceTokens } from '../tokens.js';
 import { serializeSuccessEnvelope } from '../envelope.js';
 import type { ExecutionLocalStatus } from '../contracts.js';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { HostCapacity } from '../host-capacity.js';
+import { createExecutionStatusProvider } from '../execution-status.js';
 
 export function registerExecutionTimelineContractTests(
   name: string,
@@ -325,4 +330,117 @@ export function registerExecutionTimelineContractTests(
       await app.releaseExecutionController(actor, project, controller);
     },
   );
+  for (const admitted of [false, true])
+    check(
+      `explains a real reserved ${admitted ? 'admitted drain' : 'host admission wait'} before recommending dispatch`,
+      async (f) => {
+        const directory = await mkdtemp(join(tmpdir(), 'ticketing-reserved-timeline-'));
+        const filename = join(directory, 'host.sqlite'),
+          host = new HostCapacity(filename);
+        host.configureHost('host', { script_slots: 1 });
+        const app = createApplication({
+          ...f.options,
+          executionStatus: createExecutionStatusProvider(filename, 'host'),
+        });
+        const actor = f.admin.id,
+          project = f.project.id;
+        const controller = (await app.acquireExecutionController(actor, project, 'owner', 1000))!;
+        try {
+          if (!admitted) {
+            const blocker = randomUUID();
+            host.enqueue('host', {
+              kind: 'script',
+              queue_id: blocker,
+              run_id: blocker,
+              project_id: project,
+              created_at: Date.now(),
+            });
+            assert.equal(
+              host.claimNext('host', 'blocker', { kind: 'script', queue_ids: [blocker] }).admitted,
+              true,
+            );
+          }
+          const run = (await app.reserveExecutionRun(actor, project, f.runId, 60_000, controller))!;
+          assert.equal(
+            await app.admitExecutionRun(actor, project, f.runId, run.reservation_token!, controller, () => {
+              host.enqueue('host', {
+                kind: 'script',
+                queue_id: f.runId,
+                run_id: f.runId,
+                project_id: project,
+                created_at: Date.now(),
+              });
+              assert.equal(
+                host.claimNext('host', 'owner', { kind: 'script', queue_ids: [f.runId] }).admitted,
+                admitted,
+              );
+            }),
+            true,
+          );
+          let view = await f.view({}, app);
+          assert.equal(view.run.status, 'reserved');
+          assert.equal(view.local_status.capacity.state, admitted ? 'running' : 'queued');
+          assert.equal(view.waiting_reason, admitted ? 'awaiting_dispatch' : 'capacity_wait');
+          await app.setExecutionAdmissions(actor, project, true);
+          view = await f.view({}, app);
+          assert.equal(view.waiting_reason, admitted ? 'awaiting_dispatch' : 'admissions_paused');
+          assert.equal(view.next_wake.condition, admitted ? 'dispatch' : 'admissions_resume');
+          if (!admitted) {
+            await app.setExecutionAdmissions(actor, project, false);
+            host.createRun({
+              run_id: f.runId,
+              project_id: project,
+              work: [{ ticket_id: f.ticket.id, requirements_revision: 1 }],
+              limits: { max_attempts: 1, max_provider_tokens: 100, max_runtime_ms: 1000 },
+            });
+            const budgetAttempt = randomUUID();
+            host.enqueue('host', {
+              kind: 'agent',
+              queue_id: budgetAttempt,
+              run_id: f.runId,
+              created_at: Date.now(),
+              admission: {
+                attempt_id: budgetAttempt,
+                ticket_id: f.ticket.id,
+                requirements_revision: 1,
+                actor_id: f.worker.id,
+                role: 'worker',
+                provider: 'fixture',
+                model: 'fixture',
+                allowance: { provider_tokens: 10, runtime_ms: 100, cost_usd_micros: null },
+              },
+            });
+            assert.equal(
+              host.claimNext('host', 'budget', { kind: 'agent', queue_ids: [budgetAttempt] }).admitted,
+              true,
+            );
+            assert.equal((await f.view({}, app)).waiting_reason, 'budget_attention');
+          }
+          const ticket = (await f.read(f.ticket.id)).ticket;
+          await f.call(f.worker.id, 'ticket_update', {
+            ticket_id: ticket.id,
+            expected_revision: ticket.revision,
+            criteria: ['New requirements.'],
+          });
+          view = await f.view({}, app);
+          assert.equal(view.authority_current, false);
+          assert.equal(view.waiting_reason, 'stale_authority');
+          assert.notEqual(view.next_wake.condition, 'dispatch');
+          f.clock.now = new Date(f.clock.now.getTime() + 1001);
+          view = await f.view({}, app);
+          assert.equal(view.ownership.reservation_current, true);
+          assert.equal(view.ownership.controller_active, false);
+          assert.equal(view.waiting_reason, 'lease_expired');
+          assert.equal(view.next_wake.condition, 'companion_reconciliation');
+          f.clock.now = new Date(f.clock.now.getTime() + 60_000);
+          view = await f.view({}, app);
+          assert.equal(view.ownership.reservation_current, false);
+          assert.equal(view.waiting_reason, 'lease_expired');
+        } finally {
+          await app.releaseExecutionController(actor, project, controller);
+          host.close();
+          await rm(directory, { recursive: true, force: true });
+        }
+      },
+    );
 }

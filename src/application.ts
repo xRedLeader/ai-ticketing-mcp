@@ -1217,22 +1217,31 @@ export class Application {
             'none',
             'Read the recorded outcome and continuation; no automatic execution retry is scheduled.',
           );
-        if (run.status === 'queued') {
+        if (run.status !== 'queued' && (!reservationCurrent || !controllerActive))
+          return wake(
+            'lease_expired',
+            'companion_reconciliation',
+            'Let a fenced companion inspect and adopt the original attempt; expired ownership never proves exit or permits relaunch.',
+            controllerActive ? controller!.expires_at : null,
+          );
+        const admitted = run.status === 'reserved' && local?.capacity?.state === 'running';
+        if (run.status === 'queued' || (run.status === 'reserved' && state.next_step === 'dispatch')) {
           if (!authority)
             return wake(
               'stale_authority',
               'authority_change',
               'Inspect the current claim and requirements; cancel stale work before any explicit replacement submission.',
             );
-          if (paused)
+          if (paused && !admitted)
             return wake(
               'admissions_paused',
               'admissions_resume',
               'Resume project admissions when the operator is ready.',
             );
           if (
-            local?.budget?.status === 'needs_attention' ||
-            local?.capacity?.reason === 'budget_needs_attention'
+            !admitted &&
+            (local?.budget?.status === 'needs_attention' ||
+              local?.capacity?.reason === 'budget_needs_attention')
           )
             return wake(
               'budget_attention',
@@ -1240,6 +1249,7 @@ export class Application {
               'Reconcile observed usage and budget attention before another admission.',
             );
           if (
+            !admitted &&
             local?.capacity?.state === 'queued' &&
             ['capacity', 'fair_capacity_wait'].includes(local.capacity.reason ?? '')
           )
@@ -1248,7 +1258,7 @@ export class Application {
               'capacity_change',
               'Wait for eligible host capacity; do not bypass configured limits.',
             );
-          if (controllerActive)
+          if (run.status === 'queued' && controllerActive)
             return wake(
               'controller_busy',
               'controller_available',
@@ -1258,28 +1268,17 @@ export class Application {
           return wake(
             'awaiting_dispatch',
             'dispatch',
-            'Run the configured companion; it rechecks claim authority and host admission before dispatch.',
+            admitted
+              ? 'Let the owning companion dispatch already admitted work after its final authority check; pause drains this admission.'
+              : 'Let the configured companion recheck authority and finish host admission before dispatch; do not launch this attempt independently.',
           );
         }
-        if (!reservationCurrent)
-          return wake(
-            'lease_expired',
-            'companion_reconciliation',
-            'Let a fenced companion inspect and adopt the original attempt; expiry never proves exit or permits relaunch.',
-            controllerActive ? controller!.expires_at : null,
-          );
         if (state.observation?.kind === 'running')
           return wake(
             'awaiting_process_result',
             'process_result_or_timeout',
             'Wait for the durable process result; timeout triggers inspection, never automatic capacity release.',
             local?.capacity?.timeout_at ?? null,
-          );
-        if (state.next_step === 'dispatch')
-          return wake(
-            'awaiting_dispatch',
-            'dispatch',
-            'Let the owning companion finish admission and dispatch; do not launch this attempt independently.',
           );
         return wake(
           'launch_uncertain',
