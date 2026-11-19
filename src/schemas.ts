@@ -86,6 +86,15 @@ export const schemas = {
       max_tokens: maxTokens.default(2048),
     })
     .strict(),
+  run_timeline: z
+    .object({
+      ...project,
+      run_id: id,
+      after_sequence: z.int().min(0).max(2147483647).default(0),
+      limit: z.int().min(1).max(50).default(10),
+      max_tokens: maxTokens.default(4096),
+    })
+    .strict(),
   project_list: z.object(page).strict(),
   project_get: z.object(project).strict(),
   project_create: z
@@ -325,6 +334,7 @@ export type Input<K extends Operation> = z.infer<(typeof schemas)[K]>;
 export const readOperations = new Set<Operation>([
   'run_get',
   'artifact_read',
+  'run_timeline',
   'project_list',
   'project_get',
   'ticket_get',
@@ -338,6 +348,8 @@ export const readOperations = new Set<Operation>([
   'changes_since',
 ]);
 export const descriptions: Record<Operation, string> = {
+  run_timeline:
+    'Explain one authorized run, its immutable observation timeline, current ownership and next safe wake/action. Paginate by after_sequence; max_tokens bounds the complete result. Full profile only; no transcripts or credentials.',
   run_submit:
     'Atomically persist a checkpoint, registered script execution, and exit-code continuation using your live claim. Available in the full profile; scripts are configured by the operator.',
   run_get:
@@ -356,8 +368,7 @@ export const descriptions: Record<Operation, string> = {
     'Atomically create up to 50 tickets with acceptance criteria. Use status ready to make work claimable.',
   ticket_get:
     'Read current details, criteria, links, claim and blockers by UUID or key. For history use ticket_history.',
-  ticket_history:
-    'Page ticket notes, submissions, reviews, or GitHub evidence.',
+  ticket_history: 'Page ticket notes, submissions, reviews, or GitHub evidence.',
   ticket_list: 'List project tickets, optionally filtered by status.',
   ticket_update:
     'Edit a ticket with revision protection. Requirement changes revoke claims and invalidate affected approvals.',

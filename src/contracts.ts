@@ -364,6 +364,38 @@ export interface ExecutionReconciliation {
   next_step: ExecutionObservation['next_step'];
   cancellation?: ExecutionCancellation | null;
 }
+export interface ExecutionLocalStatus {
+  observed_at: string;
+  capacity: {
+    state: 'queued' | 'running' | 'reconciling' | 'settled' | 'cancelled';
+    reason:
+      | 'capacity'
+      | 'fair_capacity_wait'
+      | 'lease_expired'
+      | 'cancel_requested'
+      | 'restart_reconciliation'
+      | 'budget_needs_attention'
+      | 'other'
+      | null;
+    lease_expires_at: string | null;
+    timeout_at: string | null;
+  } | null;
+  budget: {
+    status: 'ready' | 'needs_attention';
+    basis: 'charged_or_reserved';
+    remaining: {
+      attempts: number;
+      provider_tokens: number;
+      runtime_ms: number;
+      cost_usd_micros: number | null;
+    };
+    unknown_usage_invocations: number;
+    in_flight: number;
+  } | null;
+}
+export interface ExecutionStatusProvider {
+  observe(projectId: string, runId: string): ExecutionLocalStatus | null;
+}
 export interface OutboundDelivery {
   id: string;
   event_id: string;

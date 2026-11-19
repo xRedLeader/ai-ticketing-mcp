@@ -17,7 +17,7 @@ Every profile includes `project_list`, `project_get`, `ticket_list`, `ticket_con
 | `worker` (16 tools)   | `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`, `ticket_note`, `ticket_submit`                              | execution, handoff |
 | `planner` (17 tools)  | `tickets_create`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_note`, `knowledge_write`, `ticket_github_refresh` | planning           |
 | `reviewer` (13 tools) | `ticket_review`, `ticket_note`, `ticket_github_refresh`                                                                          | verification       |
-| `full` (30 tools)     | All tools below, including project administration, `work_next`, `run_submit`, `run_get`, and `artifact_read`                     | all four           |
+| `full` (31 tools)     | All tools below, including project administration, `work_next`, `run_submit`, `run_get`, `artifact_read`, and `run_timeline`     | all four           |
 
 Profiles are not an access-control boundary. They select tool exposure; every operation retains its OAuth scope and project-role checks. Resources remain independently authorized and available in every profile. Guides and prompts follow the selected profile; the tool surface works without either.
 

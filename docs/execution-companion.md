@@ -54,6 +54,36 @@ Dispatch persists an immutable attempt and its reservation, admits host capacity
 
 Capacity admission waits at most 30 seconds, with asynchronous checks at most one second apart. Exhaustion cancels its queued entry and records a pre-start failure. Admission uses the exact script queue ID and never takes another script or agent job. Application/controller and capacity heartbeats retain independent ownership fences. Lease expiry alone never releases an occupied host slot.
 
+## Compact run timeline and next wake
+
+Use the full-profile MCP tool `run_timeline`, or the existing trusted CLI:
+
+```powershell
+node dist/cli.js call --sqlite STORE --actor ACTOR --operation run_timeline --input-file timeline.json
+```
+
+```json
+{
+  "project_id": "PROJECT_UUID",
+  "run_id": "RUN_UUID",
+  "after_sequence": 0,
+  "limit": 10,
+  "max_tokens": 4096
+}
+```
+
+The view includes authoritative run/attempt IDs, submitted/current requirement revisions, current ticket revision, claim/controller/reservation status, continuation, cancellation/effect state, and a safe next action. It omits transcripts, checkpoint/note text, artifact contents/references, arbitrary owner/provider/model labels, process identities and all ownership credentials. Native error/signal observations are summarized without exposing arbitrary strings; use authorized `run_get` for the exact recorded result. Aggregate metrics contain numeric attempt/observation counts only. Worker, planner and reviewer catalogs are unchanged.
+
+History uses the existing immutable observation `sequence`, ordered ascending. Pass `page.next_after_sequence` while `has_more` is true. Restart, repeated reads, cancellation and controller replacement cannot reorder or duplicate entries already read. New observations append after the last sequence; current summary fields refresh from one authoritative store snapshot on every call. Separate local observations have their own `observed_at` and may be absent or unavailable.
+
+`limit` is 1–50. `max_tokens` is 512–32768, default 4096, counting the complete canonical success envelope. Entries are removed from the end to fit, setting `truncated_by_budget`; the next sequence always advances when more entries exist. If the required summary and one entry cannot fit, `CONTEXT_TOO_LARGE` reports `required_tokens` without returning a partial page. Each page reads at most `limit + 1` history rows plus the latest observation and existing bounded authority checks; it never loads a transcript. Optional host inspection/reporting uses the existing local APIs, which scan their host/run ledger data; this change does not establish sustained-load performance.
+
+`waiting_reason` distinguishes paused admissions, stale authority, another controller, capacity/budget waits, dispatch, process result, expired ownership, uncertain launch/exit, unresolved effects, and terminal capacity awaiting reconciliation. `next_wake.condition` names the event the operator or companion must observe, with `at` only for an observed lease/deadline. A deadline is an inspection threshold, never proof of exit, capacity release, rollback or permission to relaunch. A terminal result with an occupied host entry still directs reconciliation of the exact original capacity.
+
+This pinned stack does not yet include SELF-28's durable wake records. The view reports known continuation/reconciliation conditions, not a scheduled model invocation or an invented wake time. A future additive integration can expose an authenticated durable wake record without changing observation pagination.
+
+For existing single-host capacity and agent-budget data, configure both `EXECUTION_STATUS_LEDGER_FILE` (absolute operator-owned HostCapacity ledger) and `EXECUTION_STATUS_HOST_ID` on the runtime/CLI. No tool input accepts paths, host IDs, ledger IDs or budget overrides. Only the authorized project and exact run are observed; other projects' queue/resource breakdowns and full usage entries are never returned. The provider reuses HostCapacity inspection/reporting without admitting, settling or invoking work. Remaining budget uses conservative charged-or-reserved accounting, including retained in-flight allowances; it does not estimate unobserved actual usage. Missing/unavailable budgets stay `null`, never zero. Host occupancy and agent budgets remain separate from execution results.
+
 ## Operator pause, drain and cancellation
 
 These trusted local controls require a project-admin actor and stay out of worker MCP tools. Pause and cancellation requests persist in the ticket store across controller restart. No process ID is accepted from a ticket or cancellation command.

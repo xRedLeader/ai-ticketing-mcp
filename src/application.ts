@@ -35,6 +35,7 @@ import {
   type ExecutionProcessIdentity,
   type ExecutionReconciliation,
   type ExecutionCancellation,
+  type ExecutionStatusProvider,
   type Continuation,
   validateGitHubConfiguration,
 } from './contracts.js';
@@ -64,6 +65,7 @@ export interface ApplicationOptions {
   executionRecipes?: readonly ExecutionRecipeRegistration[];
   executionArtifacts?: { directory: string; ttl_ms?: number };
   clientCapabilities?: ClientCapabilities;
+  executionStatus?: ExecutionStatusProvider;
 }
 const LEASE_MS = 600_000;
 const webhookEvents = new Set([
@@ -104,6 +106,7 @@ export class Application {
   private readonly executionRecipes = new Map<string, ExecutionRecipeRegistration>();
   private readonly executionArtifacts?: ExecutionArtifacts;
   private readonly clientCapabilities?: ClientCapabilities;
+  private readonly executionStatus?: ExecutionStatusProvider;
   readonly metrics = {
     requests: 0,
     errors: 0,
@@ -132,6 +135,7 @@ export class Application {
       );
     }
     this.storage = options.storage;
+    this.executionStatus = options.executionStatus;
     this.searchAdapter = options.search;
     this.embeddings = options.embeddings
       ? options.embeddings instanceof CachedEmbeddings
@@ -1142,6 +1146,269 @@ export class Application {
             ? 'none'
             : (observation?.next_step ?? (run.status === 'queued' ? 'dispatch' : 'inspect_launch')),
     };
+  }
+  private async executionTimeline(actorId: string, input: Input<'run_timeline'>) {
+    return this.storage.readSnapshot(async (reader) => {
+      await this.access(reader, await this.actor(actorId, reader), input.project_id);
+      ensure(
+        this.storage.executionRuns,
+        'UNSUPPORTED_EXECUTION_RUNS',
+        'Storage does not support execution runs.',
+      );
+      const run = await reader.get('execution_jobs', input.run_id);
+      ensure(run?.project_id === input.project_id, 'NOT_FOUND', 'Execution run not found.');
+      const ticket = await reader.get('tickets', run.ticket_id);
+      const continuation = await reader.get('continuations', run.continuation_id);
+      ensure(
+        ticket?.project_id === input.project_id &&
+          continuation?.run_id === run.id &&
+          continuation.project_id === input.project_id,
+        'INVALID_REFERENCE',
+        'Execution ticket or continuation is missing.',
+      );
+      const state = await this.executionReconciliation(reader, run);
+      const controller = await reader.get('execution_controllers', 'execution');
+      const claim = await reader.get('claims', run.ticket_id);
+      const now = this.timestamp(),
+        claimCurrent = await this.executionClaimCurrent(reader, run);
+      const authority = await this.executionAuthority(reader, run);
+      const paused = (await reader.get('execution_admissions', input.project_id))?.paused ?? false;
+      const local = this.executionStatus?.observe(input.project_id, run.id) ?? null;
+      const controllerActive =
+        !!controller && controller.owner_id !== 'unclaimed' && controller.expires_at > now;
+      const reservationCurrent = !!run.locked_until && run.locked_until > now;
+      const wake = (reason: string, condition: string, action: string, at: string | null = null) => ({
+        reason,
+        next: { condition, at, action },
+      });
+      const cancellation = state.cancellation;
+      const waiting = (() => {
+        if (cancellation?.process_state === 'requested')
+          return wake(
+            'cancellation_requested',
+            'process_result_or_timeout',
+            'Wait for the matching supervisor to confirm exit; cancellation does not roll back effects.',
+          );
+        if (cancellation?.process_state === 'unresolved')
+          return wake(
+            'process_exit_unconfirmed',
+            'operator_reconciliation',
+            'Inspect the original attempt and external effects; provide authoritative exit evidence before releasing capacity.',
+          );
+        if (cancellation?.effects_state === 'unresolved')
+          return wake(
+            'effects_unresolved',
+            'operator_reconciliation',
+            'Inspect effects already performed and record external-effect reconciliation evidence; do not rerun this attempt.',
+          );
+        if (
+          local?.capacity &&
+          (local.capacity.state === 'reconciling' ||
+            (['succeeded', 'failed'].includes(run.status) && local.capacity.state === 'running'))
+        )
+          return wake(
+            'capacity_reconciliation',
+            'companion_reconciliation',
+            'Let a fenced companion replay matching exit evidence and reconcile exact host capacity; neither terminal status nor lease expiry permits release alone.',
+          );
+        if (['succeeded', 'failed'].includes(run.status))
+          return wake(
+            'completed',
+            'none',
+            'Read the recorded outcome and continuation; no automatic execution retry is scheduled.',
+          );
+        if (run.status === 'queued') {
+          if (!authority)
+            return wake(
+              'stale_authority',
+              'authority_change',
+              'Inspect the current claim and requirements; cancel stale work before any explicit replacement submission.',
+            );
+          if (paused)
+            return wake(
+              'admissions_paused',
+              'admissions_resume',
+              'Resume project admissions when the operator is ready.',
+            );
+          if (
+            local?.budget?.status === 'needs_attention' ||
+            local?.capacity?.reason === 'budget_needs_attention'
+          )
+            return wake(
+              'budget_attention',
+              'budget_attention',
+              'Reconcile observed usage and budget attention before another admission.',
+            );
+          if (
+            local?.capacity?.state === 'queued' &&
+            ['capacity', 'fair_capacity_wait'].includes(local.capacity.reason ?? '')
+          )
+            return wake(
+              'capacity_wait',
+              'capacity_change',
+              'Wait for eligible host capacity; do not bypass configured limits.',
+            );
+          if (controllerActive)
+            return wake(
+              'controller_busy',
+              'controller_available',
+              'Wait for the current controller to release or expire, then let the companion reconcile.',
+              controller!.expires_at,
+            );
+          return wake(
+            'awaiting_dispatch',
+            'dispatch',
+            'Run the configured companion; it rechecks claim authority and host admission before dispatch.',
+          );
+        }
+        if (!reservationCurrent)
+          return wake(
+            'lease_expired',
+            'companion_reconciliation',
+            'Let a fenced companion inspect and adopt the original attempt; expiry never proves exit or permits relaunch.',
+            controllerActive ? controller!.expires_at : null,
+          );
+        if (state.observation?.kind === 'running')
+          return wake(
+            'awaiting_process_result',
+            'process_result_or_timeout',
+            'Wait for the durable process result; timeout triggers inspection, never automatic capacity release.',
+            local?.capacity?.timeout_at ?? null,
+          );
+        if (state.next_step === 'dispatch')
+          return wake(
+            'awaiting_dispatch',
+            'dispatch',
+            'Let the owning companion finish admission and dispatch; do not launch this attempt independently.',
+          );
+        return wake(
+          'launch_uncertain',
+          'companion_reconciliation',
+          'Inspect the original launch journal, process identity and effects; missing acknowledgment does not authorize relaunch.',
+        );
+      })();
+      const rows = state.attempt
+        ? await reader.find('execution_observations', {
+            where: { attempt_id: state.attempt.id, sequence: { gt: input.after_sequence } },
+            order: [{ field: 'sequence', direction: 'asc' }],
+            limit: input.limit + 1,
+          })
+        : [];
+      const {
+        id,
+        project_id,
+        ticket_id,
+        actor_id,
+        requirements_revision,
+        status,
+        checkpoint_id,
+        continuation_id,
+        created_at,
+        started_at,
+        finished_at,
+        exit_code,
+      } = run;
+      const result = {
+        observed_at: now,
+        run: {
+          id,
+          project_id,
+          ticket_id,
+          actor_id,
+          requirements_revision,
+          status,
+          checkpoint_id,
+          continuation_id,
+          created_at,
+          started_at,
+          finished_at,
+          exit_code,
+        },
+        current_revision: { ticket: ticket.revision, requirements: ticket.requirements_revision },
+        authority_current: authority,
+        admissions_paused: paused,
+        attempt: state.attempt
+          ? {
+              id: state.attempt.id,
+              ordinal: state.attempt.ordinal,
+              previous_attempt_id: state.attempt.previous_attempt_id,
+              created_at: state.attempt.created_at,
+            }
+          : null,
+        ownership: {
+          claim_actor_id: claim?.actor_id ?? null,
+          claim_current: claimCurrent,
+          controller_generation: controller?.generation ?? 0,
+          observation_generation: state.observation?.controller_generation ?? null,
+          controller_active: controllerActive,
+          controller_expires_at: controller?.expires_at ?? null,
+          reservation_current: reservationCurrent,
+          reservation_expires_at: run.locked_until,
+        },
+        state: state.state,
+        continuation: {
+          id: continuation.id,
+          status: continuation.status,
+          settled_at: continuation.settled_at,
+        },
+        cancellation: cancellation
+          ? {
+              requested_at: cancellation.requested_at,
+              process_state: cancellation.process_state,
+              effects_state: cancellation.effects_state,
+              reconciled_at: cancellation.reconciled_at,
+            }
+          : null,
+        waiting_reason: waiting.reason,
+        next_wake: waiting.next,
+        local_status: local,
+        entries: rows.slice(0, input.limit).map((entry) => ({
+          sequence: entry.sequence,
+          kind: entry.kind,
+          controller_generation: entry.controller_generation,
+          next_step: entry.next_step,
+          process_observed: entry.process_identity !== null,
+          created_at: entry.created_at,
+          outcome: entry.outcome
+            ? {
+                exit_code: entry.outcome.exit_code,
+                signal_observed: entry.outcome.signal !== null,
+                error_observed: entry.outcome.error_code !== null,
+              }
+            : null,
+        })),
+        page: {
+          after_sequence: input.after_sequence,
+          next_after_sequence: input.after_sequence,
+          has_more: rows.length > input.limit,
+          truncated_by_budget: false,
+        },
+        metrics: {
+          attempts: state.attempt ? 1 : 0,
+          latest_sequence: state.observation?.sequence ?? 0,
+          entries_returned: 0,
+        },
+      };
+      const updatePage = () => {
+        result.page.next_after_sequence = result.entries.at(-1)?.sequence ?? input.after_sequence;
+        result.metrics.entries_returned = result.entries.length;
+      };
+      updatePage();
+      while (result.entries.length > 1 && this.responseTokens(result) > input.max_tokens) {
+        result.entries.pop();
+        result.page.has_more = true;
+        result.page.truncated_by_budget = true;
+        updatePage();
+      }
+      const required = this.responseTokens(result);
+      ensure(
+        required <= input.max_tokens,
+        'CONTEXT_TOO_LARGE',
+        'Run state and one timeline entry exceed max_tokens; increase the budget before retrying.',
+        { required_tokens: required, max_tokens: input.max_tokens },
+      );
+      return result;
+    });
   }
   async listExecutionReconciliations(
     actorId: string,
@@ -2581,6 +2848,7 @@ export class Application {
         );
         return packArtifactRange(artifact, input.max_tokens, (value) => this.responseTokens(value));
       });
+    if (operation === 'run_timeline') return this.executionTimeline(actorId, input);
     if (operation === 'run_get')
       return this.storage.readSnapshot(async (reader) => {
         await this.access(reader, await this.actor(actorId, reader), input.project_id);

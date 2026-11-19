@@ -350,6 +350,166 @@ const search = z.object({
 });
 export const resultSchemas: Record<Operation, z.ZodType> = {
   artifact_read: artifactResultSchema,
+  run_timeline: z.object({
+    observed_at: timestamp,
+    run: executionJob.pick({
+      id: true,
+      project_id: true,
+      ticket_id: true,
+      actor_id: true,
+      requirements_revision: true,
+      status: true,
+      checkpoint_id: true,
+      continuation_id: true,
+      created_at: true,
+      started_at: true,
+      finished_at: true,
+      exit_code: true,
+    }),
+    current_revision: z.object({
+      ticket: z.number().int().positive(),
+      requirements: z.number().int().positive(),
+    }),
+    authority_current: z.boolean(),
+    admissions_paused: z.boolean(),
+    attempt: z
+      .object({
+        id,
+        ordinal: z.number().int().positive(),
+        previous_attempt_id: id.nullable(),
+        created_at: timestamp,
+      })
+      .nullable(),
+    ownership: z.object({
+      claim_actor_id: id.nullable(),
+      claim_current: z.boolean(),
+      controller_generation: z.number().int().nonnegative(),
+      observation_generation: z.number().int().nonnegative().nullable(),
+      controller_active: z.boolean(),
+      controller_expires_at: timestamp.nullable(),
+      reservation_current: z.boolean(),
+      reservation_expires_at: timestamp.nullable(),
+    }),
+    state: z.enum(['queued', 'running', 'completed', 'unresolved']),
+    continuation: z.object({
+      id,
+      status: z.enum(['pending', 'satisfied', 'failed']),
+      settled_at: timestamp.nullable(),
+    }),
+    cancellation: z
+      .object({
+        requested_at: timestamp,
+        process_state: z.enum(['requested', 'never_started', 'exit_confirmed', 'unresolved']),
+        effects_state: z.enum(['not_started', 'unresolved', 'reconciled']),
+        reconciled_at: timestamp.nullable(),
+      })
+      .nullable(),
+    waiting_reason: z.enum([
+      'completed',
+      'admissions_paused',
+      'stale_authority',
+      'controller_busy',
+      'lease_expired',
+      'awaiting_dispatch',
+      'awaiting_process_result',
+      'launch_uncertain',
+      'effects_unresolved',
+      'cancellation_requested',
+      'process_exit_unconfirmed',
+      'capacity_wait',
+      'budget_attention',
+      'capacity_reconciliation',
+    ]),
+    next_wake: z.object({
+      condition: z.enum([
+        'none',
+        'admissions_resume',
+        'authority_change',
+        'controller_available',
+        'companion_reconciliation',
+        'dispatch',
+        'process_result_or_timeout',
+        'operator_reconciliation',
+        'capacity_change',
+        'budget_attention',
+      ]),
+      at: timestamp.nullable(),
+      action: z.string().max(400),
+    }),
+    local_status: z
+      .object({
+        observed_at: timestamp,
+        capacity: z
+          .object({
+            state: z.enum(['queued', 'running', 'reconciling', 'settled', 'cancelled']),
+            reason: z
+              .enum([
+                'capacity',
+                'fair_capacity_wait',
+                'lease_expired',
+                'cancel_requested',
+                'restart_reconciliation',
+                'budget_needs_attention',
+                'other',
+              ])
+              .nullable(),
+            lease_expires_at: timestamp.nullable(),
+            timeout_at: timestamp.nullable(),
+          })
+          .nullable(),
+        budget: z
+          .object({
+            status: z.enum(['ready', 'needs_attention']),
+            basis: z.literal('charged_or_reserved'),
+            remaining: z.object({
+              attempts: z.number().int().nonnegative(),
+              provider_tokens: z.number().int().nonnegative(),
+              runtime_ms: z.number().int().nonnegative(),
+              cost_usd_micros: z.number().int().nonnegative().nullable(),
+            }),
+            unknown_usage_invocations: z.number().int().nonnegative(),
+            in_flight: z.number().int().nonnegative(),
+          })
+          .nullable(),
+      })
+      .nullable(),
+    entries: z
+      .array(
+        z.object({
+          sequence: z.number().int().positive(),
+          kind: z.enum(['reserved', 'dispatching', 'running', 'completed', 'unresolved']),
+          controller_generation: z.number().int().nonnegative(),
+          next_step: z.enum([
+            'dispatch',
+            'inspect_launch',
+            'wait_for_result',
+            'inspect_side_effects',
+            'none',
+          ]),
+          process_observed: z.boolean(),
+          created_at: timestamp,
+          outcome: z
+            .object({
+              exit_code: z.number().int().nullable(),
+              signal_observed: z.boolean(),
+              error_observed: z.boolean(),
+            })
+            .nullable(),
+        }),
+      )
+      .max(50),
+    page: z.object({
+      after_sequence: z.number().int().nonnegative(),
+      next_after_sequence: z.number().int().nonnegative(),
+      has_more: z.boolean(),
+      truncated_by_budget: z.boolean(),
+    }),
+    metrics: z.object({
+      attempts: z.number().int().nonnegative(),
+      latest_sequence: z.number().int().nonnegative(),
+      entries_returned: z.number().int().nonnegative(),
+    }),
+  }),
   run_submit: z.object({
     run_id: id,
     project_id: id,
