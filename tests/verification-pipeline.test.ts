@@ -316,6 +316,79 @@ it('never retries without a durable journal or beyond its original step deadline
   }
 });
 
+it('starts no native process when identity validation or pre-spawn work exhausts the step budget', async (t) => {
+  for (const permittedClockCalls of [3, 4]) {
+    const f = await fixture([`require('node:fs').writeFileSync('must-not-run','x')`]);
+    try {
+      f.config.pipelines[0]!.steps[0]!.recovery = {
+        signature: 'RESOURCE_BUSY',
+        exit_code: 75,
+        effects: 'none',
+      };
+      f.config.recipes[1]!.timeout_ms = 1000;
+      const pipeline = f.pipeline();
+      let calls = 0;
+      t.mock.method(performance, 'now', () => (++calls <= permittedClockCalls ? 0 : 2000));
+      const report = await runVerificationPipeline(
+        pipeline,
+        Date.now() + 30000,
+        join(f.directory, 'pipeline-report.json'),
+      );
+      assert.equal(report.status, 'failed');
+      assert.equal(report.error_code, 'TIMEOUT');
+      assert.equal(report.cleanup_verified, true);
+      assert.equal(report.steps[0]!.status, 'skipped');
+      assert.equal(report.steps[0]!.exit_code, null);
+      assert.equal(report.steps[0]!.attempts, undefined);
+      assert.equal(existsSync(join(f.repository, 'must-not-run')), false);
+    } finally {
+      t.mock.restoreAll();
+      await f.dispose();
+    }
+  }
+});
+
+it('starts no retry when the aggregate step budget expires after its identity gate', async (t) => {
+  const failure = JSON.stringify({
+    kind: 'transient_failure',
+    signature: 'RESOURCE_BUSY',
+    effects: 'none',
+    approval_required: false,
+  });
+  const f = await fixture([
+    `require('node:fs').appendFileSync('invocations','x');process.stderr.write(${JSON.stringify(failure)});process.exitCode=75`,
+  ]);
+  try {
+    f.config.pipelines[0]!.steps[0]!.recovery = {
+      signature: 'RESOURCE_BUSY',
+      exit_code: 75,
+      effects: 'none',
+    };
+    f.config.recipes[1]!.timeout_ms = 1000;
+    const pipeline = f.pipeline(),
+      journal = join(f.directory, 'pipeline-recovery-step-0-1.json');
+    let retryClockCalls = 0;
+    t.mock.method(performance, 'now', () => (!existsSync(journal) || ++retryClockCalls === 1 ? 0 : 2000));
+    const report = await runVerificationPipeline(
+      pipeline,
+      Date.now() + 30000,
+      join(f.directory, 'pipeline-report.json'),
+    );
+    assert.equal(report.error_code, 'RECOVERY_BUDGET_EXHAUSTED');
+    assert.equal(report.steps[0]!.attempts!.length, 1);
+    assert.equal(report.steps[0]!.diagnostics.stderr.text, failure);
+    assert.equal(await readFile(join(f.repository, 'invocations'), 'utf8'), 'x');
+    assert.equal(
+      JSON.parse(await readFile(join(f.directory, 'pipeline-recovery-step-0-2.json'), 'utf8')).steps[0]
+        .recovery.state,
+      'stopped',
+    );
+  } finally {
+    t.mock.restoreAll();
+    await f.dispose();
+  }
+});
+
 it('refuses retry when intent publication fails and never replaces original journal evidence', async () => {
   const failure = JSON.stringify({
     kind: 'transient_failure',

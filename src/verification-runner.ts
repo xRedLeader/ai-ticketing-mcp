@@ -140,7 +140,7 @@ export async function runVerificationPipeline(
       ? Math.min(deadline, performance.now() + step.command.timeout_ms)
       : deadline;
     const before =
-      pipelineIdentityError(pipeline, step) ?? (performance.now() >= deadline ? 'TIMEOUT' : null);
+      pipelineIdentityError(pipeline, step) ?? (performance.now() >= stepDeadline ? 'TIMEOUT' : null);
     if (before) {
       result.error_code = before;
       stopped = before;
@@ -181,14 +181,27 @@ export async function runVerificationPipeline(
           recordRecovery(number);
           break;
         }
-        for (const stream of ['stdout', 'stderr'] as const)
-          result.diagnostics[stream] = { text: '', total_bytes: 0, captured_bytes: 0, truncated: false };
       }
-      const attemptStarted = step.recovery ? performance.now() : 0;
       timedOut = false;
       let processError: string | null = null;
       let termination: Promise<boolean> | undefined;
       const captures = { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+      const attemptStarted = step.recovery ? performance.now() : 0;
+      if (step.recovery && attemptStarted >= stepDeadline) {
+        const blocked = number === 1 ? 'TIMEOUT' : 'RECOVERY_BUDGET_EXHAUSTED';
+        result.error_code = blocked;
+        report.error_code = blocked;
+        stopped = blocked;
+        if (number > 1) {
+          result.recovery!.state = 'stopped';
+          result.recovery!.stop_reason = blocked;
+          recordRecovery(number);
+        }
+        break;
+      }
+      if (number > 1)
+        for (const stream of ['stdout', 'stderr'] as const)
+          result.diagnostics[stream] = { text: '', total_bytes: 0, captured_bytes: 0, truncated: false };
       const observed = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
         (resolve) => {
           const child = spawn(step.command.executable, [...step.command.argv], {
