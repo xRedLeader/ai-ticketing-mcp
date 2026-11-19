@@ -3150,20 +3150,29 @@ export class Application {
           sha256: retired.sha256,
         };
     }
-    return this.executionArtifacts
-      ? this.executionArtifacts.read(
-          artifactId,
-          {
-            run_id: run.id,
-            attempt_id: attempt.id,
-            process_token: attempt.process_token,
-            recipe_fingerprint: run.recipe_fingerprint,
-          },
-          offset,
-          length,
-          this.now().getTime(),
-        )
-      : unavailableArtifact(artifactId, offset, length, 'not_configured');
+    if (!this.executionArtifacts) return unavailableArtifact(artifactId, offset, length, 'not_configured');
+    const authority = {
+      run_id: run.id,
+      attempt_id: attempt.id,
+      process_token: attempt.process_token,
+      recipe_fingerprint: run.recipe_fingerprint,
+    };
+    const now = this.now().getTime();
+    const result = this.executionArtifacts.read(artifactId, authority, offset, length, now);
+    if (result.status !== 'expired' || !this.storage.artifactRetention) return result;
+    const transaction = reader as Transaction;
+    ensure(
+      transaction.artifactPinned,
+      'UNSUPPORTED_ARTIFACT_RETENTION',
+      'Storage must check expired artifact pins.',
+    );
+    const pinned = await transaction.artifactPinned({
+      run_id: run.id,
+      attempt_id: attempt.id,
+      ticket_id: run.ticket_id,
+      checkpoint_id: run.checkpoint_id,
+    });
+    return pinned ? this.executionArtifacts.read(artifactId, authority, offset, length, now, true) : result;
   }
   private async executionResume(reader: Reader, run: ExecutionJob) {
     const artifacts: string[] = [];

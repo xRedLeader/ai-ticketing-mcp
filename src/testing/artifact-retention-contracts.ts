@@ -14,7 +14,7 @@ import { fixture, hasCode, type ContractAdapters } from './contracts.js';
 
 type Adapters = ContractAdapters & { runtimeEnv: NodeJS.ProcessEnv; reopen(): Promise<ContractAdapters> };
 export function registerArtifactRetentionContracts(name: string, factory: () => Promise<Adapters>) {
-  async function setup() {
+  async function setup(exitCode = 0) {
     const adapters = await factory();
     await adapters.storage.migrate();
     const f = await fixture(adapters, 'self');
@@ -54,7 +54,7 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
       recipe_fingerprint: run.recipe_fingerprint,
       finished_at: f.clock.now.getTime(),
       cleanup_verified: true,
-      exit_code: 0,
+      exit_code: exitCode,
       signal: null,
       error_code: null,
       bytes: { stdout: bytes.length, stderr: bytes.length },
@@ -71,7 +71,7 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
     ])
       await writeFile(join(path, file), 'protected');
     await app.settleExecutionRun(f.admin.id, f.project.id, run.id, run.reservation_token!, {
-      exit_code: 0,
+      exit_code: exitCode,
       signal: null,
       error_code: null,
       artifacts: refs,
@@ -118,9 +118,13 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
       read,
     };
   }
-  const check = (title: string, test: (f: Awaited<ReturnType<typeof setup>>) => Promise<void>) =>
+  const check = (
+    title: string,
+    test: (f: Awaited<ReturnType<typeof setup>>) => Promise<void>,
+    exitCode = 0,
+  ) =>
     it(`${name} artifact retention: ${title}`, async () => {
-      const f = await setup();
+      const f = await setup(exitCode);
       try {
         await test(f);
       } finally {
@@ -194,6 +198,14 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
     await f.finish([f.refs[0]!]);
     await assert.rejects(f.retire(), hasCode('ARTIFACT_PINNED'));
     assert.ok(existsSync(join(f.path, 'stdout.log')));
+    const read = await f.read();
+    assert.equal(read.status, 'available');
+    assert.equal(read.expires_at, null);
+    assert.deepEqual(Buffer.from(read.range.data, 'base64'), f.bytes.subarray(0, 12));
+    await assert.rejects(
+      f.app.execute(f.outsider.id, 'artifact_read', { project_id: f.project.id, artifact_id: f.refs[0] }),
+      hasCode('FORBIDDEN'),
+    );
   });
   check('keeps memory provenance pinned even after archival and unrelated edits', async (f) => {
     await f.finish();
@@ -212,6 +224,7 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
       verification: { state: 'verified', evidence: 'Checked the exact checkpoint revision.' },
       status: 'accepted',
     })) as any;
+    assert.equal((await f.read()).status, 'available');
     await f.call(f.worker.id, 'knowledge_write', {
       ...input,
       knowledge_id: knowledge.id,
@@ -220,6 +233,7 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
       sources: [],
     });
     await assert.rejects(f.retire(), hasCode('ARTIFACT_PINNED'));
+    assert.equal((await f.read()).status, 'available');
   });
   check('serializes cross-project pins and reads with retirement, leaving heartbeat unblocked', async (f) => {
     await f.finish();
@@ -295,7 +309,58 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
       fact: null,
     });
     await assert.rejects(f.retire(), hasCode('ARTIFACT_PINNED'));
+    assert.equal((await f.read()).status, 'available');
   });
+  check('keeps unpinned expiry and avoids global pin checks on unexpired reads', async (f) => {
+    const wrapped = proxy(
+      f.storage,
+      (tx) =>
+        new Proxy(tx, {
+          get(target, property) {
+            if (property === 'artifactPinned')
+              return () => {
+                throw new Error('Unexpected unexpired pin scan');
+              };
+            const value = Reflect.get(target, property);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        }),
+    );
+    assert.equal((await f.read(f.make(wrapped))).status, 'available');
+    await f.finish();
+    const expired = await f.read();
+    assert.equal(expired.status, 'expired');
+    assert.equal(expired.range.data, '');
+  });
+  check(
+    'keeps pinned failure locations and bounded run recovery usable beyond TTL',
+    async (f) => {
+      await f.finish([f.refs[1]!]);
+      const bounded = (await f.app.execute(f.worker.id, 'run_get', {
+        project_id: f.project.id,
+        run_id: f.run.id,
+        max_tokens: 512,
+      })) as any;
+      assert.equal(bounded.run.exit_code, 7);
+      assert.ok(bounded.omitted.length > 0);
+      for (const omission of bounded.omitted)
+        await f.app.execute(f.worker.id, omission.retrieve_with, omission.arguments);
+      const view = (await f.app.execute(f.worker.id, 'run_get', {
+        project_id: f.project.id,
+        run_id: f.run.id,
+      })) as any;
+      assert.equal(view.failure_location.tool, 'artifact_read');
+      const evidence = (await f.app.execute(
+        f.worker.id,
+        view.failure_location.tool,
+        view.failure_location.arguments,
+      )) as any;
+      assert.equal(evidence.status, 'available');
+      assert.deepEqual(Buffer.from(evidence.range.data, 'base64'), f.bytes);
+      assert.equal(evidence.sha256, createHash('sha256').update(f.bytes).digest('hex'));
+    },
+    7,
+  );
   check('preserves terminal logs cited by trusted cancellation reconciliation evidence', async (f) => {
     await f.finish();
     await f.app.cancelExecutionRun(f.admin.id, f.project.id, f.run.id);

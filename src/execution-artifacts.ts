@@ -262,6 +262,7 @@ export class ExecutionArtifacts {
     offset: number,
     length: number,
     now: number,
+    pinned = false,
   ): ArtifactResult {
     const identity = artifactIdentity.exec(artifactId);
     ensure(
@@ -308,8 +309,10 @@ export class ExecutionArtifacts {
         'Artifact result identity is invalid.',
       );
       result.expires_at = new Date(metadata.finished_at + this.ttlMs).toISOString();
-      if (now >= metadata.finished_at + this.ttlMs)
-        return unavailableArtifact(artifactId, offset, length, 'expired', result.expires_at);
+      if (now >= metadata.finished_at + this.ttlMs) {
+        if (!pinned) return unavailableArtifact(artifactId, offset, length, 'expired', result.expires_at);
+        result.expires_at = null;
+      }
       if (identity[3] === 'result' && metadata.artifact_errors?.includes('OUTCOME_WRITE_FAILED'))
         return result;
       const name = identity[3]!,
