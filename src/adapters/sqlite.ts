@@ -208,6 +208,18 @@ const columns: Record<Table, string[]> = {
   ],
   knowledge: knowledgeColumns,
   knowledge_revisions: [...knowledgeColumns, 'knowledge_id'],
+  knowledge_promotions: [
+    'id',
+    'project_id',
+    'source_project_id',
+    'source_knowledge_id',
+    'source_revision',
+    'fact',
+    'actor_id',
+    'created_at',
+    'withdrawn_by',
+    'withdrawn_at',
+  ],
   events: ['id', 'project_id', 'seq', 'actor_id', 'type', 'entity_id', 'data', 'created_at'],
   receipts: ['id', 'project_id', 'actor_id', 'operation', 'input_hash', 'result', 'created_at'],
   jobs: [

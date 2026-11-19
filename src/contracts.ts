@@ -158,6 +158,18 @@ export interface Knowledge {
 export interface KnowledgeRevision extends Knowledge {
   knowledge_id: string;
 }
+export interface KnowledgePromotion {
+  id: string;
+  project_id: string;
+  source_project_id: string;
+  source_knowledge_id: string;
+  source_revision: number;
+  fact: { key: string; value: string };
+  actor_id: string;
+  created_at: string;
+  withdrawn_by: string | null;
+  withdrawn_at: string | null;
+}
 export interface Event {
   id: string;
   project_id: string;
@@ -444,6 +456,7 @@ export interface Tables {
   reviews: Review;
   knowledge: Knowledge;
   knowledge_revisions: KnowledgeRevision;
+  knowledge_promotions: KnowledgePromotion;
   events: Event;
   receipts: Receipt;
   jobs: Job;

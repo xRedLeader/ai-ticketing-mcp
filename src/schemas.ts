@@ -298,6 +298,25 @@ export const schemas = {
     .strict(),
   checkpoint_get: z.object({ ...project, checkpoint_id: id }).strict(),
   knowledge_get: z.object({ ...project, knowledge_id: id, revision: z.int().positive().optional() }).strict(),
+  knowledge_promote: z
+    .object({
+      ...project,
+      ...mutation,
+      source_project_id: id,
+      source_knowledge_id: id,
+      source_revision: z.int().positive(),
+      fact: z.object({ key: text.max(300), value: text.max(2000) }).strict(),
+    })
+    .strict(),
+  knowledge_withdraw: z
+    .object({
+      ...project,
+      ...mutation,
+      promotion_id: id,
+      source_project_id: id.optional(),
+    })
+    .strict(),
+  knowledge_shared_list: z.object({ ...project, ...page }).strict(),
   knowledge_write: z
     .object({
       ...project,
@@ -361,6 +380,7 @@ export const readOperations = new Set<Operation>([
   'ticket_context',
   'search',
   'knowledge_get',
+  'knowledge_shared_list',
   'checkpoint_get',
   'changes_since',
 ]);
@@ -402,6 +422,12 @@ export const descriptions: Record<Operation, string> = {
   search: 'Search current records by text and meaning.',
   checkpoint_get: 'Read an exact checkpoint by ID.',
   knowledge_get: 'Read memory validity, conflicts and history. Follow current requirements.',
+  knowledge_promote:
+    'Explicitly share one exact supported fact into project_id. Requires administrator access to both projects. Never copies source prose or indexes.',
+  knowledge_withdraw:
+    'Withdraw a shared fact as destination administrator, or supply source_project_id as its source administrator. Audit remains.',
+  knowledge_shared_list:
+    'Read selected shared facts under current destination access and source validity. Private provenance requires source access. Not ticket requirements.',
   knowledge_write:
     'Propose project knowledge with sources, optional fact key/value, expiry and revision-pinned supersedes. Verification and acceptance require authorized review of unchanged evidence. Only current supported undisputed facts allow trusted reuse; current requirements remain mandatory. Policy documents require admin. Updates require expected_revision.',
   changes_since:
