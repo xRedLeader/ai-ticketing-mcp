@@ -216,7 +216,12 @@ export function registerWakeContractTests(
           reserved.reservation_token!,
           60_000,
         );
-        const outcome = { exit_code, signal: null, artifacts: ['private-result-content'], error_code: null };
+        const outcome = {
+          exit_code,
+          signal: null,
+          artifacts: ['private-result-content'],
+          error_code: exit_code ? 'TIMEOUT' : null,
+        };
         for (let index = 0; index < 2; index++)
           assert.equal(
             await app.settleExecutionRun(
@@ -242,27 +247,34 @@ export function registerWakeContractTests(
           2,
         );
         assert.equal((await get()).pending.length, 2);
-        assert.equal(
-          await fresh.claimWakeDecision(f.admin.id, f.project.id, {
-            ticket_id: f.target.id,
-            expected_generation: 0,
-          }),
-          null,
-        );
-        for (
-          let index = 0;
-          index < 10 &&
-          (await get()).cursor !== (await reopened.storage.get('projects', f.project.id))!.event_seq;
-          index++
-        )
-          await fresh.evaluateWakeConditions(f.admin.id, f.project.id, { event_limit: 2 });
+        const observedCursor = (await get()).cursor;
+        await fresh.execute(f.worker.id, 'tickets_create', {
+          project_id: f.project.id,
+          idempotency_key: randomUUID(),
+          tickets: [
+            {
+              title: 'Unrelated incoming work',
+              description: 'Unrelated project traffic.',
+              criteria: ['Unrelated condition.'],
+            },
+          ],
+        });
         const decision = (await fresh.claimWakeDecision(f.admin.id, f.project.id, {
           ticket_id: f.target.id,
           expected_generation: 0,
         }))!;
+        assert.ok(decision, 'Latched terminal/deadline reasons must not wait for unrelated traffic.');
+        assert.equal(decision.through_cursor, observedCursor);
+        assert.ok(
+          decision.through_cursor < (await reopened.storage.get('projects', f.project.id))!.event_seq,
+        );
         assert.deepEqual(decision.reasons.map((reason) => reason.kind).sort(), ['continuation', 'deadline']);
         const terminal = decision.reasons.find((reason) => reason.kind === 'continuation')!;
         assert.equal(terminal.kind === 'continuation' && terminal.status, exit_code ? 'failed' : 'satisfied');
+        assert.equal(
+          terminal.kind === 'continuation' && terminal.code,
+          exit_code ? 'TIMEOUT' : 'CONTINUATION_SATISFIED',
+        );
         assert.equal(JSON.stringify(decision).includes('private-result-content'), false);
         const again = await f.reopen();
         const reconnected = createApplication({ ...again, now: () => f.clock.now });
@@ -295,6 +307,40 @@ export function registerWakeContractTests(
         );
       },
     );
+  check(
+    'claims a latched deadline during unrelated traffic while preserving partially collected event bursts',
+    async (f) => {
+      await f.register({ deadline: f.clock.now.toISOString() });
+      for (let index = 0; index < 5; index++) await f.note();
+      await f.evaluate({ event_limit: 2 });
+      const observedCursor = (await f.get()).cursor;
+      await f.append('ticket.updated', { revision: 1 }, randomUUID());
+      const urgent = await f.claimWake();
+      assert.ok(urgent, 'A latched deadline must remain claimable before catch-up.');
+      assert.deepEqual(
+        urgent.reasons.map((reason) => reason.kind),
+        ['deadline'],
+      );
+      assert.equal(urgent.through_cursor, observedCursor);
+      const pending = (await f.get()).pending;
+      assert.equal(pending.length, 1);
+      assert.equal(pending[0]!.kind === 'event' && pending[0]!.count, 2);
+      assert.equal((await f.get()).cursor, observedCursor);
+      await f.note();
+      await f.evaluate({ event_limit: 2 });
+      await f.append('ticket.updated', { revision: 2 }, randomUUID());
+      assert.equal(await f.claimWake(1), null);
+      assert.equal(await f.finish(urgent), true);
+      assert.equal(await f.claimWake(1), null);
+      await f.drain();
+      const burst = (await f.claimWake(1))!;
+      assert.equal(burst.generation, 2);
+      assert.equal(burst.reasons.length, 1);
+      assert.equal(burst.reasons[0]!.kind === 'event' && burst.reasons[0]!.count, 6);
+      assert.equal(await f.finish(urgent), false);
+      assert.equal(await f.finish(burst), true);
+    },
+  );
   check('preserves pending signals on rearm and enforces exact monotonic revisions', async (f) => {
     const registration = await f.register({ deadline: f.clock.now.toISOString() });
     await assert.rejects(f.register({ expected_revision: registration.revision }), hasCode('WAKE_PENDING'));

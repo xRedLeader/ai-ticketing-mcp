@@ -246,12 +246,15 @@ export async function claimWake(
   );
   const row = await wakeRegistration(tx, project.id, input.ticket_id);
   ensure(input.expected_generation === row.generation, 'VERSION_CONFLICT', 'Wake generation changed.');
-  if (row.active || !row.pending.length || row.cursor !== project.event_seq) return null;
+  if (row.active || !row.pending.length) return null;
+  const caughtUp = row.cursor === project.event_seq;
+  const reasons = caughtUp ? row.pending : row.pending.filter((reason) => reason.kind !== 'event');
+  if (!reasons.length) return null;
   ensure(row.generation < 2147483647, 'CONFLICT', 'Wake generation exhausted.');
   const active: WakeDecision = {
     generation: row.generation + 1,
     token: randomUUID(),
-    reasons: row.pending,
+    reasons,
     through_cursor: row.cursor,
     created_at: now,
   };
@@ -259,7 +262,7 @@ export async function claimWake(
     ...row,
     generation: active.generation,
     active,
-    pending: [],
+    pending: caughtUp ? [] : row.pending.filter((reason) => reason.kind === 'event'),
     revision: row.revision + 1,
     updated_at: now,
   });
