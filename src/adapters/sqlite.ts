@@ -33,6 +33,9 @@ const knowledgeColumns = [
   'body',
   'kind',
   'sources',
+  'fact',
+  'expires_at',
+  'supersedes',
   'status',
   'verification',
   'revision',
@@ -41,6 +44,35 @@ const knowledgeColumns = [
   'updated_at',
 ];
 const columns: Record<Table, string[]> = {
+  execution_admissions: ['id', 'paused', 'actor_id', 'updated_at'],
+  execution_cancellations: [
+    'id',
+    'project_id',
+    'requested_by',
+    'requested_at',
+    'process_state',
+    'effects_state',
+    'reconciliation_note',
+    'reconciled_by',
+    'reconciled_at',
+  ],
+  wake_conditions: [
+    'id',
+    'project_id',
+    'ticket_id',
+    'actor_id',
+    'condition',
+    'deadline',
+    'cursor',
+    'revision',
+    'generation',
+    'observed',
+    'deadline_fired',
+    'pending',
+    'active',
+    'finished_token',
+    'updated_at',
+  ],
   execution_controllers: ['id', 'owner_id', 'token', 'generation', 'expires_at'],
   execution_attempts: [
     'id',
@@ -150,7 +182,7 @@ const columns: Record<Table, string[]> = {
     'ticket_revision',
     'created_at',
   ],
-  claims: ['id', 'project_id', 'ticket_id', 'actor_id', 'token', 'expires_at'],
+  claims: ['id', 'project_id', 'ticket_id', 'actor_id', 'token', 'expires_at', 'execution'],
   submissions: [
     'id',
     'project_id',
@@ -221,6 +253,10 @@ const columns: Record<Table, string[]> = {
   ],
 };
 const json = new Set([
+  'condition',
+  'observed',
+  'pending',
+  'active',
   'process_identity',
   'outcome',
   'artifacts',
@@ -231,14 +267,17 @@ const json = new Set([
   'evidence',
   'requirements_snapshot',
   'execution_hints',
+  'execution',
   'github_pull_request',
   'checks',
   'sources',
+  'fact',
+  'supersedes',
   'verification',
   'data',
   'result',
 ]);
-const booleans = new Set(['system_admin', 'blocking', 'archived']);
+const booleans = new Set(['system_admin', 'blocking', 'archived', 'paused', 'deadline_fired']);
 function encode(key: string, value: unknown): SQLInputValue {
   if (value === undefined) return null;
   if (json.has(key))
@@ -253,7 +292,10 @@ function encode(key: string, value: unknown): SQLInputValue {
 function decode(row: Record<string, unknown>) {
   return Object.fromEntries(
     Object.entries(row).flatMap(([key, value]) =>
-      (key === 'execution_hints' || key === 'github_pull_request' || key === 'scheduling_policy') &&
+      (key === 'execution_hints' ||
+        key === 'execution' ||
+        key === 'github_pull_request' ||
+        key === 'scheduling_policy') &&
       value === null
         ? []
         : [
@@ -436,12 +478,19 @@ function repository(db: DatabaseSync): Transaction {
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
       ensure(
+        table !== 'wake_conditions',
+        'IMMUTABLE_WAKE',
+        'Durable wake cursors and consumption fences cannot be deleted.',
+      );
+      ensure(
         ![
           'execution_jobs',
           'continuations',
           'execution_attempts',
           'execution_observations',
           'execution_controllers',
+          'execution_admissions',
+          'execution_cancellations',
         ].includes(table),
         'IMMUTABLE_EXECUTION',
         'Execution history cannot be deleted.',
@@ -561,6 +610,7 @@ class Handle {
   }
 }
 class SqliteStorage extends Handle implements StorageAdapter {
+  readonly wakeDecisions = true;
   readonly executionRuns = true as const;
   get executionLaunchStorage() {
     return Object.freeze({ adapter: 'sqlite' as const, filename: this.shared.path });

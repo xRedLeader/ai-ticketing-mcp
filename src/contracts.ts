@@ -14,6 +14,19 @@ export interface Actor {
 export interface ExecutionHints {
   model?: string;
   effort?: string;
+  client_id?: string;
+  operating_system?: string;
+  environment?: string;
+}
+export interface ClientSelection {
+  client_id: string;
+  fingerprint: string;
+  model: string;
+  effort?: string;
+  operating_system: string;
+  environment: string;
+  tools: string[];
+  requirements_revision: number;
 }
 export interface Project {
   id: string;
@@ -89,6 +102,7 @@ export interface Claim {
   actor_id: string;
   token: string;
   expires_at: string;
+  execution?: ClientSelection;
 }
 export interface Evidence {
   criterion_id: string;
@@ -130,6 +144,9 @@ export interface Knowledge {
   body: string;
   kind: 'policy' | 'decision' | 'convention' | 'pitfall' | 'runbook' | 'architecture' | 'note';
   sources: { kind: 'ticket' | 'knowledge' | 'checkpoint'; id: string; revision: number }[];
+  fact: { key: string; value: string } | null;
+  expires_at: string | null;
+  supersedes: { id: string; revision: number }[];
   status: 'proposed' | 'accepted';
   verification:
     { state: 'unverified' } | { state: 'verified'; actor_id: string; verified_at: string; evidence: string };
@@ -254,6 +271,59 @@ export interface ExecutionControllerFence {
   token: string;
   generation: number;
 }
+export interface ExecutionAdmission {
+  id: string;
+  paused: boolean;
+  actor_id: string;
+  updated_at: string;
+}
+export interface ExecutionCancellation {
+  id: string;
+  project_id: string;
+  requested_by: string;
+  requested_at: string;
+  process_state: 'requested' | 'never_started' | 'exit_confirmed' | 'unresolved';
+  effects_state: 'not_started' | 'unresolved' | 'reconciled';
+  reconciliation_note: string | null;
+  reconciled_by: string | null;
+  reconciled_at: string | null;
+}
+export type WakeCondition =
+  { kind: 'events'; types: string[] } | { kind: 'continuation'; continuation_id: string };
+export type WakeReason =
+  | { kind: 'event'; code: string; first_seq: number; last_seq: number; count: number }
+  | {
+      kind: 'continuation';
+      continuation_id: string;
+      run_id: string;
+      status: 'satisfied' | 'failed';
+      code: string;
+    }
+  | { kind: 'deadline'; at: string };
+export interface WakeDecision {
+  generation: number;
+  token: string;
+  reasons: WakeReason[];
+  through_cursor: number;
+  created_at: string;
+}
+export interface WakeRegistration {
+  id: string;
+  project_id: string;
+  ticket_id: string;
+  actor_id: string;
+  condition: WakeCondition;
+  deadline: string | null;
+  cursor: number;
+  revision: number;
+  generation: number;
+  observed: Record<string, string>;
+  deadline_fired: boolean;
+  pending: WakeReason[];
+  active: WakeDecision | null;
+  finished_token: string | null;
+  updated_at: string;
+}
 export interface ExecutionController extends ExecutionControllerFence {
   id: string;
   owner_id: string;
@@ -292,6 +362,39 @@ export interface ExecutionReconciliation {
   observation: ExecutionObservation | null;
   state: 'queued' | 'running' | 'completed' | 'unresolved';
   next_step: ExecutionObservation['next_step'];
+  cancellation?: ExecutionCancellation | null;
+}
+export interface ExecutionLocalStatus {
+  observed_at: string;
+  capacity: {
+    state: 'queued' | 'running' | 'reconciling' | 'settled' | 'cancelled';
+    reason:
+      | 'capacity'
+      | 'fair_capacity_wait'
+      | 'lease_expired'
+      | 'cancel_requested'
+      | 'restart_reconciliation'
+      | 'budget_needs_attention'
+      | 'other'
+      | null;
+    lease_expires_at: string | null;
+    timeout_at: string | null;
+  } | null;
+  budget: {
+    status: 'ready' | 'needs_attention';
+    basis: 'charged_or_reserved';
+    remaining: {
+      attempts: number;
+      provider_tokens: number;
+      runtime_ms: number;
+      cost_usd_micros: number | null;
+    };
+    unknown_usage_invocations: number;
+    in_flight: number;
+  } | null;
+}
+export interface ExecutionStatusProvider {
+  observe(projectId: string, runId: string): ExecutionLocalStatus | null;
 }
 export interface OutboundDelivery {
   id: string;
@@ -319,6 +422,9 @@ export interface WebhookTarget {
   send(delivery: OutboundDelivery): Promise<{ error_code: string } | undefined>;
 }
 export interface Tables {
+  execution_admissions: ExecutionAdmission;
+  execution_cancellations: ExecutionCancellation;
+  wake_conditions: WakeRegistration;
   execution_controllers: ExecutionController;
   execution_attempts: ExecutionAttempt;
   execution_observations: ExecutionObservation;
@@ -381,6 +487,7 @@ export interface Transaction extends Reader {
   remove<K extends Table>(table: K, id: string): Promise<void>;
 }
 export interface StorageAdapter extends Reader {
+  readonly wakeDecisions?: true;
   readonly executionRuns?: true;
   /** Private bootstrap for a detached supervisor connected to this same physical store. */
   readonly executionLaunchStorage?:
@@ -425,9 +532,13 @@ export interface SearchDocument {
   memory?: {
     status: Knowledge['status'];
     verification_state: Knowledge['verification']['state'];
-    trusted_reuse: false;
+    trusted_reuse: boolean;
+    validity: MemoryValidity;
+    contradiction_count: number;
   };
 }
+export type MemoryValidity =
+  'current' | 'unsupported' | 'stale' | 'expired' | 'superseded' | 'disputed' | 'archived' | 'unavailable';
 export interface SearchHit {
   id: string;
   kind: SearchDocument['kind'];

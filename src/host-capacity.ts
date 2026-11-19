@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { ensure } from './contracts.js';
+import { ClientCapabilities, clientSelectionSchema } from './client-capabilities.js';
 import {
   UsageBudget,
   type UsageBudgetAdmission,
@@ -33,6 +34,7 @@ const queueSchema = z.strictObject({
   policy: z.enum(['priority_age', 'unblocking']).default('priority_age'),
   unfinished_dependents: count.default(0),
   eligible: z.boolean().default(true),
+  execution: clientSelectionSchema.optional(),
 });
 const leaseSchema = z.strictObject({
   host_id: id,
@@ -94,7 +96,10 @@ const compareId = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
 /** Trusted local host boundary; all dispatchers for a physical host must share this SQLite file. */
 class CapacityLedger extends UsageBudget {
-  constructor(path: string) {
+  constructor(
+    path: string,
+    private readonly clients?: ClientCapabilities,
+  ) {
     super(path);
     this.db.exec('CREATE TABLE IF NOT EXISTS host_capacity (id TEXT PRIMARY KEY, state TEXT NOT NULL)');
   }
@@ -164,6 +169,40 @@ class CapacityLedger extends UsageBudget {
       const host = this.host(hostId),
         run = admission ? this.read(request.run_id) : null;
       const project = run?.config.project_id ?? id.parse(rawProject);
+      ensure(
+        request.kind === 'agent' || !request.execution,
+        'INVALID_INPUT',
+        'Client execution choices apply only to agent work.',
+      );
+      if (request.kind === 'agent') {
+        ensure(
+          !request.execution || this.clients,
+          'CLIENT_REGISTRY_REQUIRED',
+          'Configure the operator client registry before agent admission.',
+        );
+        ensure(
+          !this.clients || request.execution,
+          'CLIENT_SELECTION_REQUIRED',
+          'Match a live authorized work claim before agent admission.',
+        );
+        const reasons =
+          request.execution && this.clients
+            ? this.clients.verify(
+                request.execution,
+                admission!.actor_id,
+                project,
+                admission!.model,
+                admission!.requirements_revision,
+                Date.now(),
+              )
+            : [];
+        ensure(
+          !reasons.length,
+          'UNSUPPORTED_EXECUTION',
+          'Agent admission requires the exact fresh registered client selection.',
+          { reasons },
+        );
+      }
       const timeout =
         admission?.allowance.runtime_ms ??
         positive.max(host.config.script_timeout_ms).parse(rawTimeout ?? host.config.script_timeout_ms);
@@ -356,6 +395,23 @@ class CapacityLedger extends UsageBudget {
             );
           });
         for (const entry of candidates) {
+          if (entry.kind === 'agent' && (this.clients || entry.execution)) {
+            const reasons =
+              this.clients && entry.execution
+                ? this.clients.verify(
+                    entry.execution,
+                    entry.admission!.actor_id,
+                    entry.project_id,
+                    entry.admission!.model,
+                    entry.admission!.requirements_revision,
+                    now,
+                  )
+                : [{ code: this.clients ? 'CLIENT_SELECTION_REQUIRED' : 'CLIENT_REGISTRY_REQUIRED' }];
+            if (reasons.length) {
+              entry.reason = `unsupported_execution:${reasons[0]!.code}`;
+              continue;
+            }
+          }
           const reasons = entry.admission ? this.budgetReasons(entry.run_id, entry.admission) : [];
           if (reasons.length) {
             this.admit(entry.run_id, entry.admission!);
@@ -644,8 +700,8 @@ class CapacityLedger extends UsageBudget {
 /** Capacity-managed dispatch surface: raw UsageBudget admission and settlement are intentionally private. */
 export class HostCapacity {
   private readonly ledger: CapacityLedger;
-  constructor(path: string) {
-    this.ledger = new CapacityLedger(path);
+  constructor(path: string, clients?: ClientCapabilities) {
+    this.ledger = new CapacityLedger(path, clients);
   }
   close() {
     this.ledger.close();

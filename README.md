@@ -76,6 +76,8 @@ For other CLI commands, set `STORAGE_ADAPTER=sqlite`, `SQLITE_PATH`, and `EMBEDD
 
 Projects and tickets accept optional `execution_hints` with `model` and `effort` strings. Ticket fields override the corresponding project defaults; `ticket_get` and context expose `effective_execution_hints` only when configured. A provided object replaces the local hints; an omitted object leaves them unchanged. Null, an empty object, or empty/null fields clear local choices so project defaults can apply. Model/effort hints never execute a provider, configure embeddings, grant permissions, or guarantee a model is accepted by the consuming client.
 
+Optional [registered client capabilities](docs/client-capabilities.md) enforce supported model/effort pairs, operating systems, tools and execution environments before matching and admission. Operator records bind support to authorized identities/projects and expire; requests can pin `client_id`, `operating_system` and `environment` through the same hints. Existing claims remain compatible when registration is not configured.
+
 ## Extending the system
 
 ```ts

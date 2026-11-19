@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { isAbsolute } from 'node:path';
+import { readFile, stat } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
 import { ensure, DomainError } from './contracts.js';
 import { createRuntime } from './runtime.js';
@@ -17,33 +19,54 @@ async function main() {
       host: { type: 'string' },
       artifacts: { type: 'string' },
       once: { type: 'boolean' },
+      pause: { type: 'boolean' },
+      resume: { type: 'boolean' },
+      drain: { type: 'boolean' },
+      cancel: { type: 'string' },
+      reconcile: { type: 'string' },
+      evidence: { type: 'string' },
     },
   });
   ensure(
     values.actor &&
       values.project &&
-      values.capacity &&
-      values.host &&
-      values.artifacts &&
-      isAbsolute(values.capacity) &&
-      isAbsolute(values.artifacts) &&
-      process.env.EXECUTION_RECIPES_FILE,
+      [values.pause, values.resume, values.drain, values.cancel, values.reconcile].filter(Boolean).length <=
+        1,
     'INVALID_CONFIG',
-    'Require --actor --project --capacity ABSOLUTE_PATH --host --artifacts ABSOLUTE_PATH and EXECUTION_RECIPES_FILE.',
+    'Require --actor --project and at most one of --pause --resume --drain --cancel RUN_UUID --reconcile RUN_UUID.',
   );
-  const recipes = loadExecutionRecipes(process.env.EXECUTION_RECIPES_FILE);
   const app = createRuntime({
     ...process.env,
     EMBEDDING_PROVIDER: 'none',
+    EXECUTION_ARTIFACTS_DIRECTORY: values.artifacts,
     ...(values.sqlite ? { STORAGE_ADAPTER: 'sqlite', SQLITE_PATH: values.sqlite } : {}),
   });
-  const capacity = new HostCapacity(values.capacity);
+  let capacity: HostCapacity | undefined;
   const abort = new AbortController();
   const stop = () => abort.abort();
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
   try {
     if (app.storage.executionLaunchStorage?.adapter === 'sqlite') await app.storage.migrate();
+    if (values.pause || values.resume || values.cancel) {
+      const result = values.cancel
+        ? await app.cancelExecutionRun(values.actor, values.project, values.cancel)
+        : await app.setExecutionAdmissions(values.actor, values.project, !!values.pause);
+      process.stdout.write(JSON.stringify(result) + '\n');
+      return;
+    }
+    ensure(
+      values.capacity &&
+        values.host &&
+        values.artifacts &&
+        isAbsolute(values.capacity) &&
+        isAbsolute(values.artifacts) &&
+        process.env.EXECUTION_RECIPES_FILE,
+      'INVALID_CONFIG',
+      'Execution, drain and external reconciliation require --capacity ABSOLUTE_PATH --host --artifacts ABSOLUTE_PATH and EXECUTION_RECIPES_FILE.',
+    );
+    const recipes = loadExecutionRecipes(process.env.EXECUTION_RECIPES_FILE);
+    capacity = new HostCapacity(values.capacity);
     try {
       capacity.inspect(values.host);
     } catch (error) {
@@ -59,6 +82,32 @@ async function main() {
       host_id: values.host,
       artifacts_directory: values.artifacts,
     });
+    if (values.reconcile) {
+      ensure(
+        values.evidence && (await stat(values.evidence)).size <= 65_536,
+        'INVALID_INPUT',
+        'Provide a bounded --evidence JSON file.',
+      );
+      const evidence = JSON.parse(await readFile(values.evidence, 'utf8'));
+      process.stdout.write(
+        JSON.stringify(await companion.reconcileCancellation(values.reconcile, evidence)) + '\n',
+      );
+      return;
+    }
+    if (values.drain) {
+      await app.setExecutionAdmissions(values.actor, values.project, true);
+      while (!abort.signal.aborted) {
+        await companion.runOnce(abort.signal);
+        const active = await app.listExecutionReconciliations(values.actor, values.project);
+        if (!active.length || active.some((state) => state.next_step === 'inspect_side_effects')) {
+          process.stdout.write(JSON.stringify({ paused: true, drained: !active.length, active }) + '\n');
+          if (active.length) process.exitCode = 2;
+          return;
+        }
+        await delay(1000, undefined, { signal: abort.signal });
+      }
+      return;
+    }
     process.stdout.write(
       JSON.stringify({
         event: 'execution_companion_started',
@@ -80,7 +129,7 @@ async function main() {
   } finally {
     process.removeListener('SIGINT', stop);
     process.removeListener('SIGTERM', stop);
-    capacity.close();
+    capacity?.close();
     await app.storage.close();
   }
 }

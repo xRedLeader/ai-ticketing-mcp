@@ -1240,7 +1240,7 @@ export function registerExecutionRecoveryContractTests(
     },
   );
 
-  check('daemon continues in its second slot after timeout leaves first run unresolved', async (f) => {
+  check('daemon continues after timeout, retaining capacity only when cleanup is unverified', async (f) => {
     const recipes = new ExecutionRecipeRegistry({
       ...f.config,
       recipes: [
@@ -1324,10 +1324,11 @@ export function registerExecutionRecoveryContractTests(
     } finally {
       clearTimeout(deadline);
     }
-    assert.equal(sawTwoSlots, true);
-    assert.equal((await f.view()).reconciliation.state, 'unresolved');
+    const verified = process.platform === 'linux';
+    assert.equal(sawTwoSlots, !verified);
+    assert.equal((await f.view()).reconciliation.state, verified ? 'completed' : 'unresolved');
     assert.equal((await f.storage.get('execution_jobs', receipt.run_id))!.status, 'succeeded');
-    assert.equal(f.capacity.inspect('test').occupied.script, 1);
+    assert.equal(f.capacity.inspect('test').occupied.script, verified ? 0 : 1);
     assert.equal(await readFile(f.marker, 'utf8'), 'xx');
   });
 
