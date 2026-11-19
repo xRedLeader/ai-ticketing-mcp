@@ -422,7 +422,7 @@ export class UsageBudget {
     if (used.attempts >= limits.max_attempts) reasons.push('attempt_limit');
     if (used.provider_tokens >= limits.max_provider_tokens) reasons.push('provider_token_limit');
     if (used.runtime_ms >= limits.max_runtime_ms) reasons.push('runtime_limit');
-    if (limits.max_cost_usd_micros !== null && used.cost_usd_micros >= limits.max_cost_usd_micros)
+    if (limits.max_cost_usd_micros !== null && used.cost_usd_micros > limits.max_cost_usd_micros)
       reasons.push('cost_limit');
     return {
       schema_version: 1,

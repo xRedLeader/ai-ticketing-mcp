@@ -97,6 +97,26 @@ async function fixture(run = config) {
   };
 }
 
+it('reports room for zero-cost work at the cost cap', async () => {
+  const f = await fixture({ ...config, limits: { ...config.limits, max_cost_usd_micros: 0 } });
+  try {
+    assert.equal(f.ledger.report('run').status, 'ready');
+    assert.equal(
+      f.ledger.admit(
+        'run',
+        request('free', { allowance: { provider_tokens: 300, runtime_ms: 10000, cost_usd_micros: 0 } }),
+      ).admitted,
+      true,
+    );
+    assert.equal(f.ledger.report('run').status, 'ready');
+    const priced = f.ledger.admit('run', request('priced'));
+    assert.equal(priced.admitted, false);
+    assert.deepEqual(priced.reasons, ['cost_limit']);
+  } finally {
+    await f.dispose();
+  }
+});
+
 it('attributes failures, explicit and provider retries, review usage, costs, and accepted work without subset double counting', async () => {
   const f = await fixture();
   try {
