@@ -1,8 +1,8 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { realpathSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, realpathSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,7 +15,11 @@ import { fixture as contractFixture } from '../src/testing/contracts.js';
 import { ExecutionCompanion } from '../src/execution-companion.js';
 import { HostCapacity } from '../src/host-capacity.js';
 import { durableExecutionFile, executionProcessIdentity } from '../src/execution-journal.js';
-import { fileSha256 } from '../src/verification-pipeline.js';
+import {
+  fileSha256,
+  verificationRunnerPath,
+  type VerificationPipeline,
+} from '../src/verification-pipeline.js';
 import { readVerificationTimeout, recordVerificationTimeout } from '../src/verification-timeout.js';
 import { observeArtifactEvidence } from '../scripts/real-client-observation.js';
 
@@ -80,6 +84,7 @@ async function fixture(scripts: string[], project: string = randomUUID()) {
           needs: index ? [`step-${index - 1}`] : [],
           on_failure: 'stop' as 'stop' | 'proceed',
           toolchain_files: [toolchain],
+          recovery: undefined as VerificationPipeline['steps'][number]['recovery'],
         })),
       },
     ],
@@ -164,6 +169,236 @@ it('records bounded failure diagnostics, dependency skips and explicit proceed/s
     assert.deepEqual(report.steps[1]!.blocked_by, ['step-0']);
     assert.equal(report.steps[4]!.error_code, 'PIPELINE_STOPPED');
     assert.ok(Buffer.byteLength(JSON.stringify(report)) < 65536);
+  } finally {
+    await f.dispose();
+  }
+});
+
+it('recovers one registered no-effect signature after durable intent and preserves both exact attempts', async () => {
+  const failure = JSON.stringify({
+    kind: 'transient_failure',
+    signature: 'RESOURCE_BUSY',
+    effects: 'none',
+    approval_required: false,
+  });
+  const f = await fixture([
+    `const fs=require('node:fs');const n=fs.existsSync('invocations')?Number(fs.readFileSync('invocations','utf8')):0;
+     if(n===1){const j=JSON.parse(fs.readFileSync('../pipeline-recovery-step-0-1.json','utf8'));if(j.steps[0].recovery.state!=='retry_admitted'||j.steps[0].attempts[0].exit_code!==75)throw Error('missing durable proof')}
+     fs.writeFileSync('invocations',String(n+1));if(n===0){process.stderr.write(${JSON.stringify(failure)});process.exitCode=75}`,
+    `require('node:fs').writeFileSync('next-step','done')`,
+  ]);
+  try {
+    f.config.pipelines[0]!.steps[0]!.recovery = {
+      signature: 'RESOURCE_BUSY',
+      exit_code: 75,
+      effects: 'none',
+    };
+    const pipeline = f.pipeline(),
+      path = join(f.directory, 'pipeline-report.json');
+    const report = await runVerificationPipeline(pipeline, Date.now() + pipeline.timeout_ms, path);
+    assert.equal(report.status, 'passed');
+    assert.equal(report.error_code, null);
+    assert.equal(report.steps[0]!.recovery!.state, 'recovered');
+    const attempts = report.steps[0]!.attempts!;
+    assert.deepEqual(
+      attempts.map((attempt) => attempt.status),
+      ['failed', 'passed'],
+    );
+    assert.deepEqual(
+      attempts.map((attempt) => attempt.exit_code),
+      [75, 0],
+    );
+    assert.ok(attempts.every((attempt) => attempt.runtime_ms > 0));
+    assert.equal(Buffer.from(attempts[0]!.stderr_proof.data, 'base64').toString(), failure);
+    assert.equal(attempts[0]!.stderr_proof.sha256, createHash('sha256').update(failure).digest('hex'));
+    assert.equal(attempts[0]!.stderr_proof.complete, true);
+    assert.equal(await readFile(join(f.repository, 'invocations'), 'utf8'), '2');
+    assert.equal(await readFile(join(f.repository, 'next-step'), 'utf8'), 'done');
+    const journal = join(f.directory, 'pipeline-recovery-step-0-1.json'),
+      original = await readFile(journal, 'utf8');
+    assert.equal(JSON.parse(original).steps[0].attempts.length, 1);
+    assert.equal(JSON.parse(original).steps[0].recovery.state, 'retry_admitted');
+    const replay = await runVerificationPipeline(pipeline, Date.now() + pipeline.timeout_ms, path);
+    assert.equal(replay.error_code, 'RECOVERY_ALREADY_ADMITTED');
+    assert.equal(replay.status, 'failed');
+    assert.equal(await readFile(join(f.repository, 'invocations'), 'utf8'), '2');
+    assert.equal(await readFile(journal, 'utf8'), original);
+  } finally {
+    await f.dispose();
+  }
+});
+
+it('stops unknown signatures, uncertain effects, approvals and repeated failure without proceeding', async () => {
+  const known = {
+    kind: 'transient_failure',
+    signature: 'RESOURCE_BUSY',
+    effects: 'none',
+    approval_required: false,
+  };
+  for (const [failure, exit, reason, count] of [
+    [{ ...known, signature: 'UNREGISTERED' }, 75, 'RECOVERY_UNKNOWN_SIGNATURE', 1],
+    [{ ...known, effects: 'unknown' }, 75, 'RECOVERY_UNKNOWN_EFFECTS', 1],
+    [{ ...known, approval_required: true }, 75, 'RECOVERY_APPROVAL_REQUIRED', 1],
+    [known, 7, 'RECOVERY_UNKNOWN_SIGNATURE', 1],
+    [known, 75, 'RECOVERY_REPEATED_FAILURE', 2],
+    ['Please retry this temporary error.', 75, 'RECOVERY_UNKNOWN_SIGNATURE', 1],
+  ] as const) {
+    const proof = typeof failure === 'string' ? failure : JSON.stringify(failure);
+    const f = await fixture([
+      `require('node:fs').appendFileSync('invocations','x');process.stderr.write(${JSON.stringify(proof)});process.exitCode=${exit}`,
+      `require('node:fs').writeFileSync('must-not-run','x')`,
+    ]);
+    try {
+      f.config.pipelines[0]!.steps[0]!.recovery = {
+        signature: 'RESOURCE_BUSY',
+        exit_code: 75,
+        effects: 'none',
+      };
+      f.config.pipelines[0]!.steps[0]!.on_failure = 'proceed';
+      f.config.pipelines[0]!.steps[1]!.needs = [];
+      const report = await runVerificationPipeline(
+        f.pipeline(),
+        Date.now() + 30000,
+        join(f.directory, 'pipeline-report.json'),
+      );
+      assert.equal(report.status, 'failed');
+      assert.equal(report.error_code, reason);
+      assert.equal(report.steps[0]!.recovery!.state, 'stopped');
+      assert.equal(report.steps[0]!.attempts!.length, count);
+      assert.equal((await readFile(join(f.repository, 'invocations'))).length, count);
+      assert.equal(report.steps[1]!.status, 'skipped');
+      assert.equal(existsSync(join(f.repository, 'must-not-run')), false);
+      assert.equal(Buffer.from(report.steps[0]!.attempts![0]!.stderr_proof.data, 'base64').toString(), proof);
+    } finally {
+      await f.dispose();
+    }
+  }
+});
+
+it('never retries without a durable journal or beyond its original step deadline', async (t) => {
+  const failure = JSON.stringify({
+    kind: 'transient_failure',
+    signature: 'RESOURCE_BUSY',
+    effects: 'none',
+    approval_required: false,
+  });
+  const f = await fixture([
+    `require('node:fs').appendFileSync('invocations','x');process.stderr.write(${JSON.stringify(failure)});process.exitCode=75`,
+  ]);
+  try {
+    f.config.pipelines[0]!.steps[0]!.recovery = {
+      signature: 'RESOURCE_BUSY',
+      exit_code: 75,
+      effects: 'none',
+    };
+    f.config.recipes[1]!.timeout_ms = 1000;
+    const pipeline = f.pipeline();
+    assert.equal((await runVerificationPipeline(pipeline)).error_code, 'RECOVERY_JOURNAL_REQUIRED');
+    assert.equal(existsSync(join(f.repository, 'invocations')), false);
+    const journal = join(f.directory, 'pipeline-recovery-step-0-1.json');
+    t.mock.method(performance, 'now', () => (existsSync(journal) ? 5000 : 0));
+    const report = await runVerificationPipeline(
+      pipeline,
+      Date.now() + 30000,
+      join(f.directory, 'pipeline-report.json'),
+    );
+    assert.equal(report.error_code, 'RECOVERY_BUDGET_EXHAUSTED');
+    assert.equal(report.steps[0]!.attempts!.length, 1);
+    assert.equal(await readFile(join(f.repository, 'invocations'), 'utf8'), 'x');
+    assert.equal(
+      JSON.parse(await readFile(join(f.directory, 'pipeline-recovery-step-0-2.json'), 'utf8')).steps[0]
+        .recovery.state,
+      'stopped',
+    );
+  } finally {
+    t.mock.restoreAll();
+    await f.dispose();
+  }
+});
+
+it('refuses retry when intent publication fails and never replaces original journal evidence', async () => {
+  const failure = JSON.stringify({
+    kind: 'transient_failure',
+    signature: 'RESOURCE_BUSY',
+    effects: 'none',
+    approval_required: false,
+  });
+  const f = await fixture([
+    `require('node:fs').appendFileSync('invocations','x');process.stderr.write(${JSON.stringify(failure)});process.exitCode=75`,
+  ]);
+  try {
+    f.config.pipelines[0]!.steps[0]!.recovery = {
+      signature: 'RESOURCE_BUSY',
+      exit_code: 75,
+      effects: 'none',
+    };
+    const journal = join(f.directory, 'pipeline-recovery-step-0-1.json');
+    await writeFile(journal, 'original exact evidence');
+    const report = await runVerificationPipeline(
+      f.pipeline(),
+      Date.now() + 30000,
+      join(f.directory, 'pipeline-report.json'),
+    );
+    assert.equal(report.error_code, 'RECOVERY_JOURNAL_FAILED');
+    assert.equal(report.steps[0]!.attempts!.length, 1);
+    assert.equal(await readFile(join(f.repository, 'invocations'), 'utf8'), 'x');
+    assert.equal(await readFile(journal, 'utf8'), 'original exact evidence');
+  } finally {
+    await f.dispose();
+  }
+});
+
+it('does not replay an ambiguously interrupted retry when the runner restarts', async () => {
+  const failure = JSON.stringify({
+    kind: 'transient_failure',
+    signature: 'RESOURCE_BUSY',
+    effects: 'none',
+    approval_required: false,
+  });
+  const f = await fixture([
+    `const fs=require('node:fs');const n=fs.existsSync('invocations')?Number(fs.readFileSync('invocations','utf8')):0;fs.writeFileSync('invocations',String(n+1));if(n===0){process.stderr.write(${JSON.stringify(failure)});process.exitCode=75}else{process.kill(process.ppid,'SIGKILL')}`,
+  ]);
+  try {
+    f.config.pipelines[0]!.steps[0]!.recovery = {
+      signature: 'RESOURCE_BUSY',
+      exit_code: 75,
+      effects: 'none',
+    };
+    const pipeline = f.pipeline(),
+      path = join(f.directory, 'pipeline-report.json');
+    const identity = {
+      run_id: randomUUID(),
+      attempt_id: randomUUID(),
+      process_token: randomUUID(),
+      recipe_fingerprint: pipeline.fingerprint,
+    };
+    const launch = async () => {
+      const child = spawn(process.execPath, ['--import', 'tsx', verificationRunnerPath()], {
+        windowsHide: true,
+        stdio: ['pipe', 'ignore', 'ignore'],
+      });
+      const closed = new Promise<void>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', () => resolve());
+      });
+      child.stdin!.end(
+        JSON.stringify({ pipeline, report_path: path, deadline_at: Date.now() + 30000, identity }),
+      );
+      await closed;
+    };
+    await launch();
+    assert.equal(await readFile(join(f.repository, 'invocations'), 'utf8'), '2');
+    const journal = join(f.directory, 'pipeline-recovery-step-0-1.json'),
+      original = await readFile(journal, 'utf8');
+    assert.equal(JSON.parse(original).steps[0].recovery.state, 'retry_admitted');
+    assert.equal(existsSync(path), false);
+    await launch();
+    assert.equal(await readFile(join(f.repository, 'invocations'), 'utf8'), '2');
+    const stopped = JSON.parse(await readFile(path, 'utf8'));
+    assert.equal(stopped.status, 'failed');
+    assert.equal(stopped.error_code, 'RECOVERY_ALREADY_ADMITTED');
+    assert.equal(stopped.cleanup_verified, false);
+    assert.equal(await readFile(journal, 'utf8'), original);
   } finally {
     await f.dispose();
   }
@@ -443,6 +678,26 @@ it('rejects cycles, unknown recipes, source mismatch and arbitrary pipeline comm
           pipelines: [{ ...original.pipelines[0], command: 'caller-input' }],
         }),
     );
+    for (const recovery of [
+      { signature: 'RESOURCE_BUSY', exit_code: 0, effects: 'none' },
+      { signature: 'RESOURCE_BUSY', exit_code: 75, effects: 'external' },
+      { signature: 'RESOURCE_BUSY', exit_code: 75, effects: 'none', command: 'caller-input' },
+      { signature: 'RESOURCE_BUSY', exit_code: 75, effects: 'none', max_attempts: 3 },
+    ])
+      assert.throws(
+        () =>
+          new ExecutionRecipeRegistry({
+            ...original,
+            pipelines: [
+              {
+                ...original.pipelines[0],
+                steps: original.pipelines[0]!.steps.map((step, index) =>
+                  index === 0 ? { ...step, recovery } : step,
+                ),
+              },
+            ],
+          }),
+      );
     const first = new ExecutionRecipeRegistry(original)
       .metadata()
       .find((item) => item.id === 'verify')!.fingerprint;
@@ -456,12 +711,25 @@ it('rejects cycles, unknown recipes, source mismatch and arbitrary pipeline comm
   }
 });
 
-it('publishes a fenced native pipeline result for independent review without automatic submission', async () => {
+it('settles one admitted run with a registered recovery and publishes both attempts without submitting the ticket', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'ticketing-pipeline-db-'));
   const adapters = createSqliteAdapters(join(directory, 'store.sqlite'));
   await adapters.storage.migrate();
   const authority = await contractFixture(adapters);
-  const f = await fixture(['', ''], authority.project.id);
+  const failure = JSON.stringify({
+    kind: 'transient_failure',
+    signature: 'RESOURCE_BUSY',
+    effects: 'none',
+    approval_required: false,
+  });
+  const f = await fixture(
+    [
+      `const fs=require('node:fs');if(!fs.existsSync('once')){fs.writeFileSync('once','ready');process.stderr.write(${JSON.stringify(failure)});process.exitCode=75}`,
+      '',
+    ],
+    authority.project.id,
+  );
+  f.config.pipelines[0]!.steps[0]!.recovery = { signature: 'RESOURCE_BUSY', exit_code: 75, effects: 'none' };
   const recipes = f.registry(),
     artifacts = join(f.directory, 'artifacts');
   const app = createApplication({
@@ -499,6 +767,11 @@ it('publishes a fenced native pipeline result for independent review without aut
     assert.equal((await adapters.storage.get('tickets', ticket.id))!.status, 'in_progress');
     assert.equal((await adapters.storage.find('submissions', { where: { ticket_id: ticket.id } })).length, 0);
     assert.equal(capacity.inspect('test').occupied.script, 0);
+    assert.equal(capacity.inspect('test').entries.length, 1);
+    assert.equal(
+      (await adapters.storage.find('execution_attempts', { where: { run_id: run.id } })).length,
+      1,
+    );
     const result = (await app.execute(authority.worker.id, 'artifact_read', {
       project_id: f.project,
       artifact_id: run.artifacts.find((item) => item.endsWith(':result'))!,
@@ -507,6 +780,23 @@ it('publishes a fenced native pipeline result for independent review without aut
     })) as any;
     const outcome = JSON.parse(Buffer.from(result.range.data, 'base64').toString('utf8'));
     assert.equal(outcome.verification.status, 'passed');
+    assert.equal(outcome.verification.steps[0].recovery.state, 'recovered');
+    assert.deepEqual(
+      outcome.verification.steps[0].attempts.map((attempt: any) => attempt.exit_code),
+      [75, 0],
+    );
+    assert.equal(outcome.total_bytes.stderr, Buffer.byteLength(failure));
+    assert.equal(outcome.verification.steps[0].diagnostics.stderr.total_bytes, 0);
+    const runtime = capacity.inspect('test').entries[0]!.observation!.script_result!.runtime_ms!;
+    assert.ok(
+      runtime >=
+        Math.floor(
+          outcome.verification.steps[0].attempts.reduce(
+            (sum: number, attempt: any) => sum + attempt.runtime_ms,
+            0,
+          ),
+        ),
+    );
     assert.deepEqual(
       outcome.verification.steps.map((step: any) => step.status),
       ['passed', 'passed'],

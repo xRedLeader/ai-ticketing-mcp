@@ -37,7 +37,7 @@ The registry file is bounded to 1 MiB; each normalized recipe and its private su
 
 ## Deterministic verification pipelines
 
-An optional top-level `pipelines` array registers a finite verification pass as one ordinary execution recipe ID. `run_submit` selects that ID; the built-in runner executes every eligible step without model calls or individual MCP turns. The existing supervisor owns the runner and its foreground step children, and the existing attempt, continuation, cancellation, recovery and capacity fences still apply. A pipeline never retries a step.
+An optional top-level `pipelines` array registers a finite verification pass as one ordinary execution recipe ID. `run_submit` selects that ID; the built-in runner executes every eligible step without model calls or individual MCP turns. The existing supervisor owns the runner and its foreground step children, and the existing attempt, continuation, cancellation, recovery and capacity fences still apply. A step retries only through an explicitly registered recovery playbook.
 
 Each step references a registered native-executable recipe. Register an additional Git recipe with empty `argv` and its `cwd` set to the repository root, then add the pipeline to the same registry:
 
@@ -244,3 +244,17 @@ Migration identity is the complete filename in `schema_migrations`, not a unique
 ## Explicit artifact retention
 
 See [operator artifact retention](artifact-retention.md) to retire an exact expired, unreferenced terminal stdout/stderr capture. Retirement preserves authoritative outcomes, private recovery journals and durable audit/receipt records. It is never automatic or model-controlled.
+
+## Registered recovery playbooks
+
+An operator may add `"recovery": { "signature": "RESOURCE_BUSY", "exit_code": 75, "effects": "none" }` to a pipeline step. This declares that the same pinned foreground command may safely run again after that exact transient failure, with no external effects from the failed attempt. The command must emit only this bounded structured JSON on stderr and exit with the registered code:
+
+```json
+{ "kind": "transient_failure", "signature": "RESOURCE_BUSY", "effects": "none", "approval_required": false }
+```
+
+The runner validates the complete stderr object (at most 512 captured bytes), never natural-language output. Unknown signatures or effects, required approvals, source/tool changes, uncertain cleanup, cancellation, journal errors, or a repeated failure stop the whole pipeline even when `on_failure` is `proceed`. A known permitted failure gets at most one retry of the exact same command; no alternate recipe, arguments, credentials, permissions, requirements, CI or review policy are changed.
+
+The original step timeout and pipeline deadline include both attempts and recovery overhead. Retry remains inside the original host admission and resource allocation; it never obtains an extra slot or model turn. Each attempt retains its actual exit, signal, errors, bounded diagnostics, runtime, and exact base64 stderr proof with SHA-256 and completeness. Final step status describes the final attempt; a successful retry still exposes the original adverse evidence under `attempts` and `recovery`. Aggregate log counts include both attempts, and the existing result artifact contains the report. Verification reports are bounded to 1 MiB; other execution journals retain their existing bound.
+
+An immutable `pipeline-recovery-start.json` fences the whole invocation. Before another process can start, an immutable `pipeline-recovery-<step>-1.json` records the original failure and retry intent; ordinal 2 records the outcome or a pre-retry refusal. Existing journals are never replaced. An interrupted or ambiguous retry cannot replay when the runner restarts and cannot claim verified cleanup. The trusted companion's existing dispatch, cancellation, capacity, and reconciliation rules remain in force. Operators must register only commands whose no-external-effects contract and foreground lifetime they have verified; an emitted assertion alone does not authorize a recovery.

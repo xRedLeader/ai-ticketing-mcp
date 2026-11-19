@@ -9,6 +9,18 @@ import { ensure } from './contracts.js';
 import type { ExecutionCommand } from './execution-recipes.js';
 
 const id = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/);
+export const MAX_VERIFICATION_REPORT_BYTES = 1024 * 1024;
+const recovery = z.strictObject({
+  signature: id,
+  exit_code: z.number().int().min(1).max(255),
+  effects: z.literal('none'),
+});
+export const recoveryFailureSchema = z.strictObject({
+  kind: z.literal('transient_failure'),
+  signature: id,
+  effects: z.enum(['none', 'unknown']),
+  approval_required: z.boolean(),
+});
 export const verificationPipelineSchema = z.strictObject({
   id,
   cacheable: z.literal(true).optional(),
@@ -22,6 +34,7 @@ export const verificationPipelineSchema = z.strictObject({
         needs: z.array(id).max(16),
         on_failure: z.enum(['stop', 'proceed']),
         toolchain_files: z.array(z.string().min(1).max(4096)).max(64),
+        recovery: recovery.optional(),
       }),
     )
     .min(1)
@@ -75,6 +88,7 @@ export interface VerificationPipeline {
     executable_sha256: string;
     toolchain_files: readonly Readonly<FileIdentity>[];
     toolchain_sha256: string;
+    recovery?: Readonly<z.output<typeof recovery>>;
   }>[];
 }
 export function fileSha256(path: string): string {
@@ -223,6 +237,7 @@ export function pinVerificationPipeline(
       executable_sha256,
       toolchain_files: Object.freeze(files),
       toolchain_sha256: digest([executable_sha256, files]),
+      ...(step.recovery ? { recovery: Object.freeze({ ...step.recovery }) } : {}),
     });
   });
   const normalized = {
