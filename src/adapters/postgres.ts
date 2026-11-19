@@ -66,6 +66,7 @@ const columns: Record<Table, string[]> = {
     'event_seq',
     'created_at',
     'scheduling_policy',
+    'reviewer_actor_id',
   ],
   members: ['id', 'project_id', 'actor_id', 'role'],
   tickets: [
@@ -160,7 +161,9 @@ function decode(row: Record<string, unknown>) {
     Object.entries(row)
       .filter(
         ([key, value]) =>
-          !['execution_hints', 'github_pull_request', 'scheduling_policy'].includes(key) || value !== null,
+          !['execution_hints', 'github_pull_request', 'scheduling_policy', 'reviewer_actor_id'].includes(
+            key,
+          ) || value !== null,
       )
       .map(([key, value]) => [
         key,

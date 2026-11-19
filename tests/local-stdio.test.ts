@@ -42,6 +42,7 @@ it('bootstraps a durable local agent and indexes eventual SQLite search without 
           const project = await call('project_create', {
             key: 'LOCAL',
             name: 'Local stdio',
+            policy: 'self',
             execution_hints: { model: 'future/model', effort: 'xhigh' },
             idempotency_key: randomUUID(),
           });

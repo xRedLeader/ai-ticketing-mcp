@@ -848,6 +848,7 @@ async function assessCommands(runtime: any, database: string, manifest: any, dir
         instructions:
           'Assess coordination protocol behavior only. Evidence is synthetic and does not establish implementation completion.',
         policy: 'independent',
+        reviewer_actor_id: manifest.actor_ids.reviewer,
         idempotency_key: randomUUID(),
       },
       'fixture-project-create',

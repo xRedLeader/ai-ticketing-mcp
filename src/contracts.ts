@@ -21,6 +21,7 @@ export interface Project {
   name: string;
   instructions: string;
   policy: Policy;
+  reviewer_actor_id?: string;
   scheduling_policy?: SchedulingPolicy;
   execution_hints?: ExecutionHints | null;
   revision: number;

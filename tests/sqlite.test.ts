@@ -457,6 +457,7 @@ it('commits outbound records with their events and rejects mutation or duplicate
     const second = (await a.app.execute(a.admin.id, 'project_create', {
       key: 'X' + randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase(),
       name: 'Other project',
+      policy: 'self',
       idempotency_key: randomUUID(),
     })) as { id: string };
     await assert.rejects(

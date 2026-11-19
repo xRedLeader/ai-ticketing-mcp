@@ -56,6 +56,10 @@ This can favor prerequisites that help more work progress. The count estimates p
 
 Submissions require passing evidence and at least one reference for every current criterion. References are stored; they are not executed or fetched. Independent approval checks identity separation, not whether two credentials secretly belong to the same person. Operators control identity registration and grants.
 
+When creating a project with `policy: "independent"` (the default), supply `reviewer_actor_id` from a registered identity. To use Astra, register its review identity first and select that actor's ID. Creation saves the selection and grants verifier access in one transaction. The creation result and `project_get` return the selected ID. Match it against the members in `project_get` when routing review. The selected identity still cannot review its own submission.
+
+For an existing project, grant the intended reviewer a verifier or admin role and select the identity with revision-protected `project_update`. The same selection is required when switching a project to independent review. Choose a replacement before removing the selected reviewer's access. Older independent projects can continue to use authorized verifiers and can add a selection through the same update.
+
 ## Context and retrieval
 
 Context uses local `o200k_base` reference-token budgets: brief 4,096 (default), standard 8,192, full 32,768. `max_tokens` overrides the budget from 512 to 32,768 on `ticket_context` and `work_claim`. Count one canonical success envelope, including omission metadata and claim-receipt siblings. Current requirements, criteria, project instructions/policy, blockers, dependencies, and visible ownership are never silently truncated. `CONTEXT_TOO_LARGE` reports `required_tokens`, `max_tokens`, selected ticket/project IDs, and permitted retrieval calls. Read `ticket_get` plus `project_get`, then claim explicitly with `include_context:false` and a fresh key. A failed combined claim rolls back all claim, revision, event, job, and receipt changes.

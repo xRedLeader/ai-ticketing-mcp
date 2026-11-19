@@ -43,6 +43,7 @@ const project = z.object({
   name: z.string(),
   instructions: z.string(),
   policy: z.enum(['self', 'independent', 'human']),
+  reviewer_actor_id: id.optional(),
   scheduling_policy: z.enum(['priority_age', 'unblocking']).optional(),
   execution_hints: executionHints.optional(),
   revision: z.number(),
@@ -151,11 +152,13 @@ const visibleClaim = z
   .nullable();
 const projectSummary = project.omit({
   execution_hints: true,
+  reviewer_actor_id: true,
   instructions: true,
   ticket_seq: true,
   event_seq: true,
   created_at: true,
 });
+const projectReceipt = projectSummary.extend({ reviewer_actor_id: id.optional() });
 const ticketSummary = ticket.omit({
   github_pull_request: true,
   execution_hints: true,
@@ -252,8 +255,8 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
     project,
     members: z.array(member.extend({ name: z.string(), kind: z.enum(['human', 'agent']) })),
   }),
-  project_create: projectSummary,
-  project_update: projectSummary,
+  project_create: projectReceipt,
+  project_update: projectReceipt,
   member_set: member.extend({ role: z.enum(['reader', 'contributor', 'verifier', 'admin', 'none']) }),
   tickets_create: z.object({ tickets: z.array(ticketReceipt) }),
   ticket_list: z.object({ tickets: z.array(ticketSummary) }),

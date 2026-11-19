@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/client';
 import { InMemoryTransport } from '@modelcontextprotocol/server';
@@ -56,18 +57,16 @@ try {
     key: 'DEMO' + randomUUID().slice(0, 6).toUpperCase(),
     name: 'Two-agent walkthrough',
     instructions: 'Demonstrate durable handoffs and independent evidence review.',
+    reviewer_actor_id: identities[2]!.id,
     idempotency_key: randomUUID(),
   });
-  for (const [i, role] of [
-    [1, 'contributor'],
-    [2, 'verifier'],
-  ] as const)
-    await call(operator!, 'member_set', {
-      project_id: project.id,
-      actor_id: identities[i]!.id,
-      role,
-      idempotency_key: randomUUID(),
-    });
+  assert.equal(project.reviewer_actor_id, identities[2]!.id);
+  await call(operator!, 'member_set', {
+    project_id: project.id,
+    actor_id: identities[1]!.id,
+    role: 'contributor',
+    idempotency_key: randomUUID(),
+  });
   const created = await call(operator!, 'tickets_create', {
     project_id: project.id,
     idempotency_key: randomUUID(),

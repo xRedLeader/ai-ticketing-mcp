@@ -756,12 +756,31 @@ export class Application {
       switch (operation) {
         case 'project_create': {
           const data = input as Input<'project_create'>;
+          const reviewerId = data.reviewer_actor_id;
+          ensure(
+            data.policy !== 'independent' || reviewerId,
+            'REVIEWER_REQUIRED',
+            'Select a registered reviewer with reviewer_actor_id when creating an independent-review project.',
+          );
+          if (reviewerId) {
+            ensure(
+              data.policy === 'independent',
+              'INVALID_INPUT',
+              'Select a reviewer only for independent review.',
+            );
+            ensure(
+              await tx.get('actors', reviewerId),
+              'INVALID_REVIEWER',
+              'Register the selected reviewer first.',
+            );
+          }
           const created: Project = {
             id: randomUUID(),
             key: data.key,
             name: data.name,
             instructions: data.instructions,
             policy: data.policy,
+            ...(reviewerId ? { reviewer_actor_id: reviewerId } : {}),
             ...(data.scheduling_policy ? { scheduling_policy: data.scheduling_policy } : {}),
             ...(data.execution_hints ? { execution_hints: data.execution_hints } : {}),
             revision: 1,
@@ -777,11 +796,39 @@ export class Application {
             actor_id: actor.id,
             role: 'admin',
           });
+          if (reviewerId && reviewerId !== actor.id)
+            await tx.put('members', {
+              id: `${created.id}:${reviewerId}`,
+              project_id: created.id,
+              actor_id: reviewerId,
+              role: 'verifier',
+            });
           await this.event(tx, created, actor, 'project.created', created.id);
           return created;
         }
         case 'project_update': {
           this.version(project, input.expected_revision);
+          const policy = input.policy ?? project.policy;
+          const reviewerId = input.reviewer_actor_id ?? project.reviewer_actor_id;
+          ensure(
+            policy !== 'independent' || project.policy === 'independent' || reviewerId,
+            'REVIEWER_REQUIRED',
+            'Select a project reviewer with reviewer_actor_id when enabling independent review.',
+          );
+          if (input.reviewer_actor_id) {
+            ensure(
+              policy === 'independent',
+              'INVALID_INPUT',
+              'Select a reviewer only for independent review.',
+            );
+            const reviewer = await tx.get('members', `${project.id}:${input.reviewer_actor_id}`);
+            ensure(
+              reviewer?.role === 'verifier' || reviewer?.role === 'admin',
+              'INVALID_REVIEWER',
+              'Grant the selected reviewer a verifier or admin role in this project first.',
+            );
+            project.reviewer_actor_id = input.reviewer_actor_id;
+          } else if (policy !== 'independent') delete project.reviewer_actor_id;
           this.schedulingPolicy({
             scheduling_policy:
               input.scheduling_policy === undefined
@@ -818,6 +865,13 @@ export class Application {
             });
             ensure(admins.length > 1, 'LAST_ADMIN', 'Grant another admin before removing the last one.');
           }
+          ensure(
+            project.reviewer_actor_id !== input.actor_id ||
+              input.role === 'verifier' ||
+              input.role === 'admin',
+            'REVIEWER_REQUIRED',
+            'Select another project reviewer before removing this reviewer’s verifier access.',
+          );
           if (input.role === 'none') await tx.remove('members', member.id);
           else await tx.put('members', member);
           await this.event(tx, project, actor, 'member.updated', input.actor_id, { role: input.role });

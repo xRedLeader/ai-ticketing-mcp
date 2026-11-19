@@ -40,6 +40,7 @@ const columns: Record<Table, string[]> = {
     'created_at',
     'execution_hints',
     'scheduling_policy',
+    'reviewer_actor_id',
   ],
   members: ['id', 'project_id', 'actor_id', 'role'],
   tickets: [
@@ -174,7 +175,7 @@ function encode(key: string, value: unknown): SQLInputValue {
 function decode(row: Record<string, unknown>) {
   return Object.fromEntries(
     Object.entries(row).flatMap(([key, value]) =>
-      (key === 'execution_hints' || key === 'github_pull_request' || key === 'scheduling_policy') &&
+      ['execution_hints', 'github_pull_request', 'scheduling_policy', 'reviewer_actor_id'].includes(key) &&
       value === null
         ? []
         : [

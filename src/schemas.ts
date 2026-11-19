@@ -54,6 +54,9 @@ export const schemas = {
       name: text.max(200),
       instructions: z.string().max(16000).default(''),
       policy: z.enum(['self', 'independent', 'human']).default('independent'),
+      reviewer_actor_id: id
+        .optional()
+        .describe('Registered reviewer identity. Required for independent review.'),
       scheduling_policy: schedulingPolicy.optional(),
       execution_hints: executionHintsSchema.optional(),
     })
@@ -66,6 +69,9 @@ export const schemas = {
       name: text.max(200).optional(),
       instructions: z.string().max(16000).optional(),
       policy: z.enum(['self', 'independent', 'human']).optional(),
+      reviewer_actor_id: id
+        .optional()
+        .describe('Project verifier or admin to select for independent review.'),
       scheduling_policy: schedulingPolicy.nullable().optional(),
       execution_hints: executionHintsSchema.optional(),
     })
@@ -273,7 +279,8 @@ export const descriptions: Record<Operation, string> = {
     'Link or refresh a PR in the configured trusted repository; retrieve immutable evidence for its exact head SHA. Never approves or merges work.',
   project_list: 'List projects accessible to your authenticated identity.',
   project_get: 'Read project instructions, review policy, and member identities.',
-  project_create: 'Create a project. Requires system administrator access.',
+  project_create:
+    'Create a project. Independent review is the default and requires reviewer_actor_id. Requires system administrator access.',
   project_update: 'Update project instructions or policy with revision protection. Requires project admin.',
   member_set:
     'Grant a registered identity a project role, or remove it with role none. The last admin cannot be removed. Requires project admin.',

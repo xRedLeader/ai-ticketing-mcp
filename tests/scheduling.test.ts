@@ -65,6 +65,7 @@ it('rejects unsupported policy mutations atomically and preserves legacy default
     const input = {
       key: 'SCHED',
       name: 'Scheduling',
+      policy: 'self',
       scheduling_policy: 'unblocking',
       idempotency_key: randomUUID(),
     };
@@ -87,7 +88,7 @@ it('rejects unsupported policy mutations atomically and preserves legacy default
     assert.deepEqual(await f.storage.get('projects', f.project.id), beforeProject);
     assert.equal((await f.storage.find('projects')).length, 1);
     assert.deepEqual(await f.storage.find('receipts'), beforeReceipts);
-    const base = { key: 'LEGACY', name: 'Legacy', idempotency_key: randomUUID() };
+    const base = { key: 'LEGACY', name: 'Legacy', policy: 'self', idempotency_key: randomUUID() };
     const created = (await legacy.execute(f.admin.id, 'project_create', base)) as any;
     assert.equal(Object.hasOwn(created, 'scheduling_policy'), false);
     assert.deepEqual(await legacy.execute(f.admin.id, 'project_create', base), created);

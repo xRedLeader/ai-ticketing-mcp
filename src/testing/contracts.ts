@@ -11,6 +11,7 @@ import {
   type Project,
   type Ticket,
   type Policy,
+  type Role,
   type GitHubEvidence,
 } from '../contracts.js';
 
@@ -53,6 +54,7 @@ export async function fixture(adapters: ContractAdapters, policy: Policy = 'inde
     key: 'T' + randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase(),
     name: 'Contract test',
     policy,
+    ...(policy === 'independent' ? { reviewer_actor_id: reviewer.id } : {}),
     idempotency_key: randomUUID(),
   })) as Project;
   const project = (await storage.get('projects', createdProject.id))!;
@@ -61,12 +63,13 @@ export async function fixture(adapters: ContractAdapters, policy: Policy = 'inde
     [other, 'contributor'],
     [reviewer, 'verifier'],
   ] as const)
-    await app.execute(admin.id, 'member_set', {
-      project_id: project.id,
-      actor_id: person.id,
-      role,
-      idempotency_key: randomUUID(),
-    });
+    if (policy !== 'independent' || person.id !== reviewer.id)
+      await app.execute(admin.id, 'member_set', {
+        project_id: project.id,
+        actor_id: person.id,
+        role,
+        idempotency_key: randomUUID(),
+      });
   const call = async (actorId: string, operation: any, input: Record<string, unknown> = {}) =>
     app.execute(actorId, operation, { project_id: project.id, idempotency_key: randomUUID(), ...input });
   const ticket = async (overrides: Record<string, unknown> = {}) => {
@@ -170,6 +173,75 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
       );
       await f.app.rebuild(f.admin.id, f.project.id);
       assert.equal((await f.storage.get('jobs', id))?.attempts, 0);
+    });
+    check('requires and grants a registered reviewer on independent project creation', async (f) => {
+      const input = {
+        key: 'R' + randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase(),
+        name: 'Review setup',
+        idempotency_key: randomUUID(),
+      };
+      const create = (args: typeof input & { reviewer_actor_id?: string }) =>
+        f.app.execute(f.admin.id, 'project_create', args) as Promise<Project>;
+      await assert.rejects(create(input), hasCode('REVIEWER_REQUIRED'));
+      await assert.rejects(
+        create({ ...input, reviewer_actor_id: randomUUID() }),
+        hasCode('INVALID_REVIEWER'),
+      );
+      assert.deepEqual(await f.storage.find('projects', { where: { key: input.key } }), []);
+      const args = { ...input, reviewer_actor_id: f.outsider.id };
+      const created = await create(args);
+      assert.equal(created.policy, 'independent');
+      assert.equal(created.reviewer_actor_id, f.outsider.id);
+      assert.deepEqual(await create(args), created);
+      const details = (await f.app.execute(f.outsider.id, 'project_get', {
+        project_id: created.id,
+      })) as { project: Project; members: { actor_id: string; role: Role }[] };
+      assert.equal(details.project.reviewer_actor_id, f.outsider.id);
+      assert.equal(details.members.find((member) => member.actor_id === f.outsider.id)?.role, 'verifier');
+      await assert.rejects(
+        f.call(f.admin.id, 'member_set', {
+          project_id: created.id,
+          actor_id: f.outsider.id,
+          role: 'none',
+        }),
+        hasCode('REVIEWER_REQUIRED'),
+      );
+    });
+    check('requires selection when enabling independent review on an existing project', async (f) => {
+      const update = async (expected_revision: number, changes: Record<string, unknown>) =>
+        f.call(f.admin.id, 'project_update', { expected_revision, ...changes }) as Promise<Project>;
+      const self = await update(f.project.revision, { policy: 'self' });
+      assert.equal(self.reviewer_actor_id, undefined);
+      await assert.rejects(update(self.revision, { policy: 'independent' }), hasCode('REVIEWER_REQUIRED'));
+      await assert.rejects(
+        update(self.revision, { policy: 'independent', reviewer_actor_id: f.worker.id }),
+        hasCode('INVALID_REVIEWER'),
+      );
+      const independent = await update(self.revision, {
+        policy: 'independent',
+        reviewer_actor_id: f.reviewer.id,
+      });
+      assert.equal(independent.reviewer_actor_id, f.reviewer.id);
+      assert.equal((await f.storage.get('projects', f.project.id))?.reviewer_actor_id, f.reviewer.id);
+    });
+    check('replays pre-selection project creation receipts without assigning a new reviewer', async (f) => {
+      const idempotency_key = randomUUID();
+      const input = { key: f.project.key, name: f.project.name, idempotency_key };
+      const { id, key, name, revision } = f.project;
+      const result = { id, key, name, revision, policy: 'independent' };
+      const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+      await f.storage.transaction('catalog', (tx) =>
+        tx.put('receipts', {
+          id: hash([f.admin.id, 'catalog', 'project_create', idempotency_key]),
+          project_id: null,
+          actor_id: f.admin.id,
+          operation: 'project_create',
+          input_hash: hash({ idempotency_key, instructions: '', key, name, policy: 'independent' }),
+          result,
+          created_at: f.clock.now.toISOString(),
+        }),
+      );
+      assert.deepEqual(await f.app.execute(f.admin.id, 'project_create', input), result);
     });
     check('rolls back all records when an atomic operation fails', async (f) => {
       const id = randomUUID();

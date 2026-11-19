@@ -151,6 +151,7 @@ it(
       const project = await call('project_create', {
         key: 'HOOK',
         name: 'Webhook test',
+        policy: 'self',
         idempotency_key: randomUUID(),
       });
       const create = (title: string) =>
