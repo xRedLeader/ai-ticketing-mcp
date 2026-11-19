@@ -8,20 +8,25 @@ Success JSON uses stable recursive object-key ordering and preserves array order
 
 ## Capability profiles
 
-The default profile is `worker`. Select `stdio --profile worker|planner|reviewer|full` or connect to `/mcp?profile=planner`. HTTP profiles are stateless; empty, unknown, or repeated `profile` parameters are rejected. OAuth tokens still target the unqueried `/mcp` resource.
+The default profile is `worker`. Select `stdio --profile worker|executor|planner|reviewer|full` or connect to `/mcp?profile=executor`. HTTP profiles are stateless; empty, unknown, or repeated `profile` parameters are rejected. OAuth tokens still target the unqueried `/mcp` resource.
 
-Every profile includes `project_list`, `project_get`, `ticket_list`, `ticket_context`, `ticket_get`, `ticket_history`, `search`, `knowledge_get`, `checkpoint_get`, and `changes_since`.
+Every profile includes `project_list`, `project_get`, `ticket_list`, `ticket_context`, `ticket_get`, `ticket_history`, and `checkpoint_get`. Worker, planner, reviewer and full also include `search`, `knowledge_get`, and `changes_since`.
 
 | Profile               | Additional tools                                                                                                                 | Prompts            |
 | --------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
 | `worker` (16 tools)   | `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`, `ticket_note`, `ticket_submit`                              | execution, handoff |
+| `executor` (16 tools) | `work_claim`, `work_release`, `ticket_note`, `ticket_submit`, `run_submit`, `run_wait`, `run_get`, `run_cancel`, `artifact_read` | execution, handoff |
 | `planner` (17 tools)  | `tickets_create`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_note`, `knowledge_write`, `ticket_github_refresh` | planning           |
 | `reviewer` (13 tools) | `ticket_review`, `ticket_note`, `ticket_github_refresh`                                                                          | verification       |
-| `full` (31 tools)     | All tools below, including project administration, `work_next`, `run_submit`, `run_get`, `artifact_read`, and `run_timeline`     | all four           |
+| `full` (36 tools)     | All tools below, including project administration, `work_next`, and `run_timeline`                                               | all four           |
 
 Profiles are not an access-control boundary. They select tool exposure; every operation retains its OAuth scope and project-role checks. Resources remain independently authorized and available in every profile. Guides and prompts follow the selected profile; the tool surface works without either.
 
-Use the [execution companion](execution-companion.md) to configure registered scripts, submit a durable run with `run_submit`, and retrieve its checkpoint, continuation, outcome, and reconciliation state/next safe step with `run_get`.
+Use the [execution companion](execution-companion.md) to configure registered scripts. The compact executor catalog preserves complete input schemas. Claim work and retrieve required omissions before `run_submit`, which atomically saves a checkpoint with the registered run. Persist the returned run ID across disconnects. The separately running trusted companion renews the admitted run's exact live claim while current requirements, permissions, assignment and blockers still allow execution. It never revives expired ownership. After completion, read the current ticket revision and submit criterion evidence; if ownership expired, reclaim explicitly before continuing.
+
+`run_wait` is a read: `timeout_ms` defaults to 1,000 and is bounded to 0–30,000; `max_tokens` defaults to 2,048. It returns the same bounded result as `run_get` when the run finishes, needs reconciliation, or the wait expires. Each snapshot rechecks project access, no transaction remains open while sleeping, and waiting never executes work or renews ownership. Follow returned checkpoint/history/run/artifact retrieval arguments before resuming or accepting evidence.
+
+`run_cancel` requires write scope and existing project-admin authority. It reuses trusted operator cancellation and returns a compact immutable receipt with a `run_get` reference. Use the same `idempotency_key` only for identical retries; changed inputs conflict, and every retry rechecks current authority. Cancellation requests neither prove process exit nor undo effects; inspect `run_get.reconciliation` and exact `artifact_read` evidence. External-effect reconciliation remains a trusted operator action.
 
 ## Tools
 
@@ -30,6 +35,7 @@ Use the [execution companion](execution-companion.md) to configure registered sc
 | Projects                   | `project_list`, `project_get`, `project_create`, `project_update`, `member_set`                                      |
 | Tickets                    | `tickets_create`, `ticket_list`, `ticket_get`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_history` |
 | Coordination               | `work_next`, `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`                                     |
+| Registered execution       | `run_submit`, `run_wait`, `run_get`, `run_cancel`, `artifact_read`, `run_timeline`                                   |
 | Collaboration and evidence | `ticket_note`, `ticket_submit`, `ticket_review`                                                                      |
 | Retrieval                  | `ticket_context`, `search`, `knowledge_get`, `knowledge_write`, `checkpoint_get`                                     |
 | Changes                    | `changes_since`                                                                                                      |
@@ -81,6 +87,12 @@ For reusable facts, supply `fact: { key: 'database.transactions', value: 'requir
 Memory is evidence, not instructions or a substitute for current ticket requirements. No memory is injected into `ticket_context`; submissions still require evidence for every current criterion. Write receipts always carry `trusted_reuse: false`, including retries; read again before reuse. Search validates candidates in an authorized snapshot and rechecks live grants after provider calls, returning only a small validity/contradiction badge and an exact-revision `knowledge_get` reference. Stale, expired, superseded, archived, or unavailable memory is withheld; disputed facts remain visible for explicit inspection. Provenance and contradiction entries contain no supporting-source bodies. Current project authorization also applies to historical reads.
 
 Validity evaluation is bounded to 1,000 current project knowledge records and 1,000 accepted revision snapshots. Above either limit, structured reads return `unavailable` with no trusted reuse and knowledge search results are withheld with a degradation notice. Unstructured direct audit reads, uncited legacy search hits, ticket-only searches and current requirement retrieval do not require a project memory scan. Indexed fact/supersession queries are needed before increasing this bound.
+
+The full profile supports deliberate sharing into a separately authorized project with `knowledge_promote`. Set `project_id` to the shared destination and supply `source_project_id`, `source_knowledge_id`, `source_revision`, and the exact supported `fact` key/value. The caller must currently administer both projects, including on receipt retries. Only accepted, verified, current, undisputed facts qualify. Promotion copies the selected fact; it never copies source prose, evidence, citations, credentials, or index documents. Shared facts are retrieved only through `knowledge_shared_list`, with destination membership; they are absent from search, embeddings, and automatic ticket context. A promotion cannot itself serve as project knowledge for another promotion.
+
+Shared reads evaluate current source support and the promoting actor's authority in one primary-storage snapshot. Withdrawal, stale/changed sources, or lost promotion authority hide the fact value and set `trusted_reuse:false` on subsequent reads. Destination-only recipients see an opaque promotion identity, status, and promotion/withdrawal audit fields. Source project/knowledge identities and revision are returned only to callers who can also read the source project. Mutation receipts contain only the promotion identity and timestamps and never authorize reuse.
+
+`knowledge_withdraw` requires destination administrator access. A source owner who no longer has destination access can instead supply `source_project_id` and administer that exact source project. Both paths use the destination's write lock and preserve the original selected fact and source identity in protected audit storage. Destination `changes_since` records promotion and withdrawal using only the opaque promotion identity; neither deletion nor revision of the original share is allowed. Read `knowledge_shared_list` again after reconnecting or authorization/source changes.
 
 Search combines lexical and semantic ranks with reciprocal rank fusion. It defaults to three results with query-centered excerpts of at most 200 reference tokens, source IDs/revisions, and explicit retrieval calls. It reports coverage and degradation when embeddings are unavailable, busy, or incomplete. Cancelled tickets and archived knowledge are excluded. Filters and source revisions are checked against primary storage. Indexing is eventual; retrieve the source directly for authoritative state.
 

@@ -14,7 +14,7 @@ export interface ProfileMessageReport {
   sequence: number;
   connection: number;
   transport: 'stdio' | 'http';
-  profile: 'worker' | 'planner' | 'reviewer' | 'full' | 'other';
+  profile: 'worker' | 'executor' | 'planner' | 'reviewer' | 'full' | 'other';
   direction: 'incoming' | 'outgoing';
   kind: 'request' | 'notification' | 'response' | 'malformed';
   method: string | null;
@@ -473,7 +473,7 @@ export async function analyzeProfile(directory: string): Promise<ProfileReport> 
         direction: event.direction!,
         kind,
         transport: event.transport as 'stdio' | 'http',
-        profile: ['worker', 'planner', 'reviewer', 'full'].includes(event.profile!)
+        profile: ['worker', 'executor', 'planner', 'reviewer', 'full'].includes(event.profile!)
           ? (event.profile as ProfileMessageReport['profile'])
           : 'other',
         method: ['request', 'notification'].includes(kind) ? route(parsed.method) : null,

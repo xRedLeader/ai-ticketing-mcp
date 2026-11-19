@@ -47,16 +47,16 @@ For real users and agents, follow [identity and client setup](docs/authenticatio
 
 ## The work loop
 
-1. `project_list` discovers authorized projects; select worker (default), planner, reviewer, or full profile for the task.
+1. `project_list` discovers authorized projects; select worker (default), executor, planner, reviewer, or full profile for the task.
 2. `work_claim` selects and claims work atomically, returning brief context with current requirements, instructions, policy, blockers, and credentials.
-3. Follow required omission references before resumed work or review. Use `ticket_context` for more detail and `ticket_history` for history.
+3. Follow required omission references before resumed work or review. Use fresh `ticket_context` after reconnecting: claim retry receipts describe the original claim. Resume packets preserve earlier checkpoint decisions, changes since the last checkpoint, and execution outcomes with scoped artifact identities. Follow every `required_before:execution` reference, paging `ticket_history` until `has_more` is false; large requirements or blockers return a concrete budget error rather than truncated text. Artifact contents require the executor or full profile's `artifact_read` when the outcome and identity are insufficient.
 4. `ticket_checkpoint` persists progress and returns the next ticket revision. Heartbeat at least every three minutes.
 5. `ticket_submit` supplies passing evidence for every criterion using the latest returned revision.
 6. A reviewer reads current requirements and submission evidence, then uses `ticket_review` according to policy.
 
 Use a fresh `idempotency_key` for each logical mutation, reusing it only for an identical retry. Read the latest revision before edits and submission. A changed requirement revokes claims and invalidates affected approvals; an old worker cannot continue with its former token.
 
-Connect with `stdio --profile planner` or `/mcp?profile=reviewer`; OAuth tokens still target `/mcp`. Profiles select tools without changing permissions. Lists and mutation receipts are compact; fetch full current state through `ticket_get` or `project_get`. Existing clients should review the [changed defaults](docs/mcp.md#changed-defaults). The [SDK maintenance example](examples/claim-maintenance.ts) renews ownership independently every two minutes and catches up change pages between model turns, retaining keys across identical retries.
+Use `stdio --profile executor` or `/mcp?profile=executor` for registered script execution with bounded waits and exact artifact evidence. Connect with `stdio --profile planner` or `/mcp?profile=reviewer`; OAuth tokens still target `/mcp`. Profiles select tools without changing permissions. Lists and mutation receipts are compact; fetch full current state through `ticket_get` or `project_get`. Existing clients should review the [changed defaults](docs/mcp.md#changed-defaults). The [SDK maintenance example](examples/claim-maintenance.ts) renews ownership independently every two minutes and catches up change pages between model turns, retaining keys across identical retries.
 
 Ticket references accept a UUID or readable key such as `CORE-42`. Project references use UUIDs. Full [tool and workflow behavior](docs/mcp.md) is documented separately.
 
