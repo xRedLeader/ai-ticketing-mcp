@@ -291,6 +291,21 @@ const continuation = z.object({
   created_at: timestamp,
   settled_at: timestamp.nullable(),
 });
+export const executionResumeSchema = z.object({
+  run: executionJob,
+  continuation,
+  stale: z.boolean(),
+});
+const change = z.object({
+  id,
+  project_id: id,
+  seq: z.number(),
+  actor_id: id,
+  type: z.string(),
+  entity_id: z.string(),
+  data: z.record(z.string(), json),
+  created_at: timestamp,
+});
 const omission = z.object({
   section: z.string(),
   retrieve_with: z.string(),
@@ -316,6 +331,9 @@ const context = z.discriminatedUnion('not_modified', [
     untrusted_content_notice: z.string(),
     omitted: z.array(omission),
     latest_checkpoint: note.nullable().optional(),
+    prior_checkpoints: z.array(note).optional(),
+    execution_outcomes: z.array(executionResumeSchema).optional(),
+    recent_changes: z.array(change).optional(),
     open_questions: z.array(note).optional(),
     reviews: z.array(review).optional(),
     submissions: z.array(submission.omit({ requirements_snapshot: true })).optional(),
@@ -598,7 +616,11 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
     claim: visibleClaim,
     blockers: z.array(blocker),
   }),
-  ticket_history: z.object({ items: z.array(z.union([note, submission, review, githubEvidenceSchema])) }),
+  ticket_history: z.object({
+    items: z.array(z.union([note, submission, review, githubEvidenceSchema, executionResumeSchema, change])),
+    has_more: z.boolean().optional(),
+    next_offset: z.number().optional(),
+  }),
   ticket_link: z.object({
     source_id: id,
     target_id: id,
@@ -659,18 +681,7 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
     }),
   checkpoint_get: note,
   changes_since: z.object({
-    events: z.array(
-      z.object({
-        id,
-        project_id: id,
-        seq: z.number(),
-        actor_id: id,
-        type: z.string(),
-        entity_id: z.string(),
-        data: z.record(z.string(), json),
-        created_at: timestamp,
-      }),
-    ),
+    events: z.array(change),
     next_cursor: z.number(),
     has_more: z.boolean(),
   }),

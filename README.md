@@ -49,7 +49,7 @@ For real users and agents, follow [identity and client setup](docs/authenticatio
 
 1. `project_list` discovers authorized projects; select worker (default), planner, reviewer, or full profile for the task.
 2. `work_claim` selects and claims work atomically, returning brief context with current requirements, instructions, policy, blockers, and credentials.
-3. Follow required omission references before resumed work or review. Use `ticket_context` for more detail and `ticket_history` for history.
+3. Follow required omission references before resumed work or review. Use fresh `ticket_context` after reconnecting: claim retry receipts describe the original claim. Resume packets preserve earlier checkpoint decisions, changes since the last checkpoint, and execution outcomes with scoped artifact identities. Follow every `required_before:execution` reference, paging `ticket_history` until `has_more` is false; large requirements or blockers return a concrete budget error rather than truncated text. Artifact contents require the executor or full profile's `artifact_read` when the outcome and identity are insufficient.
 4. `ticket_checkpoint` persists progress and returns the next ticket revision. Heartbeat at least every three minutes.
 5. `ticket_submit` supplies passing evidence for every criterion using the latest returned revision.
 6. A reviewer reads current requirements and submission evidence, then uses `ticket_review` according to policy.

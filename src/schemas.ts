@@ -145,11 +145,18 @@ export const schemas = {
     .object({
       ...ticket,
       ...page,
-      kind: z.enum(['notes', 'submissions', 'reviews', 'github']).default('notes'),
+      kind: z
+        .enum(['notes', 'submissions', 'reviews', 'github', 'checkpoints', 'executions', 'changes'])
+        .default('notes'),
       item_id: id.optional(),
+      after_sequence: z.int().nonnegative().optional(),
       nonblocking_unanswered: z.literal(true).optional(),
     })
     .strict()
+    .refine((input) => input.after_sequence === undefined || input.kind === 'changes', {
+      message: 'after_sequence requires changes history.',
+      path: ['after_sequence'],
+    })
     .refine((input) => !input.nonblocking_unanswered || (input.kind === 'notes' && !input.item_id), {
       message: 'nonblocking_unanswered requires notes history and cannot be combined with item_id.',
       path: ['nonblocking_unanswered'],
@@ -368,7 +375,8 @@ export const descriptions: Record<Operation, string> = {
     'Atomically create up to 50 tickets with acceptance criteria. Use status ready to make work claimable.',
   ticket_get:
     'Read current details, criteria, links, claim and blockers by UUID or key. For history use ticket_history.',
-  ticket_history: 'Page ticket notes, submissions, reviews, or GitHub evidence.',
+  ticket_history:
+    'Page ticket notes, evidence, checkpoints, execution outcomes, or changes; follow has_more.',
   ticket_list: 'List project tickets, optionally filtered by status.',
   ticket_update:
     'Edit a ticket with revision protection. Requirement changes revoke claims and invalidate affected approvals.',

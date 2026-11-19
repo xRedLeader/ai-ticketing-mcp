@@ -39,7 +39,7 @@ import {
   type Continuation,
   validateGitHubConfiguration,
 } from './contracts.js';
-import { resultSchemas, githubEvidenceSchema } from './result-schemas.js';
+import { resultSchemas, githubEvidenceSchema, executionResumeSchema } from './result-schemas.js';
 import { inspectMemory } from './memory.js';
 import { serializeSuccessEnvelope } from './envelope.js';
 import { registerWake, evaluateWakes, wakeRegistration, claimWake, finishWake } from './wake-events.js';
@@ -2434,6 +2434,7 @@ export class Application {
         const recipe = this.executionRecipe(project.id, input.recipe_id);
         const checkpoint = await this.note(tx, actor, ticket, 'checkpoint', input.checkpoint.progress, {
           metadata: {
+            event_seq: project.event_seq + 1,
             remaining: input.checkpoint.remaining,
             decisions: input.checkpoint.decisions,
             references: input.checkpoint.references,
@@ -2591,6 +2592,7 @@ export class Application {
         await this.liveClaim(tx, ticket, actor, input.claim_token);
         const note = await this.note(tx, actor, ticket, 'checkpoint', input.progress, {
           metadata: {
+            event_seq: project.event_seq + 1,
             remaining: input.remaining,
             decisions: input.decisions,
             references: input.references,
@@ -2834,6 +2836,26 @@ export class Application {
         )
       : unavailableArtifact(artifactId, offset, length, 'not_configured');
   }
+  private async executionResume(reader: Reader, run: ExecutionJob) {
+    const artifacts: string[] = [];
+    for (const artifact of run.artifacts) {
+      const identity = artifactIdentity.exec(artifact);
+      if (!identity || identity[1] !== run.id) continue;
+      const attempt = await reader.get('execution_attempts', identity[2]!);
+      if (attempt?.project_id === run.project_id && attempt.run_id === run.id) artifacts.push(artifact);
+    }
+    const continuation = await reader.get('continuations', run.continuation_id);
+    ensure(
+      continuation?.project_id === run.project_id && continuation.run_id === run.id,
+      'INVALID_REFERENCE',
+      'Execution continuation is missing.',
+    );
+    return executionResumeSchema.parse({
+      run: { ...run, artifacts },
+      continuation,
+      stale: !(await this.executionAuthority(reader, run)),
+    });
+  }
   private async read(actorId: string, operation: Operation, input: any): Promise<unknown> {
     if (operation === 'artifact_read')
       return this.storage.readSnapshot(async (reader) => {
@@ -3036,6 +3058,45 @@ export class Application {
         );
       case 'ticket_history': {
         const ticket = await this.ticket(this.storage, project.id, input.ticket_id);
+        if (['checkpoints', 'executions', 'changes'].includes(input.kind))
+          return this.storage.readSnapshot(async (reader) => {
+            await this.access(reader, await this.actor(actorId, reader), project.id);
+            const pageInput = { limit: input.limit + 1, offset: input.offset };
+            const where = { project_id: project.id, ...(input.item_id ? { id: input.item_id } : {}) };
+            const rows =
+              input.kind === 'changes'
+                ? await reader.find('events', {
+                    ...pageInput,
+                    where: { ...where, entity_id: ticket.id, seq: { gt: input.after_sequence ?? 0 } },
+                    order: [{ field: 'seq', direction: 'desc' }],
+                  })
+                : input.kind === 'executions'
+                  ? await reader.find('execution_jobs', {
+                      ...pageInput,
+                      where: { ...where, ticket_id: ticket.id },
+                      order: [
+                        { field: 'created_at', direction: 'desc' },
+                        { field: 'id', direction: 'desc' },
+                      ],
+                    })
+                  : await reader.find('notes', {
+                      ...pageInput,
+                      where: { ...where, ticket_id: ticket.id, kind: 'checkpoint' },
+                      order: [
+                        { field: 'ticket_revision', direction: 'desc' },
+                        { field: 'id', direction: 'desc' },
+                      ],
+                    });
+            const page = rows.slice(0, input.limit);
+            return {
+              items:
+                input.kind === 'executions'
+                  ? await Promise.all(page.map((run) => this.executionResume(reader, run as ExecutionJob)))
+                  : page,
+              has_more: rows.length > input.limit,
+              next_offset: input.offset + page.length,
+            };
+          });
         if (input.kind === 'github') {
           const latest = await this.githubEvidence(this.storage, ticket);
           const items = await this.storage.find('github_evidence', {
@@ -3383,12 +3444,12 @@ export class Application {
       { field: 'ticket_revision' as const, direction: 'desc' as const },
       { field: 'id' as const, direction: 'desc' as const },
     ];
-    const [checkpoints, questions, reviews, submissions, member, unfinishedChildren, dependencies] =
+    const [checkpoints, questions, reviews, submissions, member, unfinishedChildren, dependencies, runs] =
       await Promise.all([
         reader.find('notes', {
           where: { project_id: project.id, ticket_id: ticket.id, kind: 'checkpoint' },
           order,
-          limit: 1,
+          limit: limit + 2,
         }),
         reader.unansweredQuestions(project.id, ticket.id, false, limit + 1, 0),
         reader.find('reviews', {
@@ -3416,7 +3477,28 @@ export class Application {
               limit: 10001,
             })
           : [],
+        reader.find('execution_jobs', {
+          where: { project_id: project.id, ticket_id: ticket.id },
+          order: [
+            { field: 'created_at', direction: 'desc' },
+            { field: 'id', direction: 'desc' },
+          ],
+          limit: limit + 1,
+        }),
       ]);
+    const afterSequence = Number.isSafeInteger(checkpoints[0]?.metadata.event_seq)
+      ? (checkpoints[0]!.metadata.event_seq as number)
+      : 0;
+    const changes = checkpoints.length
+      ? await reader.find('events', {
+          where: { project_id: project.id, entity_id: ticket.id, seq: { gt: afterSequence } },
+          order: [{ field: 'seq', direction: 'desc' }],
+          limit: limit + 1,
+        })
+      : [];
+    const executions = await Promise.all(
+      runs.slice(0, limit).map((run) => this.executionResume(reader, run)),
+    );
     return {
       actor,
       project,
@@ -3430,6 +3512,10 @@ export class Application {
       member,
       unfinishedChildren,
       dependencies,
+      runs,
+      executions,
+      changes,
+      afterSequence,
     };
   }
   private packContext(
@@ -3450,6 +3536,10 @@ export class Application {
       member,
       unfinishedChildren,
       dependencies,
+      runs,
+      executions,
+      changes,
+      afterSequence,
     } = snapshot;
     const sourceSummaries = resultSchemas.ticket_list.parse({ tickets: dependencies }) as {
       tickets: { id: string }[];
@@ -3483,6 +3573,9 @@ export class Application {
       claim: detail.claim,
       github_evidence: detail.github_evidence,
       checkpoint,
+      prior_checkpoints: checkpoints.slice(1),
+      executions,
+      changes,
       questions,
       reviews,
       submissions: contextSubmissions,
@@ -3533,6 +3626,51 @@ export class Application {
           required_before: 'execution',
         },
       },
+      ...(checkpoints.length > 1
+        ? [
+            {
+              name: 'prior_checkpoints',
+              value: checkpoints.slice(1, limit + 1),
+              empty: false,
+              omission: {
+                section: 'prior_checkpoints',
+                retrieve_with: 'ticket_history',
+                arguments: { ...history('checkpoints'), offset: 1, limit },
+                required_before: 'execution' as const,
+              },
+            },
+          ]
+        : []),
+      ...(runs.length
+        ? [
+            {
+              name: 'execution_outcomes',
+              value: executions,
+              empty: false,
+              omission: {
+                section: 'execution_outcomes',
+                retrieve_with: 'ticket_history',
+                arguments: { ...history('executions'), limit },
+                required_before: 'execution' as const,
+              },
+            },
+          ]
+        : []),
+      ...(changes.length
+        ? [
+            {
+              name: 'recent_changes',
+              value: changes.slice(0, limit),
+              empty: false,
+              omission: {
+                section: 'recent_changes',
+                retrieve_with: 'ticket_history',
+                arguments: { ...history('changes'), after_sequence: afterSequence, limit },
+                required_before: 'execution' as const,
+              },
+            },
+          ]
+        : []),
       {
         name: 'open_questions',
         value: questions.slice(0, limit),
@@ -3631,6 +3769,22 @@ export class Application {
           section: 'open_questions_more',
           retrieve_with: 'ticket_history',
           arguments: { ...history('notes'), nonblocking_unanswered: true, offset: 0 },
+        };
+      const resumeHistory = {
+        prior_checkpoints: { count: checkpoints.length - 1, kind: 'checkpoints', offset: limit + 1 },
+        execution_outcomes: { count: runs.length, kind: 'executions', offset: limit },
+        recent_changes: { count: changes.length, kind: 'changes', offset: limit },
+      }[section.name];
+      if (resumeHistory && resumeHistory.count > limit)
+        addedNotice = {
+          ...section.omission,
+          section: `${section.name}_more`,
+          arguments: {
+            ...history(resumeHistory.kind),
+            limit,
+            offset: resumeHistory.offset,
+            ...(section.name === 'recent_changes' ? { after_sequence: afterSequence } : {}),
+          },
         };
       const delta =
         cost - this.responseTokens(section.omission) + (addedNotice ? this.responseTokens(addedNotice) : 0);
