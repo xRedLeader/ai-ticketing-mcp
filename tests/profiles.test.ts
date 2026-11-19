@@ -138,7 +138,7 @@ it('serves profile-specific HTTP catalogs and prompts without changing scope aut
                 tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
               ),
             ) <= 5000,
-            'Worker input catalog exceeds the protocol budget.',
+            `${profile} input catalog exceeds the protocol budget.`,
           );
         assert.deepEqual(
           (await client.listPrompts()).prompts.map((prompt) => prompt.name).sort(),

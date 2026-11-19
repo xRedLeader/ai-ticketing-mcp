@@ -369,7 +369,7 @@ export const descriptions: Record<Operation, string> = {
     'Explain one authorized run, its immutable observation timeline, current ownership and next safe wake/action. Paginate by after_sequence; max_tokens bounds the complete result. Full profile only; no transcripts or credentials.',
   run_submit: 'Checkpoint and queue an operator-registered recipe under a live claim.',
   run_get: 'Read authoritative run state, evidence, checkpoint and continuation.',
-  run_wait: 'Wait for bounded run_get status; never renews claims.',
+  run_wait: 'Wait briefly for run_get status. No renewal.',
   run_cancel: 'Request cancellation; project admin required. Inspect effects with run_get.',
   artifact_read: 'Read untrusted artifact byte ranges as base64 with SHA-256 hashes.',
   ticket_github_refresh:
@@ -382,7 +382,7 @@ export const descriptions: Record<Operation, string> = {
     'Grant a registered identity a project role, or remove it with role none. The last admin cannot be removed. Requires project admin.',
   tickets_create:
     'Atomically create up to 50 tickets with acceptance criteria. Use status ready to make work claimable.',
-  ticket_get: 'Read requirements, state, claim and blockers by ID or key.',
+  ticket_get: 'Read requirements, state, claim and blockers.',
   ticket_history: 'Page notes, evidence, checkpoints, runs or changes; follow has_more.',
   ticket_list: 'List filtered project tickets.',
   ticket_update:
