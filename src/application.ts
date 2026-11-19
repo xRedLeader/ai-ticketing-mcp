@@ -559,6 +559,38 @@ export class Application {
           'IDEMPOTENCY_CONFLICT',
           'Use a new idempotency key when changing inputs.',
         );
+        if (operation === 'work_claim' || operation === 'work_heartbeat') {
+          const stored = previous.result as {
+            claim?: { ticket_id?: string; token?: string };
+            ticket_id?: string;
+            token?: string;
+          };
+          const credential = operation === 'work_claim' ? stored.claim : stored;
+          if (
+            credential?.ticket_id &&
+            credential.token &&
+            ((input as Input<'work_claim'>).handoff_checkpoint_id ||
+              (
+                await tx.find('claim_handoffs', {
+                  where: {
+                    project_id: project!.id,
+                    ticket_id: credential.ticket_id,
+                  },
+                  limit: 1,
+                })
+              ).length)
+          ) {
+            const current = await tx.get('claims', credential.ticket_id);
+            ensure(
+              current &&
+                current.actor_id === actor.id &&
+                current.token === credential.token &&
+                current.expires_at > this.timestamp(),
+              'HANDOFF_STALE',
+              'This handoff claim is no longer current. Read ticket_context before continuing.',
+            );
+          }
+        }
         try {
           let stored = previous.result;
           if (
@@ -869,6 +901,88 @@ export class Application {
       'Claim is absent, expired, or owned by another worker. Reclaim the ticket before writing progress.',
     );
     return claim;
+  }
+  private async handoffReferences(reader: Reader, ticket: Ticket, references: string[]) {
+    for (const reference of references.filter((value) => value.startsWith('execution:'))) {
+      const identity = artifactIdentity.exec(reference);
+      ensure(
+        identity,
+        'INVALID_REFERENCE',
+        'Handoff execution references require exact artifact identities.',
+      );
+      const run = await reader.get('execution_jobs', identity[1]!);
+      const attempt = await reader.get('execution_attempts', identity[2]!);
+      ensure(
+        run &&
+          run.project_id === ticket.project_id &&
+          run.ticket_id === ticket.id &&
+          attempt &&
+          attempt.project_id === ticket.project_id &&
+          attempt.run_id === run.id &&
+          run.artifacts.includes(reference),
+        'INVALID_REFERENCE',
+        'Handoff artifacts must be published by this ticket and attempt.',
+      );
+      if (this.storage.artifactRetention)
+        ensure(
+          !(await reader.get('artifact_retirements', reference)),
+          'ARTIFACT_RETIRED',
+          'Handoff artifact was retired.',
+        );
+    }
+  }
+  private async transferable(reader: Reader, ticket: Ticket) {
+    ensure(
+      !(
+        await reader.find('execution_jobs', {
+          where: {
+            project_id: ticket.project_id,
+            ticket_id: ticket.id,
+            status: { in: ['queued', 'reserved', 'running'] },
+          },
+          limit: 1,
+        })
+      ).length,
+      'ACTIVE_EXECUTION',
+      'Resolve active registered execution before handing off responsibility.',
+    );
+  }
+  private async acceptHandoff(
+    tx: Transaction,
+    project: Project,
+    ticket: Ticket,
+    actor: Actor,
+    checkpointId: string,
+  ) {
+    const offer = await tx.get('claim_handoffs', checkpointId);
+    const claim = await tx.get('claims', ticket.id);
+    const checkpoint = await tx.get('notes', checkpointId);
+    ensure(
+      offer &&
+        offer.project_id === project.id &&
+        offer.ticket_id === ticket.id &&
+        offer.recipient_id === actor.id &&
+        claim &&
+        claim.actor_id === offer.source_actor_id &&
+        digest(claim.token) === offer.source_claim_hash &&
+        claim.expires_at > this.timestamp() &&
+        ticket.status === 'in_progress' &&
+        ticket.requirements_revision === offer.requirements_revision &&
+        ticket.revision === offer.ticket_revision &&
+        checkpoint &&
+        checkpoint.project_id === project.id &&
+        checkpoint.ticket_id === ticket.id &&
+        checkpoint.kind === 'checkpoint' &&
+        checkpoint.actor_id === offer.source_actor_id &&
+        checkpoint.ticket_revision === offer.ticket_revision,
+      'HANDOFF_STALE',
+      'Handoff is absent, expired, changed, or addressed to another recipient.',
+    );
+    await this.access(tx, await this.actor(offer.source_actor_id, tx), project.id, ['contributor', 'admin']);
+    await this.transferable(tx, ticket);
+    await this.handoffReferences(tx, ticket, checkpoint.metadata.references as string[]);
+    await tx.remove('claims', ticket.id);
+    return { checkpoint_id: checkpointId, source_actor_id: offer.source_actor_id };
   }
   private executionRecipe(projectId: string, recipeId: string) {
     const recipe = this.executionRecipes.get(recipeId);
@@ -3167,6 +3281,9 @@ export class Application {
               ? 'No eligible work matches registered capabilities. Select a ticket_id to retrieve its exact execution mismatch.'
               : 'No eligible work is currently available.',
           );
+          const handoff = input.handoff_checkpoint_id
+            ? await this.acceptHandoff(tx, project, ticket, actor, input.handoff_checkpoint_id)
+            : undefined;
           const matched = this.matchClient(project, ticket, actor, input.client_id);
           ensure(
             matched.selection !== null,
@@ -3207,7 +3324,11 @@ export class Application {
           ticket.status = 'in_progress';
           await this.touch(tx, ticket);
           await this.event(tx, project, actor, 'work.claimed', ticket.id, { expires_at: claim.expires_at });
-          const receipt = this.result('work_claim', { ticket, claim }) as Record<string, unknown>;
+          const receipt = this.result('work_claim', {
+            ticket,
+            claim,
+            ...(handoff ? { handoff } : {}),
+          }) as Record<string, unknown>;
           if (!input.include_context) return { ...receipt, context_omitted: 'requested' };
           return {
             ...receipt,
@@ -3450,7 +3571,30 @@ export class Application {
         return ticket;
       }
       case 'ticket_checkpoint': {
-        await this.liveClaim(tx, ticket, actor, input.claim_token);
+        const claim = await this.liveClaim(tx, ticket, actor, input.claim_token);
+        if (input.handoff) {
+          ensure(
+            input.handoff.recipient_id !== actor.id,
+            'INVALID_HANDOFF',
+            'Handoff requires a different recipient.',
+          );
+          ensure(
+            !ticket.assignee_id || ticket.assignee_id === input.handoff.recipient_id,
+            'ASSIGNMENT_PINNED',
+            'Clear or resolve the explicit assignment before offering a handoff.',
+          );
+          ensure(
+            !['.', '..'].includes(input.handoff.workspace_id),
+            'INVALID_HANDOFF',
+            'Use a path-free workspace identity.',
+          );
+          await this.access(tx, await this.actor(input.handoff.recipient_id, tx), project.id, [
+            'contributor',
+            'admin',
+          ]);
+          await this.transferable(tx, ticket);
+          await this.handoffReferences(tx, ticket, input.references);
+        }
         const note = await this.note(tx, actor, ticket, 'checkpoint', input.progress, {
           metadata: {
             event_seq: project.event_seq + 1,
@@ -3458,9 +3602,21 @@ export class Application {
             decisions: input.decisions,
             references: input.references,
             requirements_revision: ticket.requirements_revision,
+            ...(input.handoff ? { handoff: input.handoff } : {}),
           },
         });
         await this.touch(tx, ticket);
+        if (input.handoff)
+          await tx.put('claim_handoffs', {
+            id: note.id,
+            project_id: project.id,
+            ticket_id: ticket.id,
+            source_actor_id: actor.id,
+            recipient_id: input.handoff.recipient_id,
+            source_claim_hash: digest(claim.token),
+            requirements_revision: ticket.requirements_revision,
+            ticket_revision: ticket.revision,
+          });
         await this.queue(tx, note, 'checkpoint');
         await this.event(tx, project, actor, 'ticket.checkpointed', ticket.id, {
           note_id: note.id,
@@ -4940,7 +5096,9 @@ export class Application {
     ensure(
       requiredTokens <= maxTokens,
       'CONTEXT_TOO_LARGE',
-      'Required context exceeds max_tokens. Read ticket_get and project_get; claim with include_context:false and a fresh idempotency key if necessary.',
+      receipt?.handoff
+        ? 'Handoff context exceeds max_tokens. Increase max_tokens and retry; the previous owner remains unchanged.'
+        : 'Required context exceeds max_tokens. Read ticket_get and project_get; claim with include_context:false and a fresh idempotency key if necessary.',
       {
         required_tokens: requiredTokens,
         max_tokens: maxTokens,

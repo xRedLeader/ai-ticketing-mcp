@@ -104,6 +104,16 @@ export interface Claim {
   expires_at: string;
   execution?: ClientSelection;
 }
+export interface ClaimHandoff {
+  id: string;
+  project_id: string;
+  ticket_id: string;
+  source_actor_id: string;
+  recipient_id: string;
+  source_claim_hash: string;
+  requirements_revision: number;
+  ticket_revision: number;
+}
 export interface Evidence {
   criterion_id: string;
   result: 'pass' | 'fail';
@@ -508,6 +518,7 @@ export interface Tables {
   links: Link;
   notes: Note;
   claims: Claim;
+  claim_handoffs: ClaimHandoff;
   submissions: Submission;
   reviews: Review;
   knowledge: Knowledge;

@@ -17,6 +17,8 @@ Stop application/worker processes, back up and verify restoration, apply all pen
 
 ### Self-hosted additions
 
+Claim handoff uses optional `ticket_checkpoint.handoff` and `work_claim.handoff_checkpoint_id` without new MCP operations. Apply additive PostgreSQL `027_claim_handoffs.sql` or SQLite `019_claim_handoffs.sql`; custom adapters need the immutable `claim_handoffs` mapping and contract suite. Source ownership remains until the named authorized recipient acknowledges atomically with complete bounded context. Old generation tokens and related claim/heartbeat receipts cannot restore publication authority. See [handoff requirements and recovery](claim-handoff.md).
+
 PR #2 adds local SQLite/FTS5 operation, immutable GitHub PR/CI evidence, signed notification delivery, opt-in unblocking scheduling, and advisory project/ticket model and effort hints. Notifications remain disabled until configured. SQLite has one writer and is intended for local operation; PostgreSQL remains the shared-service option.
 
 Query embedding caches use exact text keys within each immutable profile instance. At capacity, expired completed entries are reclaimed before live completed LRU entries; in-flight requests stay protected and coalesced. The 256-entry bound and ten-minute TTL from completion remain unchanged.

@@ -666,6 +666,7 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
   work_claim: z.object({
     ticket: ticketReceipt,
     claim,
+    handoff: z.object({ checkpoint_id: id, source_actor_id: id }).optional(),
     context: context.optional(),
     context_omitted: z.enum(['requested', 'legacy_receipt']).optional(),
     context_ref: retrieval.optional(),

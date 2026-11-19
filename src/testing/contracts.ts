@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 export { registerWakeContractTests } from './wake-contracts.js';
+export { registerHandoffContractTests } from './handoff-contracts.js';
 import assert from 'node:assert/strict';
 import { randomUUID, createHash } from 'node:crypto';
 import { createApplication } from '../application.js';
