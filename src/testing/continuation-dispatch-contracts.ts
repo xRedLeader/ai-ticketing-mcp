@@ -299,7 +299,10 @@ export function registerContinuationDispatchContractTests(
       await f.storage.transaction(f.project.id, async (tx) => {
         const registration = (await tx.get('wake_conditions', f.ticket.id))!;
         for (let index = 0; index < 100; index++) {
-          const id = `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`;
+          const hex = (BigInt(`0x${f.ticket.id.replaceAll('-', '')}`) - BigInt(index + 1))
+            .toString(16)
+            .padStart(32, '0');
+          const id = hex.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5');
           assert.ok(id < f.ticket.id);
           await tx.put('tickets', { ...f.ticket, id, key: `${f.project.key}-${index + 1000}` });
           await tx.put('wake_conditions', {
@@ -476,4 +479,75 @@ export function registerContinuationDispatchContractTests(
       assert.equal(f.calls(), 0);
       assert.equal((await f.get()).generation, active.generation);
     });
+
+  for (const expired of [false, true])
+    check(
+      `recovers exact admission after ticket rollback with ${expired ? 'expired' : 'current'} worker claim`,
+      async (f) => {
+        await f.settleScript();
+        await f.register();
+        f.exitPredecessor();
+        const transaction = f.storage.transaction.bind(f.storage);
+        let injected = false;
+        f.storage.transaction = (scope, work) =>
+          transaction(scope, async (tx) => {
+            const result = await work(tx);
+            if (!injected && (result as any)?.state === 'starting') {
+              injected = true;
+              throw new Error('Simulated rollback after capacity admission before ticket commit.');
+            }
+            return result;
+          });
+        try {
+          await assert.rejects(f.dispatcher().runOnce(f.request), /Simulated rollback after capacity/);
+        } finally {
+          f.storage.transaction = transaction;
+        }
+        const before = (await f.get()).active!;
+        assert.equal(before.dispatch, undefined);
+        const occupied = f
+          .capacity()
+          .inspect('host')
+          .entries.find((entry) => entry.state === 'running')!;
+        assert.ok(occupied.execution_token);
+        const charged = f.capacity().report(f.request.budget_run_id).budget_charged_or_reserved;
+        assert.equal(charged.attempts, 2);
+        if (expired) f.clock.now = new Date(f.clock.now.getTime() + 3_600_000);
+        const fresh = f.restart();
+        const recovered = await Promise.all([fresh.runOnce(f.request), f.dispatcher().runOnce(f.request)]);
+        assert.ok(
+          recovered.every(
+            (result) => result.state === 'needs_attention' && result.code === 'ADMISSION_UNCERTAIN',
+          ),
+        );
+        const active = (await f.get()).active!;
+        assert.equal(active.generation, before.generation);
+        assert.equal(active.dispatch!.invocation!.queue_id, occupied.queue_id);
+        assert.equal(active.dispatch!.invocation!.execution_token, occupied.execution_token);
+        assert.equal(f.calls(), 0);
+        assert.deepEqual(f.capacity().report(f.request.budget_run_id).budget_charged_or_reserved, charged);
+        assert.equal((await f.dispatcher().runOnce(f.request)).code, 'ADMISSION_UNCERTAIN');
+        const fence = { ticket_id: f.ticket.id, generation: active.generation, token: active.token };
+        await assert.rejects(
+          f.app.finishWakeDecision(f.admin.id, f.project.id, fence),
+          hasCode('WAKE_PENDING'),
+        );
+        const proof = {
+          source: 'independent-fake-supervisor',
+          execution_token: occupied.execution_token!,
+          observed_at: Date.now(),
+          state: 'never_started' as const,
+          settlement: {
+            outcome: 'cancelled' as const,
+            runtime_ms: 0,
+            usage_source: 'independent-fake-supervisor',
+            usage: { input_tokens: 0, output_tokens: 0 },
+          },
+        };
+        await Promise.all([f.dispatcher().reconcile(fence, proof), f.dispatcher().reconcile(fence, proof)]);
+        assert.equal((await f.get()).active!.dispatch!.state, 'completed');
+        assert.equal(f.capacity().inspect('host').occupied.agent, 0);
+        assert.equal(f.calls(), 0);
+      },
+    );
 }

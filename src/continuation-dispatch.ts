@@ -82,6 +82,7 @@ export class ContinuationDispatcher {
       fence,
       (context) => {
         if (!predecessor(context)) return { state: 'waiting', code: 'PREDECESSOR_RUNNING' };
+        const queue = `continuation:${context.continuation_id}:${decision.generation}`;
         const budget = capacity.report(input.budget_run_id);
         ensure(
           budget.config.project_id === project,
@@ -90,7 +91,6 @@ export class ContinuationDispatcher {
         );
         if (budget.status === 'needs_attention')
           return { state: 'needs_attention', code: 'BUDGET_NEEDS_ATTENTION' };
-        const queue = `continuation:${context.continuation_id}:${decision.generation}`;
         capacity.enqueue(host, {
           queue_id: queue,
           run_id: input.budget_run_id,
@@ -148,6 +148,28 @@ export class ContinuationDispatcher {
         capacity.heartbeat(entry.lease);
         return this.options.launch(context, invocation);
       },
+      (context) => {
+        const queue = `continuation:${context.continuation_id}:${decision.generation}`;
+        const previous = capacity.inspect(host).entries.find((entry) => entry.queue_id === queue);
+        if (!previous || previous.state === 'queued') return null;
+        ensure(
+          ['running', 'reconciling', 'settled'].includes(previous.state) &&
+            previous.kind === 'agent' &&
+            previous.project_id === project &&
+            previous.run_id === input.budget_run_id &&
+            previous.admission?.attempt_id === queue &&
+            previous.admission.ticket_id === context.ticket_id &&
+            previous.admission.requirements_revision === context.requirements_revision &&
+            previous.admission.actor_id === context.actor_id &&
+            previous.lease?.host_id === host &&
+            previous.lease.queue_id === queue &&
+            previous.execution_token,
+          'CONFLICT',
+          'Continuation admission identity changed.',
+        );
+        // Capacity can commit before the ticket transaction; recover ownership before live launch validation.
+        return { host_id: host, queue_id: queue, execution_token: previous.execution_token };
+      },
     );
     if (
       dispatch.state === 'needs_attention' &&
@@ -156,7 +178,14 @@ export class ContinuationDispatcher {
     ) {
       const queue = `continuation:${row.condition.continuation_id}:${decision.generation}`;
       const queued = capacity.inspect(host).entries.find((entry) => entry.queue_id === queue);
-      if (queued?.state === 'queued' && queued.project_id === project) capacity.cancel(host, queue);
+      if (
+        queued?.state === 'queued' &&
+        queued.project_id === project &&
+        queued.run_id === input.budget_run_id &&
+        queued.admission?.attempt_id === queue &&
+        queued.admission.ticket_id === row.ticket_id
+      )
+        capacity.cancel(host, queue);
     }
     return { ...dispatch, fence };
   }

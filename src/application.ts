@@ -1380,6 +1380,7 @@ export class Application {
       | { state: 'waiting' | 'needs_attention'; code: string }
       | { state: 'starting'; invocation: ContinuationInvocation },
     launch: (context: ContinuationDispatchContext, invocation: ContinuationInvocation) => undefined,
+    recover?: (context: Omit<ContinuationDispatchContext, 'execution'>) => ContinuationInvocation | null,
   ): Promise<ContinuationDispatch> {
     ensure(
       uuid.test(fence.ticket_id) &&
@@ -1413,6 +1414,33 @@ export class Application {
       if (row.active!.dispatch && row.active!.dispatch.state !== 'waiting') return row.active!.dispatch;
       let identity: string | null = null;
       try {
+        if (recover && row.condition.kind === 'continuation') {
+          const continuation = await tx.get('continuations', row.condition.continuation_id);
+          const run = continuation ? await tx.get('execution_jobs', continuation.run_id) : null;
+          ensure(
+            continuation?.project_id === project.id &&
+              continuation.ticket_id === row.ticket_id &&
+              run?.project_id === project.id &&
+              run.ticket_id === row.ticket_id &&
+              run.continuation_id === continuation.id,
+            'INVALID_REFERENCE',
+            'Continuation admission identity is unavailable.',
+          );
+          const invocation = recover({
+            actor_id: run.actor_id,
+            ticket_id: row.ticket_id,
+            requirements_revision: run.requirements_revision,
+            continuation_id: continuation.id,
+            run_id: run.id,
+          });
+          if (invocation)
+            return save(tx, row, {
+              state: 'needs_attention',
+              code: 'ADMISSION_UNCERTAIN',
+              invocation,
+              identity: null,
+            });
+        }
         const validated = await this.continuationDispatchContext(tx, project, row);
         identity = validated.identity;
         const admission = admit(validated.context);
