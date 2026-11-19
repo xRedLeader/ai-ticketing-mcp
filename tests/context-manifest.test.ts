@@ -150,6 +150,42 @@ async function setup(t: TestContext) {
   };
 }
 
+it('leaves required reviewer artifact bytes explicit and outside retained packets', async (t) => {
+  const f = await setup(t);
+  const args = { project_id: f.project.id, ticket_id: f.ticket.id };
+  const current = (await f.app.execute(f.worker.id, 'ticket_get', args)) as any;
+  await f.app.execute(f.worker.id, 'ticket_submit', {
+    ...args,
+    idempotency_key: randomUUID(),
+    claim_token: f.initialClaim.claim.token,
+    expected_revision: current.ticket.revision,
+    summary: 'Read the exact submitted evidence.',
+    evidence: current.criteria.map(({ id }: { id: string }) => ({
+      criterion_id: id,
+      result: 'pass',
+      summary: 'Submitted verification output.',
+      references: [f.artifactId],
+    })),
+  });
+  const client = await f.connect(undefined, 'reviewer', 'reviewer');
+  const manifest = createContextManifest(client);
+  const packet = await manifest.context(args, 'review');
+  assert.equal(packet.complete, false);
+  assert.deepEqual(
+    packet.pending.map((item) => item.arguments.artifact_id),
+    [f.artifactId],
+  );
+  assert.equal(
+    f.calls.some((call) => call.name === 'artifact_read'),
+    false,
+  );
+  const pages = await manifest.artifact(packet.pending[0]!.arguments);
+  assert.deepEqual(Buffer.concat(pages.map((page) => Buffer.from(page.range.data, 'base64'))), f.bytes);
+  f.calls.length = 0;
+  assert.equal((await manifest.context(args, 'review')).complete, false);
+  assert.equal(f.calls[0]!.arguments.if_none_match, undefined);
+});
+
 it('delivers exact retained context and all required pages after an authorized conditional read', async (t) => {
   const f = await setup(t);
   const client = await f.connect();

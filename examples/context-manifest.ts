@@ -27,6 +27,8 @@ interface Retrieval {
 interface ContextPacket {
   context: Context;
   retrieved: Retrieval[];
+  pending: Context['omitted'];
+  complete: boolean;
 }
 const hash = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 const artifactVersion = ({ range: _range, ...metadata }: ArtifactResult) =>
@@ -103,9 +105,14 @@ export function createContextManifest(client: Client) {
           );
           return previous;
         }
-        const packet: ContextPacket = { context, retrieved: [] };
+        const packet: ContextPacket = { context, retrieved: [], pending: [], complete: true };
         for (const omission of context.omitted) {
           if (omission.required_before !== purpose) continue;
+          if (omission.retrieve_with === 'artifact_read') {
+            packet.pending.push(omission);
+            packet.complete = false;
+            continue;
+          }
           ensure(
             ['checkpoint_get', 'ticket_history'].includes(omission.retrieve_with),
             'INVALID_RESPONSE',
@@ -160,7 +167,8 @@ export function createContextManifest(client: Client) {
             'Requirements or authorization changed while recovering context. Read again.',
           );
         }
-        retained.set(key, serializeSuccessEnvelope(packet));
+        if (packet.complete) retained.set(key, serializeSuccessEnvelope(packet));
+        else retained.delete(key);
         return packet;
       } catch (error) {
         retained.clear();
