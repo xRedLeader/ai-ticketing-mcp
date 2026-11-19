@@ -1,4 +1,5 @@
 import { randomUUID, createHash } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { schemas, readOperations, type Operation, type Input } from './schemas.js';
 import {
   ensure,
@@ -863,40 +864,45 @@ export class Application {
     projectId: string,
     runId: string,
   ): Promise<ExecutionCancellation> {
-    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
-      await tx.lockExecutionController!();
-      const previous = await tx.get('execution_cancellations', runId);
-      if (previous) return previous;
-      const neverStarted = ['queued', 'reserved'].includes(run.status);
-      const cancellation: ExecutionCancellation = {
-        id: runId,
-        project_id: projectId,
-        requested_by: actorId,
-        requested_at: this.timestamp(),
-        process_state: neverStarted
-          ? 'never_started'
-          : ['succeeded', 'failed'].includes(run.status)
-            ? 'exit_confirmed'
-            : 'requested',
-        effects_state: neverStarted ? 'not_started' : 'unresolved',
-        reconciliation_note: null,
-        reconciled_by: null,
-        reconciled_at: null,
-      };
-      await tx.put('execution_cancellations', cancellation);
-      if (neverStarted)
-        ensure(
-          await this.finishExecutionRun(tx, run, actorId, {
-            exit_code: null,
-            signal: null,
-            artifacts: [],
-            error_code: 'CANCELLED_NOT_STARTED',
-          }),
-          'CONFLICT',
-          'Cancellation could not acquire the execution fence.',
-        );
-      return cancellation;
-    });
+    return this.executionTransaction(actorId, projectId, runId, (tx, run) =>
+      this.cancelRun(tx, run, actorId),
+    );
+  }
+  private async cancelRun(tx: Transaction, run: ExecutionJob, actorId: string) {
+    const runId = run.id,
+      projectId = run.project_id;
+    await tx.lockExecutionController!();
+    const previous = await tx.get('execution_cancellations', runId);
+    if (previous) return previous;
+    const neverStarted = ['queued', 'reserved'].includes(run.status);
+    const cancellation: ExecutionCancellation = {
+      id: runId,
+      project_id: projectId,
+      requested_by: actorId,
+      requested_at: this.timestamp(),
+      process_state: neverStarted
+        ? 'never_started'
+        : ['succeeded', 'failed'].includes(run.status)
+          ? 'exit_confirmed'
+          : 'requested',
+      effects_state: neverStarted ? 'not_started' : 'unresolved',
+      reconciliation_note: null,
+      reconciled_by: null,
+      reconciled_at: null,
+    };
+    await tx.put('execution_cancellations', cancellation);
+    if (neverStarted)
+      ensure(
+        await this.finishExecutionRun(tx, run, actorId, {
+          exit_code: null,
+          signal: null,
+          artifacts: [],
+          error_code: 'CANCELLED_NOT_STARTED',
+        }),
+        'CONFLICT',
+        'Cancellation could not acquire the execution fence.',
+      );
+    return cancellation;
   }
   async reconcileExecutionCancellation(actorId: string, projectId: string, runId: string, note: string) {
     ensure(
@@ -1736,14 +1742,22 @@ export class Application {
     return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
       if (
         !(await this.currentExecutionController(tx, controller)) ||
-        (controller && !(await this.executionClaimCurrent(tx, run))) ||
+        (controller && !(await this.executionAuthority(tx, run))) ||
         !['reserved', 'running'].includes(run.status) ||
         run.reservation_token !== token ||
         !run.locked_until ||
         run.locked_until <= this.timestamp()
       )
         return false;
-      return tx.compareExecutionRun!(run, { ...run, locked_until: lockedUntil });
+      if (!(await tx.compareExecutionRun!(run, { ...run, locked_until: lockedUntil }))) return false;
+      if (controller) {
+        const claim = (await tx.get('claims', run.ticket_id))!;
+        await tx.put('claims', {
+          ...claim,
+          expires_at: new Date(this.now().getTime() + LEASE_MS).toISOString(),
+        });
+      }
+      return true;
     });
   }
   async settleExecutionRun(
@@ -1992,11 +2006,30 @@ export class Application {
   private async dispatch(actorId: string, operation: Operation, input: any): Promise<unknown> {
     if (operation === 'ticket_github_refresh') return this.refreshGithub(actorId, input);
     const roles: Role[] = ['contributor', 'admin'];
-    if (['project_update', 'member_set'].includes(operation)) roles.splice(0, roles.length, 'admin');
+    if (['project_update', 'member_set', 'run_cancel'].includes(operation))
+      roles.splice(0, roles.length, 'admin');
     if (operation === 'ticket_review') roles.splice(0, roles.length, 'verifier', 'admin');
     if (operation === 'ticket_note' || operation === 'knowledge_write') roles.push('verifier');
     return this.scoped(actorId, operation, input, roles, async (tx, project, actor) => {
       switch (operation) {
+        case 'run_cancel': {
+          ensure(
+            this.storage.executionRuns && tx.compareExecutionRun && tx.lockExecutionController,
+            'UNSUPPORTED_EXECUTION_RUNS',
+            'Storage does not support durable execution cancellation.',
+          );
+          const run = await tx.get('execution_jobs', input.run_id);
+          ensure(run?.project_id === project.id, 'NOT_FOUND', 'Execution run not found.');
+          const cancellation = await this.cancelRun(tx, run, actor.id);
+          return {
+            run_id: run.id,
+            project_id: project.id,
+            requested_at: cancellation.requested_at,
+            process_state: cancellation.process_state,
+            effects_state: cancellation.effects_state,
+            retrieval: { tool: 'run_get', arguments: { project_id: project.id, run_id: run.id } },
+          };
+        }
         case 'project_create': {
           const data = input as Input<'project_create'>;
           const created: Project = {
@@ -2857,6 +2890,23 @@ export class Application {
     });
   }
   private async read(actorId: string, operation: Operation, input: any): Promise<unknown> {
+    if (operation === 'run_wait') {
+      const deadline = performance.now() + input.timeout_ms;
+      for (;;) {
+        const result = (await this.read(actorId, 'run_get', input)) as {
+          run: { status: string };
+          reconciliation: { state: string };
+        };
+        const remaining = deadline - performance.now();
+        if (
+          ['succeeded', 'failed'].includes(result.run.status) ||
+          result.reconciliation.state === 'unresolved' ||
+          remaining <= 0
+        )
+          return result;
+        await delay(Math.min(250, remaining));
+      }
+    }
     if (operation === 'artifact_read')
       return this.storage.readSnapshot(async (reader) => {
         await this.access(reader, await this.actor(actorId, reader), input.project_id);

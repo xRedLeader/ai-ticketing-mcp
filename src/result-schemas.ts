@@ -366,7 +366,53 @@ const search = z.object({
   coverage: z.object({ documents: z.number(), embedded: z.number(), observed_at: z.string() }),
   index_consistency: z.literal('eventual'),
 });
+const executionCancellation = z.object({
+  id,
+  project_id: id,
+  requested_by: id,
+  requested_at: timestamp,
+  process_state: z.enum(['requested', 'never_started', 'exit_confirmed', 'unresolved']),
+  effects_state: z.enum(['not_started', 'unresolved', 'reconciled']),
+  reconciliation_note: z.string().nullable(),
+  reconciled_by: id.nullable(),
+  reconciled_at: timestamp.nullable(),
+});
+const executionView = z.object({
+  run: z.union([
+    executionJob,
+    executionJob.pick({
+      id: true,
+      project_id: true,
+      status: true,
+      exit_code: true,
+      signal: true,
+      error_code: true,
+      artifacts: true,
+    }),
+  ]),
+  continuation: z.union([continuation, continuation.pick({ id: true, status: true, failure_reason: true })]),
+  checkpoint: note.nullable(),
+  output: z.array(artifactResultSchema),
+  failure_location: retrieval.nullable(),
+  omitted: z.array(omission),
+  stale: z.boolean(),
+  reconciliation: z.object({
+    state: z.enum(['queued', 'running', 'completed', 'unresolved']),
+    next_step: z.enum(['dispatch', 'inspect_launch', 'wait_for_result', 'inspect_side_effects', 'none']),
+    attempt_id: id.nullable(),
+    cancellation: executionCancellation.nullable().optional(),
+  }),
+});
 export const resultSchemas: Record<Operation, z.ZodType> = {
+  run_wait: executionView,
+  run_cancel: z.object({
+    run_id: id,
+    project_id: id,
+    requested_at: timestamp,
+    process_state: executionCancellation.shape.process_state,
+    effects_state: executionCancellation.shape.effects_state,
+    retrieval,
+  }),
   artifact_read: artifactResultSchema,
   run_timeline: z.object({
     observed_at: timestamp,
@@ -539,48 +585,7 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
     status: z.literal('queued'),
     retrieval,
   }),
-  run_get: z.object({
-    run: z.union([
-      executionJob,
-      executionJob.pick({
-        id: true,
-        project_id: true,
-        status: true,
-        exit_code: true,
-        signal: true,
-        error_code: true,
-        artifacts: true,
-      }),
-    ]),
-    continuation: z.union([
-      continuation,
-      continuation.pick({ id: true, status: true, failure_reason: true }),
-    ]),
-    checkpoint: note.nullable(),
-    output: z.array(artifactResultSchema),
-    failure_location: retrieval.nullable(),
-    omitted: z.array(omission),
-    stale: z.boolean(),
-    reconciliation: z.object({
-      state: z.enum(['queued', 'running', 'completed', 'unresolved']),
-      next_step: z.enum(['dispatch', 'inspect_launch', 'wait_for_result', 'inspect_side_effects', 'none']),
-      attempt_id: id.nullable(),
-      cancellation: z
-        .object({
-          id,
-          project_id: id,
-          requested_by: id,
-          requested_at: timestamp,
-          process_state: z.enum(['requested', 'never_started', 'exit_confirmed', 'unresolved']),
-          effects_state: z.enum(['not_started', 'unresolved', 'reconciled']),
-          reconciliation_note: z.string().nullable(),
-          reconciled_by: id.nullable(),
-          reconciled_at: timestamp.nullable(),
-        })
-        .nullable()
-        .optional(),
-    }),
-  }),
+  run_get: executionView,
   ticket_github_refresh: z.object({
     ticket: ticketReceipt,
     github_evidence: githubEvidenceSchema.pick({

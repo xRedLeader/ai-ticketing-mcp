@@ -31,6 +31,24 @@ const expected = {
     'ticket_note',
     'ticket_submit',
   ],
+  executor: [
+    'project_list',
+    'project_get',
+    'ticket_list',
+    'ticket_context',
+    'ticket_get',
+    'ticket_history',
+    'checkpoint_get',
+    'work_claim',
+    'work_release',
+    'ticket_note',
+    'ticket_submit',
+    'run_submit',
+    'run_wait',
+    'run_get',
+    'run_cancel',
+    'artifact_read',
+  ],
   planner: [
     ...shared,
     'tickets_create',
@@ -46,6 +64,7 @@ const expected = {
 };
 const prompts = {
   worker: ['execution', 'handoff'],
+  executor: ['execution', 'handoff'],
   planner: ['planning'],
   reviewer: ['verification'],
   full: ['planning', 'execution', 'handoff', 'verification'],
@@ -102,6 +121,7 @@ it('serves profile-specific HTTP catalogs and prompts without changing scope aut
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const catalogs = new Map<string, Awaited<ReturnType<Client['listTools']>>['tools']>();
   try {
     for (const profile of Object.keys(expected) as McpProfile[]) {
       const client = new Client({ name: `profile-${profile}`, version: '1.0.0' });
@@ -109,8 +129,9 @@ it('serves profile-specific HTTP catalogs and prompts without changing scope aut
         const suffix = profile === 'worker' ? '' : `?profile=${profile}`;
         await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp${suffix}`)));
         const { tools } = await client.listTools();
+        catalogs.set(profile, tools);
         assert.deepEqual(tools.map((tool) => tool.name).sort(), expected[profile].sort());
-        if (profile === 'worker')
+        if (profile === 'worker' || profile === 'executor')
           assert.ok(
             countReferenceTokens(
               JSON.stringify(
@@ -124,6 +145,15 @@ it('serves profile-specific HTTP catalogs and prompts without changing scope aut
           prompts[profile].sort(),
         );
         if (profile !== 'full') assert.ok(!client.getInstructions()?.includes('work_next'));
+        if (profile === 'executor') {
+          const guide = await client.readResource({ uri: 'ticketing://guide' });
+          assert.ok(!String((guide.contents[0] as { text: string }).text).includes('changes_since'));
+          for (const name of ['execution', 'handoff']) {
+            const prompt = await client.getPrompt({ name });
+            assert.ok(!JSON.stringify(prompt).includes('work_heartbeat'));
+            assert.ok(!JSON.stringify(prompt).includes('ticket_checkpoint'));
+          }
+        }
         const result = await client.callTool({ name: 'project_list', arguments: {} });
         assert.deepEqual(result.structuredContent, { ok: true, data: { projects: [] }, error: null });
         assert.equal(
@@ -169,6 +199,12 @@ it('serves profile-specific HTTP catalogs and prompts without changing scope aut
         await client.close();
       }
     }
+    for (const profile of ['worker', 'executor'])
+      for (const tool of catalogs.get(profile)!)
+        assert.deepEqual(
+          tool.inputSchema,
+          catalogs.get('full')!.find(({ name }) => name === tool.name)!.inputSchema,
+        );
     for (const query of ['profile=', 'profile=unknown', 'profile=worker&profile=worker']) {
       const response = await fetch(`${base}/mcp?${query}`, {
         method: 'POST',

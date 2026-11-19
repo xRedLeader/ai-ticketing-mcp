@@ -132,7 +132,7 @@ it('serves local stdio clients without writing non-protocol data to stdout', asy
     Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
   );
   try {
-    for (const profile of [undefined, 'worker', 'planner', 'reviewer', 'full'] as const) {
+    for (const profile of [undefined, 'worker', 'executor', 'planner', 'reviewer', 'full'] as const) {
       const client = new Client({ name: 'stdio-integration', version: '1.0.0' });
       const transport = new StdioClientTransport({
         command: process.execPath,

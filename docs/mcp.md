@@ -8,20 +8,25 @@ Success JSON uses stable recursive object-key ordering and preserves array order
 
 ## Capability profiles
 
-The default profile is `worker`. Select `stdio --profile worker|planner|reviewer|full` or connect to `/mcp?profile=planner`. HTTP profiles are stateless; empty, unknown, or repeated `profile` parameters are rejected. OAuth tokens still target the unqueried `/mcp` resource.
+The default profile is `worker`. Select `stdio --profile worker|executor|planner|reviewer|full` or connect to `/mcp?profile=executor`. HTTP profiles are stateless; empty, unknown, or repeated `profile` parameters are rejected. OAuth tokens still target the unqueried `/mcp` resource.
 
-Every profile includes `project_list`, `project_get`, `ticket_list`, `ticket_context`, `ticket_get`, `ticket_history`, `search`, `knowledge_get`, `checkpoint_get`, and `changes_since`.
+Every profile includes `project_list`, `project_get`, `ticket_list`, `ticket_context`, `ticket_get`, `ticket_history`, and `checkpoint_get`. Worker, planner, reviewer and full also include `search`, `knowledge_get`, and `changes_since`.
 
 | Profile               | Additional tools                                                                                                                 | Prompts            |
 | --------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
 | `worker` (16 tools)   | `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`, `ticket_note`, `ticket_submit`                              | execution, handoff |
+| `executor` (16 tools) | `work_claim`, `work_release`, `ticket_note`, `ticket_submit`, `run_submit`, `run_wait`, `run_get`, `run_cancel`, `artifact_read` | execution, handoff |
 | `planner` (17 tools)  | `tickets_create`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_note`, `knowledge_write`, `ticket_github_refresh` | planning           |
 | `reviewer` (13 tools) | `ticket_review`, `ticket_note`, `ticket_github_refresh`                                                                          | verification       |
-| `full` (31 tools)     | All tools below, including project administration, `work_next`, `run_submit`, `run_get`, `artifact_read`, and `run_timeline`     | all four           |
+| `full` (33 tools)     | All tools below, including project administration, `work_next`, and `run_timeline`                                               | all four           |
 
 Profiles are not an access-control boundary. They select tool exposure; every operation retains its OAuth scope and project-role checks. Resources remain independently authorized and available in every profile. Guides and prompts follow the selected profile; the tool surface works without either.
 
-Use the [execution companion](execution-companion.md) to configure registered scripts, submit a durable run with `run_submit`, and retrieve its checkpoint, continuation, outcome, and reconciliation state/next safe step with `run_get`.
+Use the [execution companion](execution-companion.md) to configure registered scripts. The compact executor catalog preserves complete input schemas. Claim work and retrieve required omissions before `run_submit`, which atomically saves a checkpoint with the registered run. Persist the returned run ID across disconnects. The separately running trusted companion renews the admitted run's exact live claim while current requirements, permissions, assignment and blockers still allow execution. It never revives expired ownership. After completion, read the current ticket revision and submit criterion evidence; if ownership expired, reclaim explicitly before continuing.
+
+`run_wait` is a read: `timeout_ms` defaults to 1,000 and is bounded to 0–30,000; `max_tokens` defaults to 2,048. It returns the same bounded result as `run_get` when the run finishes, needs reconciliation, or the wait expires. Each snapshot rechecks project access, no transaction remains open while sleeping, and waiting never executes work or renews ownership. Follow returned checkpoint/history/run/artifact retrieval arguments before resuming or accepting evidence.
+
+`run_cancel` requires write scope and existing project-admin authority. It reuses trusted operator cancellation and returns a compact immutable receipt with a `run_get` reference. Use the same `idempotency_key` only for identical retries; changed inputs conflict, and every retry rechecks current authority. Cancellation requests neither prove process exit nor undo effects; inspect `run_get.reconciliation` and exact `artifact_read` evidence. External-effect reconciliation remains a trusted operator action.
 
 ## Tools
 
@@ -30,6 +35,7 @@ Use the [execution companion](execution-companion.md) to configure registered sc
 | Projects                   | `project_list`, `project_get`, `project_create`, `project_update`, `member_set`                                      |
 | Tickets                    | `tickets_create`, `ticket_list`, `ticket_get`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_history` |
 | Coordination               | `work_next`, `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`                                     |
+| Registered execution       | `run_submit`, `run_wait`, `run_get`, `run_cancel`, `artifact_read`, `run_timeline`                                   |
 | Collaboration and evidence | `ticket_note`, `ticket_submit`, `ticket_review`                                                                      |
 | Retrieval                  | `ticket_context`, `search`, `knowledge_get`, `knowledge_write`, `checkpoint_get`                                     |
 | Changes                    | `changes_since`                                                                                                      |

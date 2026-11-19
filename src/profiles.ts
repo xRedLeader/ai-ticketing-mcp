@@ -1,7 +1,7 @@
 import { ensure } from './contracts.js';
 import { schemas, type Operation } from './schemas.js';
 
-export type McpProfile = 'worker' | 'planner' | 'reviewer' | 'full';
+export type McpProfile = 'worker' | 'executor' | 'planner' | 'reviewer' | 'full';
 
 const shared = [
   'project_list',
@@ -26,6 +26,24 @@ export const profileOperations: Readonly<Record<McpProfile, readonly Operation[]
     'ticket_note',
     'ticket_submit',
   ] as const),
+  executor: Object.freeze([
+    'project_list',
+    'project_get',
+    'ticket_list',
+    'ticket_context',
+    'ticket_get',
+    'ticket_history',
+    'checkpoint_get',
+    'work_claim',
+    'work_release',
+    'ticket_note',
+    'ticket_submit',
+    'run_submit',
+    'run_wait',
+    'run_get',
+    'run_cancel',
+    'artifact_read',
+  ] as const),
   planner: Object.freeze([
     ...shared,
     'tickets_create',
@@ -45,7 +63,7 @@ export function parseMcpProfile(value: string | undefined): McpProfile {
   ensure(
     Object.hasOwn(profileOperations, value),
     'INVALID_INPUT',
-    'Profile must be worker, planner, reviewer, or full.',
+    'Profile must be worker, executor, planner, reviewer, or full.',
   );
   return value as McpProfile;
 }
