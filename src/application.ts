@@ -984,6 +984,11 @@ export class Application {
         'ARTIFACT_PINNED',
         'Stored work, evidence, receipts or memory still references this execution.',
       );
+      ensure(
+        process.platform === 'linux',
+        'UNSUPPORTED_PHYSICAL_CLEANUP',
+        'Physical cleanup requires Linux directory handles; no retirement decision was committed.',
+      );
       const proof = artifacts.inspectRetirement(
         artifactId,
         state.authority,
@@ -1021,6 +1026,16 @@ export class Application {
         'ARTIFACT_PINNED',
         'Execution acquired a reference after retirement; physical deletion is blocked.',
       );
+      if (process.platform !== 'linux')
+        return {
+          artifact_id: artifactId,
+          status: 'retired_pending' as const,
+          removed: false,
+          reason: 'unsupported_physical_cleanup',
+          expires_at: decision.expires_at,
+          size_bytes: decision.size_bytes,
+          sha256: decision.sha256,
+        };
       const removed = artifacts.unlinkRetired(
         decision,
         state.authority,

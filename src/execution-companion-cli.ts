@@ -152,6 +152,9 @@ main().catch((error: unknown) => {
     JSON.stringify({
       event: 'execution_companion_error',
       code: error instanceof DomainError ? error.code : 'ERROR',
+      ...(error instanceof DomainError && error.code === 'ARTIFACT_STAGING_CONFLICT'
+        ? { message: error.message, details: error.details }
+        : {}),
     }) + '\n',
   );
   process.exitCode = 1;

@@ -1,7 +1,9 @@
 import { it } from 'node:test';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { mkdtemp, mkdir, readFile, writeFile, rm, link, rename } from 'node:fs/promises';
@@ -122,21 +124,28 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
     title: string,
     test: (f: Awaited<ReturnType<typeof setup>>) => Promise<void>,
     exitCode = 0,
+    linuxOnly = false,
   ) =>
-    it(`${name} artifact retention: ${title}`, async () => {
-      const f = await setup(exitCode);
-      try {
-        await test(f);
-      } finally {
-        await f.dispose?.();
-        if (!f.dispose) {
-          await f.storage.close();
-          await f.search.close();
+    it(
+      `${name} artifact retention: ${title}`,
+      { skip: linuxOnly && process.platform !== 'linux' },
+      async () => {
+        const f = await setup(exitCode);
+        try {
+          await test(f);
+        } finally {
+          await f.dispose?.();
+          if (!f.dispose) {
+            await f.storage.close();
+            await f.search.close();
+          }
+          assert.ok(f.directory.startsWith(join(tmpdir(), 'artifact-retention-')));
+          await rm(f.directory, { recursive: true, force: true });
         }
-        assert.ok(f.directory.startsWith(join(tmpdir(), 'artifact-retention-')));
-        await rm(f.directory, { recursive: true, force: true });
-      }
-    });
+      },
+    );
+  const physicalCheck = (title: string, test: (f: Awaited<ReturnType<typeof setup>>) => Promise<void>) =>
+    check(title, test, 0, true);
   const proxy = (
     storage: StorageAdapter,
     intercept: (tx: Transaction, count: number) => Transaction | never,
@@ -152,7 +161,7 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
       },
     });
   };
-  check(
+  physicalCheck(
     'deletes only expired unpinned logs, preserves audit/receipts and exposes explicit expired metadata',
     async (f) => {
       await f.finish();
@@ -235,58 +244,61 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
     await assert.rejects(f.retire(), hasCode('ARTIFACT_PINNED'));
     assert.equal((await f.read()).status, 'available');
   });
-  check('serializes cross-project pins and reads with retirement, leaving heartbeat unblocked', async (f) => {
-    await f.finish();
-    const other = await fixture({ storage: f.storage, search: f.search }, 'self');
-    const otherTicket = await other.ticket();
-    const otherClaim = await other.claim(otherTicket.id);
-    let release!: () => void, entered!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const ready = new Promise<void>((resolve) => {
-      entered = resolve;
-    });
-    const wrapped = proxy(
-      f.storage,
-      (tx, count) =>
-        new Proxy(tx, {
-          get(target, property) {
-            if (property === 'artifactPinned' && count === 1)
-              return async (query: Parameters<NonNullable<Transaction['artifactPinned']>>[0]) => {
-                entered();
-                await gate;
-                return target.artifactPinned!(query);
-              };
-            const value = Reflect.get(target, property);
-            return typeof value === 'function' ? value.bind(target) : value;
-          },
-        }),
-    );
-    const retiring = f.retire(f.make(wrapped));
-    await ready;
-    const heartbeat = other.call(other.worker.id, 'work_heartbeat', {
-      ticket_id: otherTicket.id,
-      claim_token: otherClaim.claim.token,
-    });
-    if (name === 'PostgreSQL') await heartbeat;
-    let readFinished = false;
-    const reading = f.read().then((value) => {
-      readFinished = true;
-      return value;
-    });
-    const writing = assert.rejects(
-      other.call(other.worker.id, 'ticket_note', { ticket_id: otherTicket.id, body: f.refs[0] }),
-      hasCode('ARTIFACT_RETIRED'),
-    );
-    await delay(20);
-    assert.equal(readFinished, false);
-    release();
-    await retiring;
-    await heartbeat;
-    await writing;
-    assert.equal((await reading).status, 'expired');
-  });
+  physicalCheck(
+    'serializes cross-project pins and reads with retirement, leaving heartbeat unblocked',
+    async (f) => {
+      await f.finish();
+      const other = await fixture({ storage: f.storage, search: f.search }, 'self');
+      const otherTicket = await other.ticket();
+      const otherClaim = await other.claim(otherTicket.id);
+      let release!: () => void, entered!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const ready = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const wrapped = proxy(
+        f.storage,
+        (tx, count) =>
+          new Proxy(tx, {
+            get(target, property) {
+              if (property === 'artifactPinned' && count === 1)
+                return async (query: Parameters<NonNullable<Transaction['artifactPinned']>>[0]) => {
+                  entered();
+                  await gate;
+                  return target.artifactPinned!(query);
+                };
+              const value = Reflect.get(target, property);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          }),
+      );
+      const retiring = f.retire(f.make(wrapped));
+      await ready;
+      const heartbeat = other.call(other.worker.id, 'work_heartbeat', {
+        ticket_id: otherTicket.id,
+        claim_token: otherClaim.claim.token,
+      });
+      if (name === 'PostgreSQL') await heartbeat;
+      let readFinished = false;
+      const reading = f.read().then((value) => {
+        readFinished = true;
+        return value;
+      });
+      const writing = assert.rejects(
+        other.call(other.worker.id, 'ticket_note', { ticket_id: otherTicket.id, body: f.refs[0] }),
+        hasCode('ARTIFACT_RETIRED'),
+      );
+      await delay(20);
+      assert.equal(readFinished, false);
+      release();
+      await retiring;
+      await heartbeat;
+      await writing;
+      assert.equal((await reading).status, 'expired');
+    },
+  );
   check('protects exact citations from another project', async (f) => {
     await f.finish();
     const other = await fixture({ storage: f.storage, search: f.search }, 'self');
@@ -368,7 +380,7 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
     await assert.rejects(f.retire(), hasCode('ARTIFACT_PINNED'));
     assert.ok(existsSync(join(f.path, 'stdout.log')));
   });
-  check('never unlinks a file if the durable decision fails to commit', async (f) => {
+  physicalCheck('never unlinks a file if the durable decision fails to commit', async (f) => {
     await f.finish();
     const wrapped = proxy(
       f.storage,
@@ -390,7 +402,7 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
     assert.equal(await f.storage.get('artifact_retirements', f.refs[0]!), null);
     assert.ok(existsSync(join(f.path, 'stdout.log')));
   });
-  check(
+  physicalCheck(
     'resumes a committed decision after process restart and rejects new pins without an artifact root',
     async (f) => {
       await f.finish();
@@ -433,7 +445,7 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
       );
     },
   );
-  check('recovers unlink-before-audit-commit failure without deleting another file', async (f) => {
+  physicalCheck('recovers unlink-before-audit-commit failure without deleting another file', async (f) => {
     await f.finish();
     const wrapped = proxy(f.storage, (tx, count) =>
       count !== 2
@@ -460,7 +472,7 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
       1,
     );
   });
-  check('rejects changed ownership, hard links, protected results and arbitrary paths', async (f) => {
+  physicalCheck('rejects changed ownership, hard links, protected results and arbitrary paths', async (f) => {
     await f.finish();
     for (const id of [
       f.refs[2]!,
@@ -489,7 +501,7 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
     assert.deepEqual(await readFile(outside), f.bytes);
     assert.ok(existsSync(join(f.path, 'stdout.log')));
   });
-  check(
+  physicalCheck(
     'requires current administrator authority on every restart/retry and trusted expiry proof',
     async (f) => {
       await f.finish();
@@ -514,7 +526,164 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
       assert.ok(existsSync(join(f.path, 'stdout.log')));
     },
   );
-  check('runs only through an explicit trusted operator CLI invocation', async (f) => {
+  check('refuses unsupported physical cleanup before creating any retirement decision', async (f) => {
+    if (process.platform === 'linux') return;
+    await f.finish();
+    await assert.rejects(f.retire(), hasCode('UNSUPPORTED_PHYSICAL_CLEANUP'));
+    assert.equal(await f.storage.get('artifact_retirements', f.refs[0]!), null);
+    assert.ok(existsSync(join(f.path, 'stdout.log')));
+    await assert.rejects(
+      promisify(execFile)(
+        process.execPath,
+        [
+          '--import',
+          'tsx',
+          'src/execution-companion-cli.ts',
+          '--actor',
+          f.admin.id,
+          '--project',
+          f.project.id,
+          '--artifacts',
+          f.directory,
+          '--retire',
+          f.refs[0]!,
+        ],
+        {
+          cwd: process.cwd(),
+          windowsHide: true,
+          timeout: 20000,
+          env: { ...process.env, ...f.runtimeEnv, EXECUTION_ARTIFACT_TTL_MS: '1' },
+        },
+      ),
+      (error: any) => /UNSUPPORTED_PHYSICAL_CLEANUP/.test(error.stderr),
+    );
+    assert.equal(await f.storage.get('artifact_retirements', f.refs[0]!), null);
+    await f.storage.transaction(f.project.id, async (tx) =>
+      tx.put('artifact_retirements', {
+        id: f.refs[0]!,
+        project_id: f.project.id,
+        run_id: f.run.id,
+        attempt_id: f.attempt.id,
+        ticket_id: f.ticket.id,
+        checkpoint_id: f.run.checkpoint_id,
+        actor_id: f.admin.id,
+        requested_at: f.clock.now.toISOString(),
+        expires_at: new Date(f.journal.finished_at + 1000).toISOString(),
+        size_bytes: f.bytes.length,
+        sha256: createHash('sha256').update(f.bytes).digest('hex'),
+        root_identity: 'prior-linux-root',
+        file_identity: 'prior-linux-file',
+      }),
+    );
+    const result = await f.retire();
+    assert.equal(result.status, 'retired_pending');
+    assert.equal(result.removed, false);
+    assert.equal((await f.read()).status, 'expired');
+  });
+  physicalCheck('anchors the last unlink to its opened parent despite a directory replacement', async (f) => {
+    await f.finish();
+    const outside = await mkdtemp(join(tmpdir(), 'retention-outside-'));
+    const sentinel = join(outside, 'capture');
+    await writeFile(sentinel, 'unrelated outside bytes');
+    const original = fs.unlinkSync,
+      saved = f.path + '.original';
+    let swapped = false;
+    fs.unlinkSync = ((path: fs.PathLike) => {
+      if (String(path).startsWith('/proc/self/fd/') && String(path).endsWith('/capture') && !swapped) {
+        fs.renameSync(f.path, saved);
+        fs.symlinkSync(outside, f.path);
+        swapped = true;
+      }
+      return original(path);
+    }) as typeof fs.unlinkSync;
+    syncBuiltinESMExports();
+    try {
+      assert.equal((await f.retire()).removed, true);
+      assert.equal(await readFile(sentinel, 'utf8'), 'unrelated outside bytes');
+    } finally {
+      fs.unlinkSync = original;
+      syncBuiltinESMExports();
+      if (swapped) {
+        original(f.path);
+        fs.renameSync(saved, f.path);
+      }
+      assert.ok(outside.startsWith(join(tmpdir(), 'retention-outside-')));
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+  physicalCheck('restores an unexpected source replacement without deleting its bytes', async (f) => {
+    await f.finish();
+    const original = fs.renameSync;
+    let swapped = false;
+    fs.renameSync = ((source: fs.PathLike, target: fs.PathLike) => {
+      if (
+        String(source).startsWith('/proc/self/fd/') &&
+        String(source).endsWith('/stdout.log') &&
+        String(target).endsWith('/capture') &&
+        !swapped
+      ) {
+        original(source, join(f.path, 'owned-original.log'));
+        fs.writeFileSync(source, 'unrelated replacement');
+        swapped = true;
+      }
+      return original(source, target);
+    }) as typeof fs.renameSync;
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(f.retire(), hasCode('ARTIFACT_STAGING_CONFLICT'));
+      assert.equal(await readFile(join(f.path, 'stdout.log'), 'utf8'), 'unrelated replacement');
+      assert.equal(
+        await readFile(join(f.path, '.retired-stdout', 'capture'), 'utf8'),
+        'unrelated replacement',
+      );
+      assert.deepEqual(await readFile(join(f.path, 'owned-original.log')), f.bytes);
+    } finally {
+      fs.renameSync = original;
+      syncBuiltinESMExports();
+    }
+  });
+  physicalCheck('resumes a durable staged capture after a crash before unlink', async (f) => {
+    await f.finish();
+    const original = fs.unlinkSync;
+    fs.unlinkSync = ((path: fs.PathLike) => {
+      if (String(path).endsWith('/capture')) throw new Error('staged crash');
+      return original(path);
+    }) as typeof fs.unlinkSync;
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(f.retire(), /staged crash/);
+    } finally {
+      fs.unlinkSync = original;
+      syncBuiltinESMExports();
+    }
+    assert.ok(existsSync(join(f.path, '.retired-stdout', 'capture')));
+    const reopened = await f.reopen();
+    assert.equal((await f.retire(f.make(reopened.storage, reopened.search))).removed, true);
+  });
+  physicalCheck(
+    'fails closed without blocking on substituted FIFO files or missing staging markers',
+    async (f) => {
+      await f.finish();
+      await rename(join(f.path, 'stdout.log'), join(f.path, 'fifo-backup.log'));
+      execFileSync('mkfifo', [join(f.path, 'stdout.log')]);
+      await assert.rejects(f.retire(), hasCode('INVALID_ARTIFACT'));
+      await rm(join(f.path, 'stdout.log'));
+      await rename(join(f.path, 'fifo-backup.log'), join(f.path, 'stdout.log'));
+      const wrapped = f.make(
+        proxy(f.storage, (tx, count) => {
+          if (count === 2) throw new Error('before staging');
+          return tx;
+        }),
+      );
+      await assert.rejects(f.retire(wrapped), /before staging/);
+      await mkdir(join(f.path, '.retired-stdout'), { mode: 0o700 });
+      await assert.rejects(f.retire(), hasCode('ARTIFACT_STAGING_CONFLICT'));
+      execFileSync('mkfifo', [join(f.path, '.retired-stdout', 'decision.json')]);
+      await assert.rejects(f.retire(), hasCode('ARTIFACT_STAGING_CONFLICT'));
+      assert.ok(existsSync(join(f.path, 'stdout.log')));
+    },
+  );
+  physicalCheck('runs only through an explicit trusted operator CLI invocation', async (f) => {
     await f.finish();
     const result = await promisify(execFile)(
       process.execPath,
