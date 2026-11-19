@@ -17,6 +17,7 @@ async function setup(t: TestContext) {
   const directory = await mkdtemp(join(tmpdir(), 'ticketing-manifest-'));
   const adapters = createSqliteAdapters(join(directory, 'tickets.sqlite'));
   const clients: Client[] = [];
+  const sessions = new WeakMap<Client, { actor: string; profile: string }>();
   t.after(async () => {
     for (const client of clients) await client.close();
     server.closeAllConnections();
@@ -110,10 +111,20 @@ async function setup(t: TestContext) {
         return response;
       };
     }
+    const session = { actor, profile };
+    sessions.set(client, session);
     await client.connect(
       new StreamableHTTPClientTransport(
         new URL(`http://127.0.0.1:${(server.address() as any).port}/mcp?profile=${profile}`),
-        { requestInit: { headers: { Authorization: `Bearer ${actor}` } } },
+        {
+          fetch: async (url, init) => {
+            const target = new URL(url instanceof Request ? url.url : String(url));
+            target.searchParams.set('profile', session.profile);
+            const headers = new Headers(init?.headers);
+            headers.set('Authorization', `Bearer ${session.actor}`);
+            return fetch(target, { ...init, headers });
+          },
+        },
       ),
     );
     return client;
@@ -128,6 +139,7 @@ async function setup(t: TestContext) {
     artifactId,
     calls,
     connect,
+    sessions,
     input: { project_id: f.project.id, ticket_id: ticket.id, max_tokens: 1200 },
     artifactInput: {
       project_id: f.project.id,
@@ -253,6 +265,8 @@ it('retains exact artifact bytes, counts budgeted pages, and refetches missing o
   const f = await setup(t);
   const manifest = createContextManifest(await f.connect());
   const first = await manifest.artifact(f.artifactInput);
+  for (const call of f.calls)
+    assert.ok(countReferenceTokens(serializeSuccessEnvelope(call.data)) <= f.artifactInput.max_tokens);
   assert.ok(first.length > 1, 'A small response budget requires actual byte-range calls.');
   assert.deepEqual(Buffer.concat(first.map((page) => Buffer.from(page.range.data, 'base64'))), f.bytes);
   assert.equal(f.calls.length, first.length);
@@ -314,17 +328,72 @@ it('retains exact artifact bytes, counts budgeted pages, and refetches missing o
   assert.equal(f.calls[back]!.arguments.length, f.bytes.length);
 });
 
+it('refetches for actual same-transport bearer, profile and role changes and rejects mixed-actor pages', async (t) => {
+  const f = await setup(t);
+  const client = await f.connect();
+  const session = f.sessions.get(client)!;
+  const transport = client.transport;
+  const instructions = client.getInstructions();
+  const manifest = createContextManifest(client);
+  let pages = await manifest.artifact(f.artifactInput);
+  const reread = async () => {
+    const previous = pages;
+    const start = f.calls.length;
+    pages = await manifest.artifact(f.artifactInput);
+    assert.equal(client.transport, transport);
+    assert.equal(client.getInstructions(), instructions);
+    assert.deepEqual(
+      f.calls.slice(start, start + 2).map((call) => call.arguments.length),
+      [0, f.bytes.length],
+    );
+    assert.equal(f.calls.length - start, pages.length + 1, 'Every full reread is counted.');
+    assert.notEqual(pages[0]!.authorization_binding, previous[0]!.authorization_binding);
+    assert.deepEqual(Buffer.concat(pages.map((page) => Buffer.from(page.range.data, 'base64'))), f.bytes);
+  };
+  session.actor = 'reviewer';
+  await reread();
+  session.profile = 'full';
+  await reread();
+  const member = (await f.storage.get('members', `${f.project.id}:${f.reviewer.id}`))!;
+  await f.storage.transaction(f.project.id, (tx) => tx.put('members', { ...member, role: 'reader' }));
+  await reread();
+
+  manifest.forget();
+  session.actor = 'worker';
+  const callTool = client.callTool.bind(client);
+  let switched = false;
+  client.callTool = async (request, ...rest) => {
+    const response = await callTool(request, ...rest);
+    if (!switched && request.name === 'artifact_read') {
+      switched = true;
+      session.actor = 'reviewer';
+    }
+    return response;
+  };
+  await assert.rejects(manifest.artifact(f.artifactInput), hasCode('INVALID_RESPONSE'));
+  client.callTool = callTool;
+  const start = f.calls.length;
+  pages = await manifest.artifact(f.artifactInput);
+  assert.equal(
+    f.calls[start]!.arguments.length,
+    f.bytes.length,
+    'Mixed-actor pages cannot leave a cache hit.',
+  );
+  assert.deepEqual(Buffer.concat(pages.map((page) => Buffer.from(page.range.data, 'base64'))), f.bytes);
+});
+
 it('rejects mismatched checkpoint revisions and corrupt artifact pages without retaining partial proof', async (t) => {
   const f = await setup(t);
   const client = await f.connect();
   const callTool = client.callTool.bind(client);
-  let corrupt: 'checkpoint' | 'artifact' | undefined = 'checkpoint';
+  let corrupt: 'checkpoint' | 'artifact' | 'binding' | undefined = 'checkpoint';
   client.callTool = async (request, ...rest) => {
     const response = await callTool(request, ...rest);
     const data = (response.structuredContent as any)?.data;
     if (corrupt === 'checkpoint' && request.name === 'checkpoint_get') data.ticket_revision++;
     if (corrupt === 'artifact' && request.name === 'artifact_read' && request.arguments?.length)
       data.range.data = Buffer.from('corrupt bytes').toString('base64');
+    if (corrupt === 'binding' && request.name === 'artifact_read') delete data.authorization_binding;
     return response;
   };
   const manifest = createContextManifest(client);
@@ -334,6 +403,8 @@ it('rejects mismatched checkpoint revisions and corrupt artifact pages without r
   await manifest.context(f.input, 'execution');
   assert.equal(f.calls[retry]!.arguments.if_none_match, undefined);
   corrupt = 'artifact';
+  await assert.rejects(manifest.artifact(f.artifactInput), hasCode('INVALID_RESPONSE'));
+  corrupt = 'binding';
   await assert.rejects(manifest.artifact(f.artifactInput), hasCode('INVALID_RESPONSE'));
   corrupt = undefined;
   const full = f.calls.length;

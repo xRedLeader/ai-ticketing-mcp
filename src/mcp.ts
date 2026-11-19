@@ -59,12 +59,7 @@ export function createMcpServer(app: Application, principal: Principal, profile:
               'INSUFFICIENT_SCOPE',
               'ticketing:write scope is required.',
             );
-          const result = await app.execute(
-            principal.actorId,
-            operation,
-            input,
-            profile === 'reviewer' ? 'reviewer' : undefined,
-          );
+          const result = await app.execute(principal.actorId, operation, input, profile);
           const text = serializeSuccessEnvelope(result);
           app.recordReferenceTokens?.('result', text);
           return {

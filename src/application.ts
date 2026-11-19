@@ -1,6 +1,7 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { schemas, readOperations, type Operation, type Input } from './schemas.js';
+import type { McpProfile } from './profiles.js';
 import {
   ensure,
   DomainError,
@@ -2480,7 +2481,12 @@ export class Application {
       'This project requires a registered human reviewer.',
     );
   }
-  async execute(actorId: string, operation: Operation, raw: unknown, viewer?: 'reviewer'): Promise<unknown> {
+  async execute(
+    actorId: string,
+    operation: Operation,
+    raw: unknown,
+    viewerProfile?: McpProfile,
+  ): Promise<unknown> {
     const started = performance.now();
     this.metrics.requests++;
     try {
@@ -2491,7 +2497,7 @@ export class Application {
           issues: result.error.issues,
         });
       if (readOperations.has(operation))
-        return this.result(operation, await this.read(actorId, operation, result.data, viewer));
+        return this.result(operation, await this.read(actorId, operation, result.data, viewerProfile));
       return await this.dispatch(actorId, operation, result.data);
     } catch (error) {
       this.metrics.errors++;
@@ -3540,12 +3546,12 @@ export class Application {
     actorId: string,
     operation: Operation,
     input: any,
-    viewer?: 'reviewer',
+    viewerProfile?: McpProfile,
   ): Promise<unknown> {
     if (operation === 'run_wait') {
       const deadline = performance.now() + input.timeout_ms;
       for (;;) {
-        const result = (await this.read(actorId, 'run_get', input)) as {
+        const result = (await this.read(actorId, 'run_get', input, viewerProfile)) as {
           run: { status: string };
           reconciliation: { state: string };
         };
@@ -3585,8 +3591,9 @@ export class Application {
       });
     if (operation === 'artifact_read')
       return this.artifactSnapshot(input.project_id, async (reader) => {
-        await this.access(reader, await this.actor(actorId, reader), input.project_id);
-        if (viewer === 'reviewer') {
+        const actor = await this.actor(actorId, reader);
+        await this.access(reader, actor, input.project_id);
+        if (viewerProfile === 'reviewer') {
           const identity = artifactIdentity.exec(input.artifact_id);
           const run = identity && (await reader.get('execution_jobs', identity[1]!));
           ensure(run && run.project_id === input.project_id, 'NOT_FOUND', 'Execution run not found.');
@@ -3609,6 +3616,7 @@ export class Application {
             'Reviewer artifact reads require an exact reference in the current submission.',
           );
         }
+        const member = await reader.get('members', `${input.project_id}:${actor.id}`);
         const artifact = await this.readArtifact(
           reader,
           input.project_id,
@@ -3616,6 +3624,12 @@ export class Application {
           input.offset,
           input.length,
         );
+        artifact.authorization_binding = digest({
+          actor: { id: actor.id, kind: actor.kind, system_admin: actor.system_admin },
+          project_id: input.project_id,
+          role: member?.role ?? null,
+          profile: viewerProfile ?? null,
+        });
         return packArtifactRange(artifact, input.max_tokens, (value) => this.responseTokens(value));
       });
     if (operation === 'run_timeline') return this.executionTimeline(actorId, input);
@@ -3739,7 +3753,13 @@ export class Application {
       const snapshot = await this.storage.readSnapshot(async (reader) => {
         const actor = await this.actor(actorId, reader);
         const project = await this.access(reader, actor, input.project_id);
-        return this.collectContext(reader, actor, project, input, viewer);
+        return this.collectContext(
+          reader,
+          actor,
+          project,
+          input,
+          viewerProfile === 'reviewer' ? 'reviewer' : undefined,
+        );
       });
       return this.packContext(snapshot, input);
     }

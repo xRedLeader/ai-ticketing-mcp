@@ -26,6 +26,10 @@ const hash = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('h
 const count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 export const artifactResultSchema = z.object({
   artifact_id: z.string(),
+  authorization_binding: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
   status: z.enum(['available', 'missing', 'expired', 'not_configured']),
   size_bytes: count.nullable(),
   total_bytes: count.nullable(),

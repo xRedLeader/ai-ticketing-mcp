@@ -153,6 +153,11 @@ export function createContextManifest(client: Client) {
         for (;;) {
           const page = artifactResultSchema.parse(await call('artifact_read', { ...args, offset, length }));
           connected();
+          ensure(
+            /^[a-f0-9]{64}$/.test(page.authorization_binding ?? ''),
+            'INVALID_RESPONSE',
+            'Artifact pages require a server authorization binding.',
+          );
           pages.push(page);
           if (page.status !== 'available') return [page];
           const bytes = Buffer.from(page.range.data, 'base64');
