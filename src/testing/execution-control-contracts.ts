@@ -323,8 +323,8 @@ export function registerExecutionControlContractTests(
           },
           note: 'External receipt confirms exit and records the partial effect. No rollback.',
         };
-        const takeOver = f.capacity.takeOver;
-        f.capacity.takeOver = () => {
+        const reconcile = f.capacity.reconcile;
+        f.capacity.reconcile = () => {
           throw new Error('Injected crash after terminal commit');
         };
         try {
@@ -333,7 +333,7 @@ export function registerExecutionControlContractTests(
             /Injected crash/,
           );
         } finally {
-          f.capacity.takeOver = takeOver;
+          f.capacity.reconcile = reconcile;
         }
         const state = await f.state();
         assert.equal(state.run.status, 'failed');
@@ -378,15 +378,26 @@ export function registerExecutionControlContractTests(
             db.close();
           }
         }
+        if (replacement) {
+          await assert.rejects(
+            new ExecutionCompanion(f.options).reconcileCancellation(f.runId, evidence),
+            hasCode('CONFLICT'),
+          );
+          assert.equal((await f.state()).cancellation!.effects_state, 'unresolved');
+          assert.equal(f.capacity.inspect('test').occupied.script, 1);
+          assert.equal(f.capacity.inspect('test').entries[0]!.execution_token, replacementToken);
+          assert.equal(await readFile(filename, 'utf8'), original);
+          await new ExecutionCompanion(f.options).runOnce();
+          assert.equal(f.capacity.inspect('test').occupied.script, 1);
+          return;
+        }
         const resolved = await new ExecutionCompanion(f.options).reconcileCancellation(f.runId, evidence);
         assert.equal(resolved.effects_state, 'reconciled');
-        assert.equal(f.capacity.inspect('test').occupied.script, replacement ? 1 : 0);
-        if (replacement)
-          assert.equal(f.capacity.inspect('test').entries[0]!.execution_token, replacementToken);
+        assert.equal(f.capacity.inspect('test').occupied.script, 0);
         assert.equal(await readFile(filename, 'utf8'), original);
         assert.deepEqual((await f.state()).attempt, state.attempt);
         await new ExecutionCompanion(f.options).runOnce();
-        assert.equal(f.capacity.inspect('test').occupied.script, replacement ? 1 : 0);
+        assert.equal(f.capacity.inspect('test').occupied.script, 0);
         assert.deepEqual(
           await new ExecutionCompanion(f.options).reconcileCancellation(f.runId, evidence),
           resolved,

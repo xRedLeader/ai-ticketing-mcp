@@ -13,7 +13,11 @@ import {
   type ExecutionProcessIdentity,
   type ExecutionReconciliation,
 } from './contracts.js';
-import { HostCapacity, type HostCapacityNeverStartedProof } from './host-capacity.js';
+import {
+  HostCapacity,
+  type HostCapacityNeverStartedProof,
+  type HostCapacityObservation,
+} from './host-capacity.js';
 import { ExecutionRecipeRegistry } from './execution-recipes.js';
 import {
   durableExecutionFile,
@@ -715,33 +719,27 @@ export class ExecutionCompanion {
     >,
   ) {
     const { capacity, host_id: host } = this.options;
+    if (result.capacity === null) return true;
     const entry = capacity.inspect(host).entries.find((entry) => entry.queue_id === runId);
     if (
-      !entry?.lease ||
+      !entry ||
       entry.kind !== 'script' ||
       entry.run_id !== runId ||
-      entry.project_id !== this.options.project_id ||
-      !['running', 'reconciling'].includes(entry.state)
+      entry.project_id !== this.options.project_id
     )
-      return;
+      return false;
     if (
       result.capacity !== undefined &&
-      (!result.capacity ||
-        result.capacity.host_id !== host ||
+      (result.capacity.host_id !== host ||
         result.capacity.queue_id !== runId ||
         result.capacity.run_id !== entry.run_id ||
         result.capacity.project_id !== entry.project_id ||
-        result.capacity.execution_token !== entry.execution_token ||
-        !(
-          result.capacity.state === entry.state ||
-          (result.capacity.state === 'running' && entry.state === 'reconciling')
-        ))
+        result.capacity.execution_token !== entry.execution_token)
     )
-      return;
-    const takeover = capacity.takeOver(host, runId, entry.lease.generation, this.owner);
-    capacity.reconcile(takeover.lease, {
+      return false;
+    const observation: HostCapacityObservation = {
       source: 'execution-companion-recovery',
-      execution_token: takeover.execution_token!,
+      execution_token: entry.execution_token!,
       observed_at: result.finished_at,
       state: result.spawned === false ? 'never_started' : 'terminated',
       script_result: {
@@ -753,7 +751,20 @@ export class ExecutionCompanion {
               : 'failed',
         runtime_ms: result.spawned === false ? 0 : result.finished_at - result.started_at,
       },
-    });
+    };
+    if (entry.state === 'settled') return JSON.stringify(entry.observation) === JSON.stringify(observation);
+    if (
+      !entry.lease ||
+      !['running', 'reconciling'].includes(entry.state) ||
+      (result.capacity &&
+        !(
+          result.capacity.state === entry.state ||
+          (result.capacity.state === 'running' && entry.state === 'reconciling')
+        ))
+    )
+      return false;
+    const takeover = capacity.takeOver(host, runId, entry.lease.generation, this.owner);
+    return capacity.reconcile(takeover.lease, observation).released;
   }
   async run(signal?: AbortSignal) {
     while (!signal?.aborted) {
@@ -815,7 +826,11 @@ export class ExecutionCompanion {
             'CONFLICT',
             'Existing operator evidence differs; preserve it for investigation.',
           );
-          this.releaseCapacity(runId, { ...proof, capacity: proof.capacity ?? null });
+          ensure(
+            this.releaseCapacity(runId, { ...proof, capacity: proof.capacity ?? null }),
+            'CONFLICT',
+            'Exact capacity identity could not be reconciled; preserve it for investigation.',
+          );
         }
       }
       if (!['succeeded', 'failed'].includes(state.run.status)) {
@@ -896,7 +911,11 @@ export class ExecutionCompanion {
           'CONFLICT',
           'External result was not fenced.',
         );
-        this.releaseCapacity(runId, proof);
+        ensure(
+          this.releaseCapacity(runId, proof),
+          'CONFLICT',
+          'Exact capacity identity could not be reconciled; preserve it for investigation.',
+        );
       }
       return await app.reconcileExecutionCancellation(actor, project, runId, evidence.note);
     } finally {
