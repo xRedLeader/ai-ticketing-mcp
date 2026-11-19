@@ -1592,12 +1592,17 @@ export class Application {
                 'VERSION_CONFLICT',
                 'A knowledge source revision changed. Read the current source before citing or verifying it.',
               );
-              if (input.verification?.state === 'verified' || input.status === 'accepted')
+              if (input.verification?.state === 'verified' || input.status === 'accepted') {
+                const parent =
+                  current.kind === 'checkpoint' && current.ticket_id
+                    ? await tx.get('tickets', current.ticket_id)
+                    : undefined;
                 ensure(
-                  !current.archived,
+                  !current.archived && parent?.status !== 'cancelled',
                   'INVALID_REFERENCE',
                   'Archived sources cannot be verified as current evidence.',
                 );
+              }
             }
           }
           if (input.verification?.state === 'verified') {

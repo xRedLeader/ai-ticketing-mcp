@@ -210,6 +210,49 @@ export function registerKnowledgeContractTests(name: string, factory: () => Prom
       );
     });
 
+    check('rejects a cancelled ticket checkpoint as current evidence', async (f) => {
+      const ticket = await f.ticket();
+      const claim = await f.claim(ticket.id);
+      const { checkpoint } = (await f.call(f.worker.id, 'ticket_checkpoint', {
+        ticket_id: ticket.id,
+        claim_token: claim.claim.token,
+        progress: 'Recorded the source before cancellation.',
+      })) as { checkpoint: { id: string; ticket_revision: number } };
+      const input = {
+        ...content,
+        sources: [{ kind: 'checkpoint', id: checkpoint.id, revision: checkpoint.ticket_revision }],
+      };
+      const proposed = (await f.call(f.worker.id, 'knowledge_write', input)) as {
+        id: string;
+        revision: number;
+      };
+      const review = { ...input, knowledge_id: proposed.id, expected_revision: proposed.revision };
+      const verified = (await f.call(f.reviewer.id, 'knowledge_write', {
+        ...review,
+        verification: evidence,
+      })) as { revision: number };
+      await f.call(f.worker.id, 'ticket_transition', {
+        ticket_id: ticket.id,
+        expected_revision: checkpoint.ticket_revision,
+        status: 'cancelled',
+        reason: 'The source ticket has been cancelled.',
+      });
+      for (const update of [{ status: 'accepted' }, { verification: evidence }])
+        await assert.rejects(
+          f.call(f.reviewer.id, 'knowledge_write', {
+            ...review,
+            ...update,
+            expected_revision: verified.revision,
+          }),
+          hasCode('INVALID_REFERENCE'),
+        );
+      assert.equal((await read(f, proposed.id)).status, 'proposed');
+      const historical = (await f.app.execute(f.worker.id, 'checkpoint_get', {
+        project_id: f.project.id,
+        checkpoint_id: checkpoint.id,
+      })) as { id: string };
+      assert.equal(historical.id, checkpoint.id);
+    });
     check('rechecks review, sources and revision under the project lock', async (f) => {
       const ticket = await f.ticket();
       const input = { ...content, sources: [source(ticket.id, ticket.revision)] };
