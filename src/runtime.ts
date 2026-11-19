@@ -5,6 +5,7 @@ import { createApplication } from './application.js';
 import { GitHubClient } from './github.js';
 import { SignedWebhook } from './webhook.js';
 import { loadExecutionRecipes } from './execution-recipes.js';
+import { loadClientCapabilities } from './client-capabilities.js';
 import { ensure, type StorageAdapter, type SearchAdapter, type EmbeddingProvider } from './contracts.js';
 export function createRuntime(env: NodeJS.ProcessEnv = process.env) {
   ensure(
@@ -73,6 +74,9 @@ export function createRuntime(env: NodeJS.ProcessEnv = process.env) {
             ...(env.EXECUTION_ARTIFACT_TTL_MS ? { ttl_ms: Number(env.EXECUTION_ARTIFACT_TTL_MS) } : {}),
           },
         }
+      : {}),
+    ...(env.CLIENT_CAPABILITIES_FILE
+      ? { clientCapabilities: loadClientCapabilities(env.CLIENT_CAPABILITIES_FILE) }
       : {}),
     ...(env.TICKETING_GITHUB_REPOSITORY
       ? {

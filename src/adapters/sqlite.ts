@@ -165,7 +165,7 @@ const columns: Record<Table, string[]> = {
     'ticket_revision',
     'created_at',
   ],
-  claims: ['id', 'project_id', 'ticket_id', 'actor_id', 'token', 'expires_at'],
+  claims: ['id', 'project_id', 'ticket_id', 'actor_id', 'token', 'expires_at', 'execution'],
   submissions: [
     'id',
     'project_id',
@@ -246,6 +246,7 @@ const json = new Set([
   'evidence',
   'requirements_snapshot',
   'execution_hints',
+  'execution',
   'github_pull_request',
   'checks',
   'sources',
@@ -270,7 +271,10 @@ function encode(key: string, value: unknown): SQLInputValue {
 function decode(row: Record<string, unknown>) {
   return Object.fromEntries(
     Object.entries(row).flatMap(([key, value]) =>
-      (key === 'execution_hints' || key === 'github_pull_request' || key === 'scheduling_policy') &&
+      (key === 'execution_hints' ||
+        key === 'execution' ||
+        key === 'github_pull_request' ||
+        key === 'scheduling_policy') &&
       value === null
         ? []
         : [

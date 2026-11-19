@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { artifactIdentity, MAX_ARTIFACT_RANGE_BYTES } from './execution-artifacts.js';
+import { clientId } from './client-capabilities.js';
 const id = z.uuid();
 const ref = z.string().min(1).max(80);
 const text = z.string().trim().min(1);
@@ -22,6 +23,9 @@ export const executionHintsSchema = z
   .object({
     model: z.string().trim().max(128).nullable().optional(),
     effort: z.string().trim().max(32).nullable().optional(),
+    client_id: clientId.nullable().optional(),
+    operating_system: z.string().trim().max(80).nullable().optional(),
+    environment: z.string().trim().max(80).nullable().optional(),
   })
   .strict()
   .nullable()
@@ -29,6 +33,9 @@ export const executionHintsSchema = z
     const hints = {
       ...(value?.model ? { model: value.model } : {}),
       ...(value?.effort ? { effort: value.effort } : {}),
+      ...(value?.client_id ? { client_id: value.client_id } : {}),
+      ...(value?.operating_system ? { operating_system: value.operating_system } : {}),
+      ...(value?.environment ? { environment: value.environment } : {}),
     };
     return Object.keys(hints).length ? hints : null;
   });
@@ -187,6 +194,7 @@ export const schemas = {
   work_next: z
     .object({
       ...project,
+      client_id: clientId.optional(),
       capabilities: labels.default([]),
       labels: labels.default([]),
       mode: z.enum(['execution', 'review']).default('execution'),
@@ -197,6 +205,7 @@ export const schemas = {
     .object({
       ...project,
       ...mutation,
+      client_id: clientId.optional(),
       ticket_id: ref.optional(),
       capabilities: labels.default([]),
       labels: labels.default([]),

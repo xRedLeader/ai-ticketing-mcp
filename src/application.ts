@@ -17,6 +17,7 @@ import {
   type SearchDocument,
   type Submission,
   type ExecutionHints,
+  type ClientSelection,
   type GitHubConfiguration,
   type GitHubProvider,
   type GitHubEvidence,
@@ -48,6 +49,7 @@ import {
   packArtifactRange,
   unavailableArtifact,
 } from './execution-artifacts.js';
+import { ClientCapabilities } from './client-capabilities.js';
 
 export interface ApplicationOptions {
   storage: StorageAdapter;
@@ -60,6 +62,7 @@ export interface ApplicationOptions {
   webhook?: WebhookTarget;
   executionRecipes?: readonly ExecutionRecipeRegistration[];
   executionArtifacts?: { directory: string; ttl_ms?: number };
+  clientCapabilities?: ClientCapabilities;
 }
 const LEASE_MS = 600_000;
 const webhookEvents = new Set([
@@ -99,6 +102,7 @@ export class Application {
   private readonly webhook?: WebhookTarget;
   private readonly executionRecipes = new Map<string, ExecutionRecipeRegistration>();
   private readonly executionArtifacts?: ExecutionArtifacts;
+  private readonly clientCapabilities?: ClientCapabilities;
   readonly metrics = {
     requests: 0,
     errors: 0,
@@ -141,6 +145,7 @@ export class Application {
         options.executionArtifacts.directory,
         options.executionArtifacts.ttl_ms,
       );
+    this.clientCapabilities = options.clientCapabilities;
     if (options.webhook) {
       ensure(
         options.storage.leaseDeliveries &&
@@ -657,10 +662,12 @@ export class Application {
     capabilities: string[],
     labels: string[],
     limit: number,
+    clientId?: string,
   ) {
     const policy = this.schedulingPolicy(project);
     const at = this.timestamp();
     const result: Ticket[] = [];
+    capabilities = this.availableCapabilities(project, actor, capabilities);
     let offset = 0;
     while (result.length < limit) {
       const page = await reader.workCandidates(
@@ -674,13 +681,85 @@ export class Application {
         policy,
       );
       for (const ticket of page) {
-        if (await this.eligible(reader, ticket, actor, capabilities, labels, at)) result.push(ticket);
+        if (
+          (await this.eligible(reader, ticket, actor, capabilities, labels, at)) &&
+          this.matchClient(project, ticket, actor, clientId).selection !== null
+        )
+          result.push(ticket);
         if (result.length === limit) break;
       }
       if (page.length < limit) break;
       offset += page.length;
     }
     return result;
+  }
+  private availableCapabilities(project: Project, actor: Actor, advertised: string[]) {
+    if (!this.clientCapabilities) return advertised;
+    const tools = this.clientCapabilities.tools(actor.id, project.id, this.now().getTime());
+    return advertised.length ? tools.filter((tool) => advertised.includes(tool)) : tools;
+  }
+  private matchClient(project: Project, ticket: Ticket, actor: Actor, clientId?: string) {
+    const hints = this.executionHints(project, ticket);
+    if (!this.clientCapabilities) {
+      const required = clientId || hints?.client_id || hints?.operating_system || hints?.environment;
+      return {
+        selection: required ? null : undefined,
+        reasons: required
+          ? [
+              {
+                code: 'CLIENT_REGISTRY_REQUIRED',
+                message:
+                  'Ask the operator to configure CLIENT_CAPABILITIES_FILE before requesting a client or execution environment.',
+              },
+            ]
+          : [],
+      };
+    }
+    return this.clientCapabilities.match(
+      {
+        actor_id: actor.id,
+        project_id: project.id,
+        requirements_revision: ticket.requirements_revision,
+        tools: ticket.capabilities,
+        hints,
+        client_id: clientId,
+      },
+      this.now().getTime(),
+    );
+  }
+  /** Keep authorization locked through synchronous host admission/launch, as with script dispatch. */
+  async dispatchClientExecution(
+    actorId: string,
+    projectId: string,
+    ticketId: string,
+    token: string,
+    dispatch: (selection: ClientSelection) => undefined,
+  ) {
+    return this.storage.transaction(projectId, async (reader) => {
+      const actor = await this.actor(actorId, reader),
+        project = await this.access(reader, actor, projectId, ['contributor', 'admin']);
+      const ticket = await this.ticket(reader, projectId, ticketId),
+        claim = await this.liveClaim(reader, ticket, actor, token);
+      ensure(
+        ticket.status === 'in_progress' && (!ticket.assignee_id || ticket.assignee_id === actor.id),
+        'NOT_CLAIMABLE',
+        'Agent dispatch requires in-progress work assigned to this worker or unassigned.',
+      );
+      ensure(
+        !(await this.blockers(reader, ticket)).length,
+        'DEPENDENCY_BLOCKED',
+        'Resolve blockers before dispatch.',
+      );
+      const matched = this.matchClient(project, ticket, actor, claim.execution?.client_id);
+      ensure(
+        matched.selection && claim.execution && digest(matched.selection) === digest(claim.execution),
+        'CLIENT_SELECTION_CHANGED',
+        'Reclaim work and match again; its client, requirements or requested choices changed.',
+        { reasons: matched.reasons },
+      );
+      dispatch(claim.execution);
+      return claim.execution;
+    });
   }
   private async liveClaim(tx: Reader, ticket: Ticket, actor: Actor, token: string) {
     const claim = await tx.get('claims', ticket.id);
@@ -1853,10 +1932,57 @@ export class Application {
           };
         }
         case 'work_claim': {
+          ensure(
+            !input.client_id || this.clientCapabilities,
+            'CLIENT_REGISTRY_REQUIRED',
+            'Ask the operator to configure CLIENT_CAPABILITIES_FILE before selecting a client.',
+          );
           const ticket = input.ticket_id
             ? await this.ticket(tx, project.id, input.ticket_id)
-            : (await this.candidates(tx, project, actor, input.capabilities, input.labels, 1))[0];
-          ensure(ticket, 'NO_ELIGIBLE_WORK', 'No eligible work is currently available.');
+            : (
+                await this.candidates(
+                  tx,
+                  project,
+                  actor,
+                  input.capabilities,
+                  input.labels,
+                  1,
+                  input.client_id,
+                )
+              )[0];
+          if (!ticket && this.clientCapabilities) {
+            const available = this.clientCapabilities.match(
+              {
+                actor_id: actor.id,
+                project_id: project.id,
+                requirements_revision: 1,
+                tools: [],
+                hints: project.execution_hints ?? undefined,
+                client_id: input.client_id,
+              },
+              this.now().getTime(),
+            );
+            ensure(
+              available.selection,
+              'UNSUPPORTED_EXECUTION',
+              'No authorized fresh client supports the requested execution choices.',
+              { reasons: available.reasons },
+            );
+          }
+          ensure(
+            ticket,
+            'NO_ELIGIBLE_WORK',
+            this.clientCapabilities
+              ? 'No eligible work matches registered capabilities. Select a ticket_id to retrieve its exact execution mismatch.'
+              : 'No eligible work is currently available.',
+          );
+          const matched = this.matchClient(project, ticket, actor, input.client_id);
+          ensure(
+            matched.selection !== null,
+            'UNSUPPORTED_EXECUTION',
+            'No authorized fresh client supports the requested execution choices. Resolve the reported mismatch or ask the operator to update registration.',
+            { reasons: matched.reasons },
+          );
           if (input.ticket_id) {
             const blockers = await this.blockers(tx, ticket);
             ensure(
@@ -1866,7 +1992,13 @@ export class Application {
               { blockers },
             );
             ensure(
-              await this.eligible(tx, ticket, actor, input.capabilities, input.labels),
+              await this.eligible(
+                tx,
+                ticket,
+                actor,
+                this.availableCapabilities(project, actor, input.capabilities),
+                input.labels,
+              ),
               'NOT_CLAIMABLE',
               'Ticket is claimed, not ready, assigned elsewhere, or requires other capabilities.',
             );
@@ -1878,6 +2010,7 @@ export class Application {
             actor_id: actor.id,
             token: randomUUID(),
             expires_at: new Date(this.now().getTime() + LEASE_MS).toISOString(),
+            ...(matched.selection ? { execution: matched.selection } : {}),
           };
           await tx.put('claims', claim);
           ticket.status = 'in_progress';
@@ -2328,7 +2461,9 @@ export class Application {
             actor_id: claim.actor_id,
             expires_at: claim.expires_at,
             expired: claim.expires_at <= at,
-            ...(claim.actor_id === actor.id ? { token: claim.token } : {}),
+            ...(claim.actor_id === actor.id
+              ? { token: claim.token, ...(claim.execution ? { execution: claim.execution } : {}) }
+              : {}),
           }
         : null,
       blockers,
@@ -2624,6 +2759,7 @@ export class Application {
               input.capabilities,
               input.labels,
               input.limit,
+              input.client_id,
             ),
           };
         }

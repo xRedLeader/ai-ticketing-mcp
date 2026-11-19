@@ -1,11 +1,18 @@
 import { z } from 'zod';
 import { artifactResultSchema } from './execution-artifacts.js';
+import { clientSelectionSchema } from './client-capabilities.js';
 import type { Operation } from './schemas.js';
 const id = z.string(),
   timestamp = z.string(),
   json = z.json();
 const executionHints = z
-  .object({ model: z.string().min(1).max(128).optional(), effort: z.string().min(1).max(32).optional() })
+  .object({
+    model: z.string().min(1).max(128).optional(),
+    effort: z.string().min(1).max(32).optional(),
+    client_id: z.string().optional(),
+    operating_system: z.string().optional(),
+    environment: z.string().optional(),
+  })
   .strict();
 const githubBinding = z.object({ repository: z.string(), number: z.number().int().positive() });
 export const githubEvidenceSchema = z.object({
@@ -93,7 +100,15 @@ const note = z.object({
   ticket_revision: z.number(),
   created_at: timestamp,
 });
-const claim = z.object({ id, project_id: id, ticket_id: id, actor_id: id, token: id, expires_at: timestamp });
+const claim = z.object({
+  id,
+  project_id: id,
+  ticket_id: id,
+  actor_id: id,
+  token: id,
+  expires_at: timestamp,
+  execution: clientSelectionSchema.optional(),
+});
 const evidence = z.object({
   criterion_id: id,
   result: z.enum(['pass', 'fail']),
@@ -201,7 +216,13 @@ const member = z.object({
 });
 const blocker = z.object({ code: z.string(), reference: id, message: z.string() });
 const visibleClaim = z
-  .object({ actor_id: id, expires_at: timestamp, expired: z.boolean(), token: id.optional() })
+  .object({
+    actor_id: id,
+    expires_at: timestamp,
+    expired: z.boolean(),
+    token: id.optional(),
+    execution: clientSelectionSchema.optional(),
+  })
   .nullable();
 const projectSummary = project.omit({
   execution_hints: true,

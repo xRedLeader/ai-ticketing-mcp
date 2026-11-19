@@ -14,6 +14,19 @@ export interface Actor {
 export interface ExecutionHints {
   model?: string;
   effort?: string;
+  client_id?: string;
+  operating_system?: string;
+  environment?: string;
+}
+export interface ClientSelection {
+  client_id: string;
+  fingerprint: string;
+  model: string;
+  effort?: string;
+  operating_system: string;
+  environment: string;
+  tools: string[];
+  requirements_revision: number;
 }
 export interface Project {
   id: string;
@@ -89,6 +102,7 @@ export interface Claim {
   actor_id: string;
   token: string;
   expires_at: string;
+  execution?: ClientSelection;
 }
 export interface Evidence {
   criterion_id: string;

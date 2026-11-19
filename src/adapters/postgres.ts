@@ -191,7 +191,7 @@ const columns: Record<Table, string[]> = {
     'ticket_revision',
     'created_at',
   ],
-  claims: ['id', 'project_id', 'ticket_id', 'actor_id', 'token', 'expires_at'],
+  claims: ['id', 'project_id', 'ticket_id', 'actor_id', 'token', 'expires_at', 'execution'],
   submissions: [
     'id',
     'project_id',
@@ -243,6 +243,7 @@ const jsonColumns = new Set([
   'result',
   'requirements_snapshot',
   'execution_hints',
+  'execution',
   'github_pull_request',
   'checks',
   'sources',
@@ -256,7 +257,8 @@ function decode(row: Record<string, unknown>) {
     Object.entries(row)
       .filter(
         ([key, value]) =>
-          !['execution_hints', 'github_pull_request', 'scheduling_policy'].includes(key) || value !== null,
+          !['execution_hints', 'execution', 'github_pull_request', 'scheduling_policy'].includes(key) ||
+          value !== null,
       )
       .map(([key, value]) => [
         key,
