@@ -43,7 +43,7 @@ async function main() {
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
   try {
-    await app.storage.migrate();
+    if (app.storage.executionLaunchStorage?.adapter === 'sqlite') await app.storage.migrate();
     try {
       capacity.inspect(values.host);
     } catch (error) {
