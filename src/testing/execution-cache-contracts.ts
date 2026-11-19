@@ -11,6 +11,8 @@ import { ExecutionRecipeRegistry } from '../execution-recipes.js';
 import { ExecutionCompanion } from '../execution-companion.js';
 import { HostCapacity } from '../host-capacity.js';
 import { runVerificationPipeline } from '../verification-runner.js';
+import { ClientCapabilities } from '../client-capabilities.js';
+import { ContinuationDispatcher } from '../continuation-dispatch.js';
 import { fixture, hasCode, type ContractAdapters } from './contracts.js';
 
 export function registerExecutionCacheContractTests(name: string, factory: () => Promise<ContractAdapters>) {
@@ -101,15 +103,34 @@ export function registerExecutionCacheContractTests(name: string, factory: () =>
       assert.ok('kind' in pinned);
       return pinned;
     };
+    const clients = new ClientCapabilities({
+      clients: [
+        {
+          id: 'benign-cache-continuation',
+          actor_ids: [f.worker.id, foreign.worker.id],
+          project_ids: projects,
+          operating_system: 'fixture',
+          environments: ['local-fake'],
+          tools: [],
+          models: [{ id: 'fake-model', efforts: [] }],
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+        },
+      ],
+    });
     const appFor = (registered = recipes) =>
       createApplication({
         ...adapters,
+        clientCapabilities: clients,
         executionRecipes: registered.metadata(),
         executionArtifacts: { directory: artifacts },
       });
     const app = appFor(),
       ticket = await f.ticket(),
-      claim = await f.claim(ticket.id);
+      claim = (await app.execute(f.worker.id, 'work_claim', {
+        project_id: f.project.id,
+        ticket_id: ticket.id,
+        idempotency_key: randomUUID(),
+      })) as any;
     const submit = async (
       application = app,
       target = ticket,
@@ -204,7 +225,7 @@ export function registerExecutionCacheContractTests(name: string, factory: () =>
     );
     await app.releaseExecutionController(f.admin.id, f.project.id, seedController);
     const controllers: { project: string; fence: typeof seedController }[] = [];
-    const capacity = new HostCapacity(join(directory, 'capacity.sqlite'));
+    const capacity = new HostCapacity(join(directory, 'capacity.sqlite'), clients);
     capacity.configureHost('host');
     const begin = async (application = app, receipt?: any, project = f.project.id) => {
       const current = receipt ?? (await submit(application));
@@ -350,6 +371,132 @@ export function registerExecutionCacheContractTests(name: string, factory: () =>
       assert.equal(await companion.runOnce(), false);
     },
   );
+
+  for (const change of ['valid', 'missing', 'tampered', 'foreign'] as const)
+    check(`dispatches cached continuation only with exact original proof (${change})`, async (f) => {
+      const priorClaim = (await f.storage.get('claims', f.ticket.id))!;
+      await f.app.execute(f.worker.id, 'work_release', {
+        project_id: f.project.id,
+        ticket_id: f.ticket.id,
+        claim_token: priorClaim.token,
+        reason: 'Rotate the worker claim before resuming cached verification.',
+        idempotency_key: randomUUID(),
+      });
+      const claimed = (await f.app.execute(f.worker.id, 'work_claim', {
+        project_id: f.project.id,
+        ticket_id: f.ticket.id,
+        idempotency_key: randomUUID(),
+      })) as any;
+      assert.notEqual(claimed.claim.token, f.source.claim_token);
+      const target = await f.submit(f.app, f.ticket, claimed.claim.token);
+      const current = await f.begin(f.app, target);
+      assert.equal(await current.reuse(), true);
+      const cached = (await f.storage.get('execution_jobs', target.run_id))!;
+      const state = (await f.app.listExecutionReconciliations(f.admin.id, f.project.id, [cached.id]))[0]!;
+      assert.notEqual(state.attempt!.id, f.attempt.id);
+      assert.deepEqual(cached.artifacts, f.references);
+      if (change === 'missing') await rm(join(f.sourceDirectory, 'stderr.log'));
+      if (change === 'tampered')
+        await writeFile(join(f.sourceDirectory, 'stdout.log'), 'changed original bytes');
+      if (change === 'foreign') {
+        const foreignTicket = await f.foreign.ticket(),
+          foreignClaim = await f.foreign.claim(foreignTicket.id);
+        const foreignRun = await f.submit(
+          f.app,
+          foreignTicket,
+          foreignClaim.claim.token,
+          f.foreign.project.id,
+          f.foreign.worker.id,
+        );
+        await f.storage.transaction(f.project.id, async (tx) => {
+          const observation = state.observation!;
+          // A forged persisted source is rejected even though the original artifacts themselves still exist.
+          await tx.put('execution_observations', {
+            ...observation,
+            id: randomUUID(),
+            sequence: observation.sequence + 1,
+            outcome: {
+              ...observation.outcome!,
+              cache: { ...observation.outcome!.cache!, source_run_id: foreignRun.run_id },
+            },
+          });
+        });
+      }
+      const allowance = { provider_tokens: 100, runtime_ms: 60_000, cost_usd_micros: null };
+      const budget = randomUUID();
+      f.capacity.createRun({
+        run_id: budget,
+        project_id: f.project.id,
+        work: [{ ticket_id: f.ticket.id, requirements_revision: f.ticket.requirements_revision }],
+        limits: { max_attempts: 4, max_provider_tokens: 1000, max_runtime_ms: 600_000 },
+      });
+      f.capacity.enqueue('host', {
+        queue_id: 'current-worker',
+        run_id: budget,
+        kind: 'agent',
+        created_at: Date.now(),
+        execution: claimed.claim.execution,
+        admission: {
+          attempt_id: 'current-worker',
+          actor_id: f.worker.id,
+          ticket_id: f.ticket.id,
+          requirements_revision: f.ticket.requirements_revision,
+          role: 'worker',
+          provider: 'fake',
+          model: 'fake-model',
+          allowance,
+        },
+      });
+      const predecessor = f.capacity.claimNext('host', 'current-worker');
+      assert.ok(predecessor.admitted);
+      f.capacity.reconcile(predecessor.lease, {
+        source: 'independent-fake-supervisor',
+        state: 'terminated',
+        observed_at: Date.now(),
+        execution_token: predecessor.request.execution_token!,
+        settlement: {
+          outcome: 'succeeded',
+          usage_source: 'independent-fake-supervisor',
+          runtime_ms: 1,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      });
+      await f.app.registerWakeCondition(f.admin.id, f.project.id, {
+        ticket_id: f.ticket.id,
+        condition: { kind: 'continuation', continuation_id: cached.continuation_id },
+      });
+      let calls = 0;
+      const dispatcher = new ContinuationDispatcher({
+        application: f.appFor(),
+        capacity: f.capacity,
+        actor_id: f.admin.id,
+        project_id: f.project.id,
+        host_id: 'host',
+        launch: (context) => {
+          assert.equal(context.run_id, cached.id);
+          calls++;
+        },
+      });
+      const request = {
+        ticket_id: f.ticket.id,
+        budget_run_id: budget,
+        provider: 'fake',
+        allowance,
+        predecessor: {
+          host_id: 'host',
+          queue_id: 'current-worker',
+          execution_token: predecessor.request.execution_token!,
+        },
+      };
+      const result = await dispatcher.runOnce(request);
+      assert.equal(result.state, change === 'valid' ? 'running' : 'needs_attention');
+      if (change !== 'valid') assert.equal(result.code, 'INVALID_ARTIFACT');
+      await Promise.all([dispatcher.runOnce(request), dispatcher.runOnce(request)]);
+      assert.equal(calls, change === 'valid' ? 1 : 0);
+      assert.equal((await f.storage.get('tickets', f.ticket.id))!.status, 'in_progress');
+      assert.equal((await f.storage.find('submissions', { where: { ticket_id: f.ticket.id } })).length, 0);
+      assert.deepEqual((await f.storage.get('execution_jobs', cached.id))!.artifacts, f.references);
+    });
 
   check(
     'never reuses default jobs or caller-added cacheability',

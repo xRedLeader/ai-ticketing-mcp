@@ -1309,13 +1309,42 @@ export class Application {
       'UNSUPPORTED_EXECUTION',
       'Continuation requires its exact current registered client.',
     );
-    const resultId = `execution:${run.id}:${recovery.attempt.id}:result`;
+    const cache = recovery.observation?.outcome?.cache;
+    let artifactRun = run,
+      artifactAttempt = recovery.attempt;
+    if (cache) {
+      const references = await this.executionArtifactReferences(tx, run, cache);
+      ensure(
+        references.cache &&
+          references.artifacts.length === run.artifacts.length &&
+          cache.artifacts.length === 3,
+        'INVALID_ARTIFACT',
+        'Continuation cache provenance is invalid.',
+      );
+      const source = (await tx.get('execution_jobs', cache.source_run_id))!;
+      const sourceState = await this.executionReconciliation(tx, source);
+      const sourceContinuation = await tx.get('continuations', source.continuation_id);
+      ensure(
+        source.started_at &&
+          sourceState.state === 'completed' &&
+          sourceState.attempt?.id === cache.source_attempt_id &&
+          sourceState.attempt.project_id === project.id &&
+          sourceState.attempt.run_id === source.id &&
+          sourceContinuation?.status === 'satisfied' &&
+          source.recipe_id === run.recipe_id,
+        'INVALID_ARTIFACT',
+        'Continuation cache source ownership is invalid.',
+      );
+      artifactRun = source;
+      artifactAttempt = sourceState.attempt;
+    }
+    const resultId = `execution:${artifactRun.id}:${artifactAttempt.id}:result`;
     ensure(run.artifacts.includes(resultId), 'INVALID_ARTIFACT', 'Continuation requires a published result.');
     const artifacts = [];
     for (const id of run.artifacts) {
       const identity = artifactIdentity.exec(id);
       ensure(
-        identity?.[1] === run.id && identity[2] === recovery.attempt.id,
+        identity?.[1] === artifactRun.id && identity[2] === artifactAttempt.id,
         'INVALID_ARTIFACT',
         'Continuation artifact belongs to another execution attempt.',
       );
@@ -1325,6 +1354,14 @@ export class Application {
         'INVALID_ARTIFACT',
         'Continuation artifact is missing, expired or invalid.',
       );
+      if (cache) {
+        const proof = cache.artifacts.find((item) => item.artifact_id === id);
+        ensure(
+          proof?.sha256 === artifact.sha256 && proof.size_bytes === artifact.size_bytes,
+          'INVALID_ARTIFACT',
+          'Continuation cache artifact differs from its retained proof.',
+        );
+      }
       const hash = createHash('sha256');
       let range = artifact,
         offset = 0;
@@ -1357,8 +1394,8 @@ export class Application {
           ensure(false, 'INVALID_ARTIFACT', 'Continuation result is invalid JSON.');
         }
         ensure(
-          outcome?.run_id === run.id &&
-            outcome.attempt_id === recovery.attempt.id &&
+          outcome?.run_id === artifactRun.id &&
+            outcome.attempt_id === artifactAttempt.id &&
             outcome.exit_code === run.exit_code &&
             outcome.signal === run.signal &&
             outcome.error_code === run.error_code,
@@ -1376,7 +1413,7 @@ export class Application {
       run_id: run.id,
       execution: claim.execution,
     };
-    return { context, identity: digest([context, recovery.attempt, artifacts]) };
+    return { context, identity: digest([context, recovery.attempt, artifactAttempt, cache, artifacts]) };
   }
 
   /** A committed intent grants this call one launch; crash/replay never grants another. */
@@ -3929,7 +3966,7 @@ export class Application {
         );
         const stderr = output.find((artifact) => artifact.artifact_id.endsWith(':stderr'));
         const response = {
-          run: { ...run, ...references },
+          run: { ...run, ...(recovery.observation?.outcome?.cache ? references : {}) },
           continuation,
           checkpoint: checkpoint as Note | null,
           output,
