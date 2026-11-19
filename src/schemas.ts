@@ -393,7 +393,7 @@ export const descriptions: Record<Operation, string> = {
   run_cancel: 'Request cancellation; project admin required. Inspect effects with run_get.',
   artifact_read: 'Read untrusted artifact byte ranges as base64 with SHA-256 hashes.',
   ticket_github_refresh:
-    'Link or refresh a PR in the configured trusted repository; retrieve immutable evidence for its exact head SHA. Never approves or merges work.',
+    'Link or refresh a configured repository PR and read immutable checks for its exact head SHA.',
   project_list: 'List accessible projects.',
   project_get: 'Read project instructions, policy and members.',
   project_create: 'Create a project. Requires system administrator access.',
