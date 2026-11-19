@@ -410,6 +410,7 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
     check('rejects stale revisions and superseded lease tokens', async (f) => {
       const ticket = await f.ticket();
       const first = await f.claim(ticket.id);
+      assert.equal((await f.read(ticket.id)).ticket.assignee_id, f.worker.id);
       await assert.rejects(
         f.call(f.worker.id, 'ticket_update', {
           ticket_id: ticket.id,
@@ -419,7 +420,14 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
         hasCode('VERSION_CONFLICT'),
       );
       f.clock.now = new Date(f.clock.now.getTime() + 601000);
+      await assert.rejects(f.claim(ticket.id, f.other.id), hasCode('NOT_CLAIMABLE'));
+      await f.call(f.admin.id, 'ticket_update', {
+        ticket_id: ticket.id,
+        expected_revision: first.ticket.revision,
+        assignee_id: f.other.id,
+      });
       const second = await f.claim(ticket.id, f.other.id);
+      assert.equal((await f.read(ticket.id)).ticket.assignee_id, f.other.id);
       assert.notEqual(first.claim.token, second.claim.token);
       await assert.rejects(
         f.call(f.worker.id, 'ticket_checkpoint', {

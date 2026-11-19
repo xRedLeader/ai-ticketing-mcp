@@ -157,6 +157,11 @@ it('rebuilds authorized fingerprints for state changes and effective lease expir
     })) as any;
     assert.equal(expired.not_modified, false);
     assert.equal(expired.claim.expired, true);
+    await f.call(f.admin.id, 'ticket_update', {
+      ticket_id: ticket.id,
+      expected_revision: expired.ticket.revision,
+      assignee_id: f.other.id,
+    });
     const reclaimed = await f.claim(ticket.id, f.other.id);
     assert.notEqual(reclaimed.claim.token, claimed.claim.token);
     const changed = (await f.app.execute(f.worker.id, 'ticket_context', {
@@ -245,7 +250,7 @@ it('replays legacy claims deterministically without rewriting receipts or renewi
     };
     await f.storage.transaction(f.project.id, async (tx) => tx.put('receipts', legacy));
     f.clock.now = new Date(f.clock.now.getTime() + 601000);
-    await f.claim(ticket.id, f.other.id);
+    await f.claim(ticket.id);
     const replay = (await f.app.execute(f.worker.id, 'work_claim', input)) as any;
     assert.equal(replay.context_omitted, 'legacy_receipt');
     assert.deepEqual(replay.claim, claimed.claim);
@@ -563,6 +568,7 @@ it('requires exact omitted rejection feedback before resumed execution', async (
     const ticket = await f.ticket();
     const claimed = await f.claim(ticket.id);
     const submission = await f.submit(ticket.id, claimed.claim.token);
+    assert.equal((await f.read(ticket.id)).ticket.assignee_id, f.worker.id);
     const review = (await f.call(f.reviewer.id, 'ticket_review', {
       ticket_id: ticket.id,
       expected_revision: submission.ticket.revision,
@@ -570,10 +576,12 @@ it('requires exact omitted rejection feedback before resumed execution', async (
       decision: 'request_changes',
       feedback: 'x '.repeat(7500),
     })) as any;
-    const resumed = await f.claim(ticket.id, f.other.id);
+    assert.equal((await f.read(ticket.id)).ticket.assignee_id, f.worker.id);
+    await assert.rejects(f.claim(ticket.id, f.other.id), hasCode('NOT_CLAIMABLE'));
+    const resumed = await f.claim(ticket.id);
     const omitted = resumed.context.omitted.find((item: any) => item.section === 'reviews');
     assert.equal(omitted.required_before, 'execution');
-    const retrieved = (await f.app.execute(f.other.id, omitted.retrieve_with, omitted.arguments)) as any;
+    const retrieved = (await f.app.execute(f.worker.id, omitted.retrieve_with, omitted.arguments)) as any;
     assert.equal(retrieved.items.length, 1);
     assert.equal(retrieved.items[0].id, review.review.id);
     assert.equal(retrieved.items[0].decision, 'request_changes');

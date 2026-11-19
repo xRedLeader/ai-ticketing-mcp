@@ -38,6 +38,8 @@ Ticket lifecycle: `backlog → ready → in_progress → in_review → done`, pl
 
 `work_claim` returns a token, expiry, compact ticket receipt, and brief context by default. `include_context:false` returns ownership alone. Heartbeat at least every three minutes; claims last ten minutes. Retrying an identical claim returns its original receipt and context snapshot, even after expiry; it never renews ownership. A new claim attempt needs a new key. Checkpoints return the new ticket revision so submission can chain without another read.
 
+Claiming an unassigned ticket sets its assignee to the claimant in the same transaction. Only the current assignee can claim an assigned ticket. The assignment survives release, expiry, submission, and review. After a change request, the ticket returns to `ready` with the same assignee. Use `ticket_update` to reassign work or clear its assignment.
+
 Requirement edits revoke claims and invalidate affected reviews, completed dependent tickets, and parent approvals. Metadata edits still increment the ticket revision. Read current state after a revision conflict. Questions marked blocking prevent claims and submissions until an answer references their identifier. Checkpoints are immutable notes, and complete history can be paged with `ticket_history`.
 
 ## Scheduling

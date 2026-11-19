@@ -981,6 +981,7 @@ export class Application {
             expires_at: new Date(this.now().getTime() + LEASE_MS).toISOString(),
           };
           await tx.put('claims', claim);
+          ticket.assignee_id ??= actor.id;
           ticket.status = 'in_progress';
           await this.touch(tx, ticket);
           await this.event(tx, project, actor, 'work.claimed', ticket.id, { expires_at: claim.expires_at });

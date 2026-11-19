@@ -132,6 +132,11 @@ it('recovers checkpoints, blocks on questions, and rejects cycles', async () => 
       body: 'Independent verification.',
     });
     f.clock.now = new Date(f.clock.now.getTime() + 601000);
+    await f.call(f.admin.id, 'ticket_update', {
+      ticket_id: a.id,
+      expected_revision: (await f.read(a.id)).ticket.revision,
+      assignee_id: f.other.id,
+    });
     await f.claim(a.id, f.other.id);
     const context = (await f.app.execute(f.other.id, 'ticket_context', {
       project_id: f.project.id,
