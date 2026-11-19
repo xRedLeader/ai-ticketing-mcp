@@ -17,6 +17,8 @@ export { countReferenceTokens } from './tokens.js';
 export { GitHubClient } from './github.js';
 export { SignedWebhook } from './webhook.js';
 export { ClientCapabilities, loadClientCapabilities } from './client-capabilities.js';
+export { ContinuationDispatcher } from './continuation-dispatch.js';
+export type { ContinuationDispatcherOptions, ContinuationDispatchRequest } from './continuation-dispatch.js';
 export { createProfileRecorder } from './profiling.js';
 export type {
   ProfileRecorder,

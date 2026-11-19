@@ -40,6 +40,11 @@ import {
   type ArtifactRetirement,
   type ExecutionStatusProvider,
   type Continuation,
+  type ContinuationDispatch,
+  type ContinuationDispatchContext,
+  type ContinuationInvocation,
+  type WakeFence,
+  type WakeRegistration,
   validateGitHubConfiguration,
 } from './contracts.js';
 import { resultSchemas, githubEvidenceSchema, executionResumeSchema } from './result-schemas.js';
@@ -1232,6 +1237,256 @@ export class Application {
           generation: result.generation,
         });
       return result.completed;
+    });
+  }
+
+  private async continuationDispatchContext(tx: Transaction, project: Project, row: WakeRegistration) {
+    if (this.storage.artifactRetention) {
+      ensure(
+        tx.lockArtifactReferences,
+        'UNSUPPORTED_ARTIFACT_RETENTION',
+        'Serialize continuation artifacts.',
+      );
+      await tx.lockArtifactReferences();
+    }
+    ensure(row.condition.kind === 'continuation', 'INVALID_REFERENCE', 'Register a continuation wake.');
+    ensure(
+      !row.deadline || row.deadline > this.timestamp(),
+      'DEADLINE_EXPIRED',
+      'Continuation dispatch deadline expired.',
+    );
+    const continuation = await tx.get('continuations', row.condition.continuation_id);
+    ensure(continuation?.status === 'satisfied', 'CONTINUATION_FAILED', 'Continuation is not satisfied.');
+    const run = await tx.get('execution_jobs', continuation.run_id);
+    ensure(
+      run?.project_id === project.id &&
+        run.ticket_id === row.ticket_id &&
+        run.continuation_id === continuation.id &&
+        run.status === 'succeeded' &&
+        run.requirements_revision === continuation.requirements_revision,
+      'INVALID_REFERENCE',
+      'Continuation execution identity changed.',
+    );
+    const recovery = await this.executionReconciliation(tx, run);
+    ensure(
+      recovery.state === 'completed' && recovery.attempt,
+      'PREDECESSOR_UNRESOLVED',
+      'Resolve execution exit and effects before continuation dispatch.',
+    );
+    const ticket = await this.ticket(tx, project.id, row.ticket_id);
+    ensure(
+      ticket.requirements_revision === run.requirements_revision,
+      'REQUIREMENTS_CHANGED',
+      'Continuation requirements changed.',
+    );
+    const worker = await this.actor(run.actor_id, tx);
+    await this.access(tx, worker, project.id, ['contributor', 'admin']);
+    const claim = await this.liveClaim(tx, ticket, worker, run.claim_token);
+    ensure(
+      ticket.status === 'in_progress' && (!ticket.assignee_id || ticket.assignee_id === worker.id),
+      'OWNERSHIP_CHANGED',
+      'Continuation work is no longer owned by its worker.',
+    );
+    ensure(
+      !(await this.blockers(tx, ticket)).length,
+      'UNRESOLVED_APPROVAL',
+      'Resolve blocking questions and dependencies before continuation dispatch.',
+    );
+    const matched = this.matchClient(project, ticket, worker, claim.execution?.client_id);
+    ensure(
+      matched.selection && claim.execution && digest(matched.selection) === digest(claim.execution),
+      'UNSUPPORTED_EXECUTION',
+      'Continuation requires its exact current registered client.',
+    );
+    const resultId = `execution:${run.id}:${recovery.attempt.id}:result`;
+    ensure(run.artifacts.includes(resultId), 'INVALID_ARTIFACT', 'Continuation requires a published result.');
+    const artifacts = [];
+    for (const id of run.artifacts) {
+      const identity = artifactIdentity.exec(id);
+      ensure(
+        identity?.[1] === run.id && identity[2] === recovery.attempt.id,
+        'INVALID_ARTIFACT',
+        'Continuation artifact belongs to another execution attempt.',
+      );
+      const artifact = await this.readArtifact(tx, project.id, id, 0, 65_536);
+      ensure(
+        artifact.status === 'available' && artifact.sha256,
+        'INVALID_ARTIFACT',
+        'Continuation artifact is missing, expired or invalid.',
+      );
+      const hash = createHash('sha256');
+      let range = artifact,
+        offset = 0;
+      do {
+        const bytes = Buffer.from(range.range.data, 'base64');
+        hash.update(bytes);
+        offset += bytes.length;
+        ensure(
+          range.status === 'available' &&
+            range.size_bytes === artifact.size_bytes &&
+            range.sha256 === artifact.sha256 &&
+            (offset === artifact.size_bytes || bytes.length > 0),
+          'INVALID_ARTIFACT',
+          'Continuation artifact changed during verification.',
+        );
+        if (offset < artifact.size_bytes!)
+          range = await this.readArtifact(tx, project.id, id, offset, 65_536);
+      } while (offset < artifact.size_bytes!);
+      ensure(
+        hash.digest('hex') === artifact.sha256,
+        'INVALID_ARTIFACT',
+        'Continuation artifact bytes changed.',
+      );
+      if (id === resultId) {
+        ensure(artifact.size_bytes! <= 65_536, 'INVALID_ARTIFACT', 'Continuation result is too large.');
+        let outcome: any;
+        try {
+          outcome = JSON.parse(Buffer.from(artifact.range.data, 'base64').toString('utf8'));
+        } catch {
+          ensure(false, 'INVALID_ARTIFACT', 'Continuation result is invalid JSON.');
+        }
+        ensure(
+          outcome?.run_id === run.id &&
+            outcome.attempt_id === recovery.attempt.id &&
+            outcome.exit_code === run.exit_code &&
+            outcome.signal === run.signal &&
+            outcome.error_code === run.error_code,
+          'INVALID_ARTIFACT',
+          'Continuation result does not match its durable outcome.',
+        );
+      }
+      artifacts.push([id, artifact.sha256]);
+    }
+    const context: ContinuationDispatchContext = {
+      actor_id: worker.id,
+      ticket_id: ticket.id,
+      requirements_revision: ticket.requirements_revision,
+      continuation_id: continuation.id,
+      run_id: run.id,
+      execution: claim.execution,
+    };
+    return { context, identity: digest([context, recovery.attempt, artifacts]) };
+  }
+
+  /** A committed intent grants this call one launch; crash/replay never grants another. */
+  async dispatchWakeContinuation(
+    actorId: string,
+    projectId: string,
+    fence: WakeFence,
+    admit: (
+      context: ContinuationDispatchContext,
+    ) =>
+      | { state: 'waiting' | 'needs_attention'; code: string }
+      | { state: 'starting'; invocation: ContinuationInvocation },
+    launch: (context: ContinuationDispatchContext, invocation: ContinuationInvocation) => undefined,
+  ): Promise<ContinuationDispatch> {
+    ensure(
+      uuid.test(fence.ticket_id) &&
+        uuid.test(fence.token) &&
+        Number.isSafeInteger(fence.generation) &&
+        fence.generation > 0,
+      'INVALID_INPUT',
+      'Invalid continuation wake fence.',
+    );
+    const current = async (tx: Transaction) => {
+      const row = await wakeRegistration(tx, projectId, fence.ticket_id);
+      ensure(
+        row.active?.generation === fence.generation && row.active.token === fence.token,
+        'VERSION_CONFLICT',
+        'Continuation wake ownership changed.',
+      );
+      return row;
+    };
+    const save = async (tx: Transaction, row: WakeRegistration, dispatch: ContinuationDispatch) => {
+      await tx.put('wake_conditions', {
+        ...row,
+        active: { ...row.active!, dispatch },
+        revision: row.revision + 1,
+        updated_at: this.timestamp(),
+      });
+      return dispatch;
+    };
+    let reserved = false;
+    const intent = await this.wakeTransaction(actorId, projectId, async (tx, project) => {
+      const row = await current(tx);
+      if (row.active!.dispatch && row.active!.dispatch.state !== 'waiting') return row.active!.dispatch;
+      let identity: string | null = null;
+      try {
+        const validated = await this.continuationDispatchContext(tx, project, row);
+        identity = validated.identity;
+        const admission = admit(validated.context);
+        reserved = admission.state === 'starting';
+        return save(tx, row, {
+          state: admission.state,
+          code: 'code' in admission ? admission.code : null,
+          invocation: 'invocation' in admission ? admission.invocation : null,
+          identity,
+        });
+      } catch (error) {
+        return save(tx, row, {
+          state: 'needs_attention',
+          code: error instanceof DomainError ? error.code : 'DISPATCH_VALIDATION_FAILED',
+          invocation: null,
+          identity,
+        });
+      }
+    });
+    if (!reserved) return intent;
+    return this.wakeTransaction(actorId, projectId, async (tx, project) => {
+      const row = await current(tx);
+      const dispatch = row.active!.dispatch!;
+      ensure(
+        dispatch.state === 'starting' && digest(dispatch) === digest(intent),
+        'VERSION_CONFLICT',
+        'Continuation launch intent changed.',
+      );
+      try {
+        const validated = await this.continuationDispatchContext(tx, project, row);
+        ensure(
+          validated.identity === dispatch.identity,
+          'INVALID_ARTIFACT',
+          'Continuation identity changed.',
+        );
+        const result = launch(validated.context, dispatch.invocation!);
+        ensure(result === undefined, 'INVALID_INPUT', 'Trusted launch callback must be synchronous.');
+        return save(tx, row, { ...dispatch, state: 'running' });
+      } catch (error) {
+        return save(tx, row, {
+          ...dispatch,
+          state: 'needs_attention',
+          code: error instanceof DomainError ? error.code : 'LAUNCH_UNCERTAIN',
+        });
+      }
+    });
+  }
+
+  /** Only independent host termination/usage reconciliation may release a dispatched generation. */
+  async completeWakeContinuation(
+    actorId: string,
+    projectId: string,
+    fence: WakeFence,
+    exited: (invocation: ContinuationInvocation) => boolean,
+  ) {
+    return this.wakeTransaction(actorId, projectId, async (tx) => {
+      const row = await wakeRegistration(tx, projectId, fence.ticket_id);
+      ensure(
+        row.active?.generation === fence.generation && row.active.token === fence.token,
+        'VERSION_CONFLICT',
+        'Continuation wake ownership changed.',
+      );
+      const dispatch = row.active.dispatch;
+      ensure(
+        dispatch?.invocation && exited(dispatch.invocation),
+        'WAKE_PENDING',
+        'Exact invocation exit and usage settlement are required.',
+      );
+      await tx.put('wake_conditions', {
+        ...row,
+        active: { ...row.active, dispatch: { ...dispatch, state: 'completed', code: null } },
+        revision: row.revision + 1,
+        updated_at: this.timestamp(),
+      });
+      return true;
     });
   }
   /** Trusted companion API; these methods are deliberately absent from the MCP catalog. */

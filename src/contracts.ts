@@ -339,6 +339,31 @@ export interface WakeDecision {
   reasons: WakeReason[];
   through_cursor: number;
   created_at: string;
+  dispatch?: ContinuationDispatch;
+}
+export interface ContinuationInvocation {
+  host_id: string;
+  queue_id: string;
+  execution_token: string;
+}
+export interface ContinuationDispatch {
+  state: 'waiting' | 'starting' | 'running' | 'completed' | 'needs_attention';
+  code: string | null;
+  invocation: ContinuationInvocation | null;
+  identity: string | null;
+}
+export interface ContinuationDispatchContext {
+  actor_id: string;
+  ticket_id: string;
+  requirements_revision: number;
+  continuation_id: string;
+  run_id: string;
+  execution: ClientSelection;
+}
+export interface WakeFence {
+  ticket_id: string;
+  generation: number;
+  token: string;
 }
 export interface WakeRegistration {
   id: string;
