@@ -1415,11 +1415,26 @@ export class Application {
       });
       return dispatch;
     };
+    // Protect the generation before the separate local capacity transaction can commit.
+    await this.wakeTransaction(actorId, projectId, async (tx) => {
+      const row = await current(tx);
+      if (!row.active!.dispatch)
+        await save(tx, row, {
+          state: 'waiting',
+          code: 'ADMISSION_PENDING',
+          invocation: null,
+          identity: null,
+          admission_uncertain: true,
+        });
+    });
     let reserved = false;
     const intent = await this.wakeTransaction(actorId, projectId, async (tx, project) => {
       const row = await current(tx);
-      if (row.active!.dispatch && row.active!.dispatch.state !== 'waiting') return row.active!.dispatch;
+      const previous = row.active!.dispatch;
+      if (previous && previous.state !== 'waiting' && (previous.invocation || !recover)) return previous;
       let identity: string | null = null;
+      let recoveryContext: Omit<ContinuationDispatchContext, 'execution'> | undefined;
+      let recoveryChecked = false;
       try {
         if (recover && row.condition.kind === 'continuation') {
           const continuation = await tx.get('continuations', row.condition.continuation_id);
@@ -1433,20 +1448,28 @@ export class Application {
             'INVALID_REFERENCE',
             'Continuation admission identity is unavailable.',
           );
-          const invocation = recover({
+          recoveryContext = {
             actor_id: run.actor_id,
             ticket_id: row.ticket_id,
             requirements_revision: run.requirements_revision,
             continuation_id: continuation.id,
             run_id: run.id,
-          });
+          };
+          const invocation = recover(recoveryContext);
+          recoveryChecked = true;
           if (invocation)
             return save(tx, row, {
               state: 'needs_attention',
               code: 'ADMISSION_UNCERTAIN',
               invocation,
               identity: null,
+              admission_uncertain: true,
             });
+        }
+        if (previous && previous.state !== 'waiting') {
+          if (recoveryChecked && previous.admission_uncertain !== false)
+            return save(tx, row, { ...previous, admission_uncertain: false });
+          return previous;
         }
         const validated = await this.continuationDispatchContext(tx, project, row);
         identity = validated.identity;
@@ -1457,13 +1480,29 @@ export class Application {
           code: 'code' in admission ? admission.code : null,
           invocation: 'invocation' in admission ? admission.invocation : null,
           identity,
+          admission_uncertain: admission.state === 'starting',
         });
       } catch (error) {
+        let invocation: ContinuationInvocation | null = null;
+        recoveryChecked = false;
+        if (recover && recoveryContext) {
+          try {
+            invocation = recover(recoveryContext);
+            recoveryChecked = true;
+          } catch {
+            /* Preserve uncertainty when the exact local admission cannot be inspected. */
+          }
+        }
         return save(tx, row, {
           state: 'needs_attention',
-          code: error instanceof DomainError ? error.code : 'DISPATCH_VALIDATION_FAILED',
-          invocation: null,
+          code: invocation
+            ? 'ADMISSION_UNCERTAIN'
+            : error instanceof DomainError
+              ? error.code
+              : 'DISPATCH_VALIDATION_FAILED',
+          invocation,
           identity,
+          admission_uncertain: !!invocation || !recoveryChecked,
         });
       }
     });

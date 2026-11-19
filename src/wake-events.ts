@@ -293,7 +293,9 @@ export async function finishWake(tx: Transaction, projectId: string, raw: unknow
   ensure(
     !row.active.dispatch ||
       row.active.dispatch.state === 'completed' ||
-      (row.active.dispatch.state === 'needs_attention' && !row.active.dispatch.invocation),
+      (row.active.dispatch.state === 'needs_attention' &&
+        !row.active.dispatch.invocation &&
+        row.active.dispatch.admission_uncertain === false),
     'WAKE_PENDING',
     'Confirm invocation exit before finishing its wake decision.',
   );

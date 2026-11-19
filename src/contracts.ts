@@ -351,6 +351,7 @@ export interface ContinuationDispatch {
   code: string | null;
   invocation: ContinuationInvocation | null;
   identity: string | null;
+  admission_uncertain?: boolean;
 }
 export interface ContinuationDispatchContext {
   actor_id: string;

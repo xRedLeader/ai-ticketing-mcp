@@ -480,6 +480,91 @@ export function registerContinuationDispatchContractTests(
       assert.equal((await f.get()).generation, active.generation);
     });
 
+  for (const legacy of [false, true])
+    check(
+      `retains exact admission when post-claim accounting throws${legacy ? ' and repairs legacy null attention' : ''}`,
+      async (f) => {
+        await f.settleScript();
+        await f.register();
+        f.exitPredecessor();
+        const capacity = f.capacity(),
+          report = capacity.report.bind(capacity);
+        let injected = false;
+        capacity.report = (run) => {
+          if (
+            !injected &&
+            capacity
+              .inspect('host')
+              .entries.some(
+                (entry) => entry.state === 'running' && entry.queue_id.startsWith('continuation:'),
+              )
+          ) {
+            injected = true;
+            throw new Error('Injected accounting failure after committed admission.');
+          }
+          return report(run);
+        };
+        try {
+          const failed = await f.dispatcher().runOnce(f.request);
+          assert.equal(failed.code, 'ADMISSION_UNCERTAIN');
+        } finally {
+          capacity.report = report;
+        }
+        let active = (await f.get()).active!;
+        const invocation = active.dispatch!.invocation!;
+        assert.ok(invocation.execution_token);
+        assert.equal(active.dispatch!.admission_uncertain, true);
+        const fence = { ticket_id: f.ticket.id, generation: active.generation, token: active.token };
+        if (legacy) {
+          await f.storage.transaction(f.project.id, async (tx) => {
+            const row = (await tx.get('wake_conditions', f.ticket.id))!;
+            const { admission_uncertain: _uncertain, ...dispatch } = row.active!.dispatch!;
+            await tx.put('wake_conditions', {
+              ...row,
+              active: {
+                ...row.active!,
+                dispatch: {
+                  ...dispatch,
+                  invocation: null,
+                  code: 'DISPATCH_VALIDATION_FAILED',
+                },
+              },
+              revision: row.revision + 1,
+            });
+          });
+        }
+        await assert.rejects(
+          f.app.finishWakeDecision(f.admin.id, f.project.id, fence),
+          hasCode('WAKE_PENDING'),
+        );
+        const charged = report(f.request.budget_run_id).budget_charged_or_reserved;
+        assert.equal(charged.attempts, 2);
+        assert.equal((await f.restart().runOnce(f.request)).code, 'ADMISSION_UNCERTAIN');
+        active = (await f.get()).active!;
+        assert.deepEqual(active.dispatch!.invocation, invocation);
+        assert.equal(f.calls(), 0);
+        assert.deepEqual(f.capacity().report(f.request.budget_run_id).budget_charged_or_reserved, charged);
+        await assert.rejects(
+          f.app.finishWakeDecision(f.admin.id, f.project.id, fence),
+          hasCode('WAKE_PENDING'),
+        );
+        await f.dispatcher().reconcile(fence, {
+          source: 'independent-fake-supervisor',
+          execution_token: invocation.execution_token,
+          observed_at: Date.now(),
+          state: 'never_started',
+          settlement: {
+            outcome: 'cancelled',
+            runtime_ms: 0,
+            usage_source: 'independent-fake-supervisor',
+            usage: { input_tokens: 0, output_tokens: 0 },
+          },
+        });
+        assert.equal((await f.get()).active!.dispatch!.state, 'completed');
+        assert.equal(f.capacity().inspect('host').occupied.agent, 0);
+      },
+    );
+
   for (const expired of [false, true])
     check(
       `recovers exact admission after ticket rollback with ${expired ? 'expired' : 'current'} worker claim`,
@@ -504,7 +589,16 @@ export function registerContinuationDispatchContractTests(
           f.storage.transaction = transaction;
         }
         const before = (await f.get()).active!;
-        assert.equal(before.dispatch, undefined);
+        assert.equal(before.dispatch!.state, 'waiting');
+        assert.equal(before.dispatch!.admission_uncertain, true);
+        await assert.rejects(
+          f.app.finishWakeDecision(f.admin.id, f.project.id, {
+            ticket_id: f.ticket.id,
+            generation: before.generation,
+            token: before.token,
+          }),
+          hasCode('WAKE_PENDING'),
+        );
         const occupied = f
           .capacity()
           .inspect('host')

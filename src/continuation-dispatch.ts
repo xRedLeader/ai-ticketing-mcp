@@ -151,7 +151,14 @@ export class ContinuationDispatcher {
       (context) => {
         const queue = `continuation:${context.continuation_id}:${decision.generation}`;
         const previous = capacity.inspect(host).entries.find((entry) => entry.queue_id === queue);
-        if (!previous || previous.state === 'queued') return null;
+        if (!previous || previous.state === 'queued') {
+          ensure(
+            !capacity.report(input.budget_run_id).attempts.some((attempt) => attempt.attempt_id === queue),
+            'CONFLICT',
+            'Budget admission requires its exact original host queue.',
+          );
+          return null;
+        }
         ensure(
           ['running', 'reconciling', 'settled'].includes(previous.state) &&
             previous.kind === 'agent' &&
