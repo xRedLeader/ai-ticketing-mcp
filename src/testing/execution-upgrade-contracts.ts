@@ -6,6 +6,34 @@ import { createApplication } from '../application.js';
 import { fixture, type ContractAdapters } from './contracts.js';
 import type { Table } from '../contracts.js';
 
+/** Seed the historical claim shape without requiring the current adapter's optional columns. */
+export async function seedLegacyExecutionClaim(
+  sql: (text: string) => Promise<unknown>,
+  projectId: string,
+  ticketId: string,
+  actorId: string,
+  now: Date,
+) {
+  await assert.rejects(
+    sql('SELECT execution FROM claims LIMIT 0'),
+    (error: any) => error.code === '42703' || /no such column: execution/.test(error.message),
+  );
+  const claim = {
+    id: ticketId,
+    project_id: projectId,
+    ticket_id: ticketId,
+    actor_id: actorId,
+    token: randomUUID(),
+    expires_at: new Date(now.getTime() + 600000).toISOString(),
+  };
+  const literal = (value: string) => `'${value.replaceAll("'", "''")}'`;
+  await sql(
+    `INSERT INTO claims(id,project_id,ticket_id,actor_id,token,expires_at) VALUES(${Object.values(claim).map(literal).join(',')})`,
+  );
+  await sql(`UPDATE tickets SET status='in_progress',revision=revision+1 WHERE id=${literal(ticketId)}`);
+  return { claim };
+}
+
 export function registerExecutionUpgradeContractTests(
   name: string,
   dialect: 'sqlite' | 'postgres',
@@ -30,6 +58,7 @@ export function registerExecutionUpgradeContractTests(
               !file.includes('memory_validity') &&
               !file.includes('execution_control') &&
               !file.includes('durable_wakes') &&
+              !file.includes('client_capabilities') &&
               (history === 'main'
                 ? !file.includes('project_memory') && !file.includes('execution_runs')
                 : !file.includes('review_fixes')),
@@ -41,7 +70,13 @@ export function registerExecutionUpgradeContractTests(
         }
         const f = await fixture(adapters),
           ticket = await f.ticket(),
-          claim = await f.claim(ticket.id);
+          claim = await seedLegacyExecutionClaim(
+            adapters.sql,
+            f.project.id,
+            ticket.id,
+            f.worker.id,
+            f.clock.now,
+          );
         await f.call(f.worker.id, 'ticket_checkpoint', {
           ticket_id: ticket.id,
           claim_token: claim.claim.token,
@@ -74,6 +109,7 @@ export function registerExecutionUpgradeContractTests(
         const before = await snapshot();
         await f.storage.migrate();
         await f.storage.migrate();
+        await adapters.sql('SELECT execution FROM claims LIMIT 0');
         assert.deepEqual(await snapshot(), before);
         assert.equal((await f.storage.get('execution_controllers', 'execution'))?.owner_id, 'unclaimed');
         assert.deepEqual(await f.storage.find('execution_attempts'), []);
