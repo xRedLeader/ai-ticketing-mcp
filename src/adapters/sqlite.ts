@@ -25,6 +25,7 @@ import {
   type SchedulingPolicy,
 } from '../contracts.js';
 import { MAX_INDEX_JOB_ATTEMPTS } from './index-job-policy.js';
+import { artifactPinSql } from './artifact-pins.js';
 
 const knowledgeColumns = [
   'id',
@@ -44,6 +45,21 @@ const knowledgeColumns = [
   'updated_at',
 ];
 const columns: Record<Table, string[]> = {
+  artifact_retirements: [
+    'id',
+    'project_id',
+    'run_id',
+    'attempt_id',
+    'ticket_id',
+    'checkpoint_id',
+    'actor_id',
+    'requested_at',
+    'expires_at',
+    'size_bytes',
+    'sha256',
+    'root_identity',
+    'file_identity',
+  ],
   execution_admissions: ['id', 'paused', 'actor_id', 'updated_at'],
   execution_cancellations: [
     'id',
@@ -348,6 +364,17 @@ function repository(db: DatabaseSync): Transaction {
     return `"${key}"`;
   };
   return {
+    async lockArtifactReferences() {
+      // The caller's BEGIN IMMEDIATE already serializes reference writes and physical reads.
+    },
+    async artifactPinned(query) {
+      const values: string[] = [];
+      const sql = artifactPinSql(query, (value) => {
+        values.push(value);
+        return '?';
+      });
+      return (db.prepare(sql).get(...values) as { pinned: number }).pinned === 1;
+    },
     async lockExecutionController() {
       return await this.get('execution_controllers', 'execution');
     },
@@ -472,6 +499,7 @@ function repository(db: DatabaseSync): Transaction {
         'A record ID is required.',
       );
       const conflict =
+        table === 'artifact_retirements' ||
         table === 'github_evidence' ||
         table === 'outbound_deliveries' ||
         table === 'knowledge_revisions' ||
@@ -496,6 +524,7 @@ function repository(db: DatabaseSync): Transaction {
       );
       ensure(
         ![
+          'artifact_retirements',
           'execution_jobs',
           'continuations',
           'execution_attempts',
@@ -622,6 +651,7 @@ class Handle {
   }
 }
 class SqliteStorage extends Handle implements StorageAdapter {
+  readonly artifactRetention = true as const;
   readonly wakeDecisions = true;
   readonly executionRuns = true as const;
   get executionLaunchStorage() {

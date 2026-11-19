@@ -37,6 +37,7 @@ import {
   type ExecutionProcessIdentity,
   type ExecutionReconciliation,
   type ExecutionCancellation,
+  type ArtifactRetirement,
   type ExecutionStatusProvider,
   type Continuation,
   validateGitHubConfiguration,
@@ -71,6 +72,20 @@ export interface ApplicationOptions {
 }
 const LEASE_MS = 600_000;
 const resumeChangeTypes = ['ticket.updated', 'ticket.invalidated', 'ticket.transitioned', 'ticket.linked'];
+const artifactPinWriters = new Set<Operation>([
+  'project_create',
+  'project_update',
+  'tickets_create',
+  'ticket_update',
+  'ticket_transition',
+  'ticket_note',
+  'ticket_checkpoint',
+  'ticket_submit',
+  'ticket_review',
+  'knowledge_write',
+  'work_claim',
+  'run_submit',
+]);
 const webhookEvents = new Set([
   'ticket.created',
   'ticket.updated',
@@ -504,6 +519,14 @@ export class Application {
       if (!project) ensure(actor.system_admin, 'FORBIDDEN', 'System administrator access is required.');
       if (operation === 'knowledge_promote')
         await this.access(tx, actor, input.source_project_id!, ['admin']);
+      if (this.storage.artifactRetention && artifactPinWriters.has(operation)) {
+        ensure(
+          tx.lockArtifactReferences,
+          'UNSUPPORTED_ARTIFACT_RETENTION',
+          'Storage must serialize artifact references.',
+        );
+        await tx.lockArtifactReferences();
+      }
       const receiptId = digest([actor.id, scope, operation, input.idempotency_key]);
       const hash = digest(input);
       const previous = await tx.get('receipts', receiptId);
@@ -563,6 +586,44 @@ export class Application {
             { committed: true, receipt_id: previous.id, operation },
           );
         }
+      }
+      if (this.storage.artifactRetention && artifactPinWriters.has(operation)) {
+        const ids = [
+          ...new Set(
+            JSON.stringify({
+              ...input,
+              project_id: undefined,
+              ticket_id: undefined,
+              claim_token: undefined,
+              idempotency_key: undefined,
+              expected_revision: undefined,
+              knowledge_id: undefined,
+            })
+              .toLowerCase()
+              .match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g) ?? [],
+          ),
+        ];
+        ensure(ids.length <= 1000, 'INVALID_INPUT', 'Too many artifact reference identities.');
+        if (ids.length)
+          for (const field of ['run_id', 'attempt_id'] as const)
+            ensure(
+              !(await tx.find('artifact_retirements', { where: { [field]: { in: ids } }, limit: 1 })).length,
+              'ARTIFACT_RETIRED',
+              'Referenced execution logs have been retired; retrieve current evidence.',
+            );
+        if (operation === 'knowledge_write')
+          for (const source of (input as Input<'knowledge_write'>).sources ?? [])
+            if (source.kind === 'ticket' || source.kind === 'checkpoint')
+              ensure(
+                !(
+                  await tx.find('artifact_retirements', {
+                    where: { [source.kind === 'ticket' ? 'ticket_id' : 'checkpoint_id']: source.id },
+                    limit: 1,
+                  })
+                ).length,
+                'ARTIFACT_RETIRED',
+                'Memory sources cannot pin retired execution logs.',
+              );
       }
       const result = this.result(operation, await work(tx, project!, actor));
       if (operation === 'work_claim') {
@@ -859,6 +920,133 @@ export class Application {
     );
     return new Date(this.now().getTime() + leaseMs).toISOString();
   }
+  /** Trusted operator only; retirement decisions commit before any filesystem deletion. */
+  async retireExecutionArtifact(actorId: string, projectId: string, artifactId: string) {
+    const identity = artifactIdentity.exec(artifactId);
+    ensure(
+      uuid.test(projectId) && identity && identity[3] !== 'result',
+      'INVALID_INPUT',
+      'Provide an exact stdout/stderr artifact identity. Journals and temporary files are protected.',
+    );
+    ensure(
+      this.storage.artifactRetention && this.executionArtifacts,
+      'UNSUPPORTED_ARTIFACT_RETENTION',
+      'Configure artifact retention storage and the owned artifact root.',
+    );
+    const artifacts = this.executionArtifacts;
+    const inspect = async (tx: Transaction) => {
+      const actor = await this.actor(actorId, tx);
+      const project = await this.access(tx, actor, projectId, ['admin']);
+      ensure(
+        tx.lockArtifactReferences && tx.artifactPinned,
+        'UNSUPPORTED_ARTIFACT_RETENTION',
+        'Storage must serialize retention and reference checks.',
+      );
+      await tx.lockArtifactReferences(true);
+      const run = await tx.get('execution_jobs', identity[1]!);
+      const attempt = await tx.get('execution_attempts', identity[2]!);
+      ensure(
+        run?.project_id === projectId &&
+          attempt?.project_id === projectId &&
+          attempt.run_id === run.id &&
+          run.artifacts.includes(artifactId),
+        'INVALID_REFERENCE',
+        'Artifact is not published by this project execution attempt.',
+      );
+      const state = await this.executionReconciliation(tx, run);
+      ensure(
+        state.state === 'completed' && run.finished_at && Date.parse(run.finished_at) <= this.now().getTime(),
+        'ARTIFACT_PINNED',
+        'Active or unresolved execution artifacts cannot be retired.',
+      );
+      const authority = {
+        run_id: run.id,
+        attempt_id: attempt.id,
+        process_token: attempt.process_token,
+        recipe_fingerprint: run.recipe_fingerprint,
+        exit_code: run.exit_code,
+        signal: run.signal,
+        error_code: run.error_code,
+      };
+      return { actor, project, run, authority, settledAt: Date.parse(run.finished_at) };
+    };
+    const decision = await this.storage.transaction(projectId, async (tx) => {
+      const state = await inspect(tx);
+      const previous = await tx.get('artifact_retirements', artifactId);
+      if (previous) return previous;
+      ensure(
+        !(await tx.artifactPinned!({
+          run_id: state.run.id,
+          attempt_id: identity[2]!,
+          ticket_id: state.run.ticket_id,
+          checkpoint_id: state.run.checkpoint_id,
+        })),
+        'ARTIFACT_PINNED',
+        'Stored work, evidence, receipts or memory still references this execution.',
+      );
+      const proof = artifacts.inspectRetirement(
+        artifactId,
+        state.authority,
+        state.settledAt,
+        this.now().getTime(),
+      );
+      const record: ArtifactRetirement = {
+        id: artifactId,
+        project_id: projectId,
+        run_id: state.run.id,
+        attempt_id: identity[2]!,
+        ticket_id: state.run.ticket_id,
+        checkpoint_id: state.run.checkpoint_id,
+        actor_id: actorId,
+        requested_at: this.timestamp(),
+        ...proof,
+      };
+      await tx.put('artifact_retirements', record);
+      await this.event(tx, state.project, state.actor, 'artifact.retired', artifactId, {
+        artifact_id: artifactId,
+        size_bytes: record.size_bytes,
+        sha256: record.sha256,
+      });
+      return record;
+    });
+    return this.storage.transaction(projectId, async (tx) => {
+      const state = await inspect(tx);
+      ensure(
+        !(await tx.artifactPinned!({
+          run_id: state.run.id,
+          attempt_id: identity[2]!,
+          ticket_id: state.run.ticket_id,
+          checkpoint_id: state.run.checkpoint_id,
+        })),
+        'ARTIFACT_PINNED',
+        'Execution acquired a reference after retirement; physical deletion is blocked.',
+      );
+      const removed = artifacts.unlinkRetired(
+        decision,
+        state.authority,
+        state.settledAt,
+        this.now().getTime(),
+      );
+      const [event] = await tx.find('events', {
+        where: { project_id: projectId, type: 'artifact.deleted', entity_id: artifactId },
+        limit: 1,
+      });
+      if (!event)
+        await this.event(tx, state.project, state.actor, 'artifact.deleted', artifactId, {
+          artifact_id: artifactId,
+          size_bytes: decision.size_bytes,
+          sha256: decision.sha256,
+        });
+      return {
+        artifact_id: artifactId,
+        status: 'expired' as const,
+        removed,
+        expires_at: decision.expires_at,
+        size_bytes: decision.size_bytes,
+        sha256: decision.sha256,
+      };
+    });
+  }
   async setExecutionAdmissions(actorId: string, projectId: string, paused: boolean) {
     ensure(typeof paused === 'boolean', 'INVALID_INPUT', 'Provide a boolean admission state.');
     return this.storage.transaction(projectId, async (tx) => {
@@ -928,6 +1116,14 @@ export class Application {
       'Provide bounded external-effect reconciliation evidence.',
     );
     return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (this.storage.artifactRetention) {
+        ensure(
+          tx.lockArtifactReferences,
+          'UNSUPPORTED_ARTIFACT_RETENTION',
+          'Storage must serialize reconciliation evidence.',
+        );
+        await tx.lockArtifactReferences();
+      }
       await tx.lockExecutionController!();
       const cancellation = await tx.get('execution_cancellations', runId);
       ensure(cancellation, 'INVALID_REFERENCE', 'Request cancellation before reconciliation.');
@@ -945,6 +1141,20 @@ export class Application {
         'CONFLICT',
         'Confirm execution exit before reconciling external effects.',
       );
+      if (this.storage.artifactRetention) {
+        const ids = [
+          ...new Set(
+            note.toLowerCase().match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g) ?? [],
+          ),
+        ];
+        if (ids.length)
+          for (const field of ['run_id', 'attempt_id'] as const)
+            ensure(
+              !(await tx.find('artifact_retirements', { where: { [field]: { in: ids } }, limit: 1 })).length,
+              'ARTIFACT_RETIRED',
+              'Reconciliation evidence cannot cite retired execution logs.',
+            );
+      }
       const next: ExecutionCancellation = {
         ...cancellation,
         effects_state: 'reconciled',
@@ -2931,6 +3141,15 @@ export class Application {
       'INVALID_REFERENCE',
       'Artifact is not published by this execution attempt.',
     );
+    if (this.storage.artifactRetention) {
+      const retired = await reader.get('artifact_retirements', artifactId);
+      if (retired)
+        return {
+          ...unavailableArtifact(artifactId, offset, length, 'expired', retired.expires_at),
+          size_bytes: retired.size_bytes,
+          sha256: retired.sha256,
+        };
+    }
     return this.executionArtifacts
       ? this.executionArtifacts.read(
           artifactId,
@@ -3026,6 +3245,18 @@ export class Application {
         : {}),
     };
   }
+  private async artifactSnapshot<T>(projectId: string, work: (reader: Reader) => Promise<T>) {
+    if (!this.storage.artifactRetention) return this.storage.readSnapshot(work);
+    return this.storage.transaction(projectId, async (tx) => {
+      ensure(
+        tx.lockArtifactReferences,
+        'UNSUPPORTED_ARTIFACT_RETENTION',
+        'Storage must serialize artifact retrieval.',
+      );
+      await tx.lockArtifactReferences();
+      return work(tx);
+    });
+  }
   private async read(actorId: string, operation: Operation, input: any): Promise<unknown> {
     if (operation === 'run_wait') {
       const deadline = performance.now() + input.timeout_ms;
@@ -3069,7 +3300,7 @@ export class Application {
         };
       });
     if (operation === 'artifact_read')
-      return this.storage.readSnapshot(async (reader) => {
+      return this.artifactSnapshot(input.project_id, async (reader) => {
         await this.access(reader, await this.actor(actorId, reader), input.project_id);
         const artifact = await this.readArtifact(
           reader,
@@ -3082,7 +3313,7 @@ export class Application {
       });
     if (operation === 'run_timeline') return this.executionTimeline(actorId, input);
     if (operation === 'run_get')
-      return this.storage.readSnapshot(async (reader) => {
+      return this.artifactSnapshot(input.project_id, async (reader) => {
         await this.access(reader, await this.actor(actorId, reader), input.project_id);
         ensure(
           this.storage.executionRuns,

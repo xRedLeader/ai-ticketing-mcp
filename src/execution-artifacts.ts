@@ -1,8 +1,17 @@
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+  unlinkSync,
+} from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { z } from 'zod';
-import { ensure } from './contracts.js';
+import { ensure, type ArtifactRetirement } from './contracts.js';
 
 const uuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 export const artifactIdentity = new RegExp(`^execution:(${uuid}):(${uuid}):(stdout|stderr|result)$`);
@@ -40,6 +49,10 @@ export interface ArtifactAuthority {
   process_token: string;
   recipe_fingerprint: string;
 }
+type RetentionProof = Pick<
+  ArtifactRetirement,
+  'expires_at' | 'size_bytes' | 'sha256' | 'root_identity' | 'file_identity'
+>;
 
 /** Only canonical, authorized execution identities reach this private filesystem boundary. */
 export class ExecutionArtifacts {
@@ -94,13 +107,155 @@ export class ExecutionArtifacts {
         'INVALID_ARTIFACT',
         'Artifact is not a private regular file.',
       );
-      return { fd, size: info.size };
+      return { fd, size: info.size, path };
     } catch (error) {
       closeSync(fd);
       throw error;
     }
   }
 
+  private retentionJournal(artifactId: string, authority: ArtifactAuthority, settledAt: number, now: number) {
+    const identity = artifactIdentity.exec(artifactId);
+    ensure(
+      identity &&
+        identity[3] !== 'result' &&
+        identity[1] === authority.run_id &&
+        identity[2] === authority.attempt_id,
+      'INVALID_REFERENCE',
+      'Only an exact published stdout/stderr log can be retired.',
+    );
+    const journal = this.open(identity[1]!, identity[2]!, 'result.json');
+    let metadata: any;
+    try {
+      ensure(
+        journal.size <= MAX_ARTIFACT_RANGE_BYTES,
+        'INVALID_ARTIFACT',
+        'Artifact result journal is too large.',
+      );
+      const bytes = Buffer.alloc(journal.size);
+      ensure(
+        readSync(journal.fd, bytes, 0, bytes.length, 0) === bytes.length,
+        'INVALID_ARTIFACT',
+        'Artifact result journal is incomplete.',
+      );
+      metadata = JSON.parse(bytes.toString('utf8'));
+    } finally {
+      closeSync(journal.fd);
+    }
+    ensure(
+      Object.entries(authority).every(([key, value]) => metadata[key] === value) &&
+        metadata.cleanup_verified === true &&
+        Number.isSafeInteger(metadata.finished_at) &&
+        metadata.finished_at > 0 &&
+        Number.isFinite(settledAt) &&
+        metadata.finished_at <= settledAt &&
+        settledAt + this.ttlMs <= now,
+      'ARTIFACT_NOT_EXPIRED',
+      'Retirement requires a verified terminal journal and expired durable settlement.',
+    );
+    ensure(
+      !lstatSync(this.directory).isSymbolicLink(),
+      'INVALID_ARTIFACT',
+      'Artifact root links are not allowed.',
+    );
+    const root = realpathSync(this.directory),
+      info = lstatSync(root, { bigint: true });
+    ensure(info.isDirectory() && info.ino > 0n, 'INVALID_ARTIFACT', 'Artifact root identity is unavailable.');
+    return {
+      identity,
+      metadata,
+      root_identity: hash(
+        Buffer.from(JSON.stringify([root, String(info.dev), String(info.ino), String(info.birthtimeNs)])),
+      ),
+      expires_at: new Date(settledAt + this.ttlMs).toISOString(),
+    };
+  }
+  inspectRetirement(
+    artifactId: string,
+    authority: ArtifactAuthority,
+    settledAt: number,
+    now: number,
+  ): RetentionProof {
+    const journal = this.retentionJournal(artifactId, authority, settledAt, now);
+    const name = journal.identity[3]!;
+    const file = this.open(authority.run_id, authority.attempt_id, `${name}.log`);
+    try {
+      ensure(
+        file.size <= 16 * 1024 * 1024 && journal.metadata.bytes?.[name] === file.size,
+        'INVALID_ARTIFACT',
+        'Retirement requires an unchanged bounded capture.',
+      );
+      const digest = createHash('sha256'),
+        bytes = Buffer.alloc(MAX_ARTIFACT_RANGE_BYTES);
+      for (let position = 0; position < file.size;) {
+        const read = readSync(file.fd, bytes, 0, Math.min(bytes.length, file.size - position), position);
+        ensure(read > 0, 'INVALID_ARTIFACT', 'Artifact changed during inspection.');
+        digest.update(bytes.subarray(0, read));
+        position += read;
+      }
+      const sha256 = digest.digest('hex');
+      ensure(
+        sha256 === journal.metadata.sha256?.[name],
+        'INVALID_ARTIFACT',
+        'Retirement requires the trusted capture hash.',
+      );
+      const info = fstatSync(file.fd, { bigint: true });
+      ensure(info.ino > 0n, 'INVALID_ARTIFACT', 'Artifact file identity is unavailable.');
+      return {
+        expires_at: journal.expires_at,
+        root_identity: journal.root_identity,
+        size_bytes: file.size,
+        sha256,
+        file_identity: JSON.stringify([
+          String(info.dev),
+          String(info.ino),
+          String(info.size),
+          String(info.mtimeNs),
+          String(info.birthtimeNs),
+        ]),
+      };
+    } finally {
+      closeSync(file.fd);
+    }
+  }
+  unlinkRetired(decision: ArtifactRetirement, authority: ArtifactAuthority, settledAt: number, now: number) {
+    const journal = this.retentionJournal(decision.id, authority, settledAt, now);
+    ensure(
+      journal.root_identity === decision.root_identity && journal.expires_at === decision.expires_at,
+      'INVALID_ARTIFACT',
+      'Retirement ownership changed.',
+    );
+    try {
+      const proof = this.inspectRetirement(decision.id, authority, settledAt, now);
+      ensure(
+        Object.entries(proof).every(([key, value]) => decision[key as keyof RetentionProof] === value),
+        'INVALID_ARTIFACT',
+        'Retirement file identity changed.',
+      );
+      const file = this.open(authority.run_id, authority.attempt_id, `${journal.identity[3]}.log`);
+      try {
+        const info = fstatSync(file.fd, { bigint: true });
+        ensure(
+          JSON.stringify([
+            String(info.dev),
+            String(info.ino),
+            String(info.size),
+            String(info.mtimeNs),
+            String(info.birthtimeNs),
+          ]) === decision.file_identity,
+          'INVALID_ARTIFACT',
+          'Retirement file changed before deletion.',
+        );
+        unlinkSync(file.path);
+      } finally {
+        closeSync(file.fd);
+      }
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+  }
   read(
     artifactId: string,
     authority: ArtifactAuthority,

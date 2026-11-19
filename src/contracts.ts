@@ -248,6 +248,27 @@ export interface ExecutionOutcome {
   artifacts: string[];
   error_code: string | null;
 }
+export interface ArtifactRetirement {
+  id: string;
+  project_id: string;
+  run_id: string;
+  attempt_id: string;
+  ticket_id: string;
+  checkpoint_id: string;
+  actor_id: string;
+  requested_at: string;
+  expires_at: string;
+  size_bytes: number;
+  sha256: string;
+  root_identity: string;
+  file_identity: string;
+}
+export interface ArtifactPinQuery {
+  run_id: string;
+  attempt_id: string;
+  ticket_id: string;
+  checkpoint_id: string;
+}
 export interface ExecutionJob extends ExecutionOutcome {
   id: string;
   project_id: string;
@@ -434,6 +455,7 @@ export interface WebhookTarget {
   send(delivery: OutboundDelivery): Promise<{ error_code: string } | undefined>;
 }
 export interface Tables {
+  artifact_retirements: ArtifactRetirement;
   execution_admissions: ExecutionAdmission;
   execution_cancellations: ExecutionCancellation;
   wake_conditions: WakeRegistration;
@@ -492,6 +514,10 @@ export interface Reader {
   find<K extends Table>(table: K, query?: Query<Tables[K]>): Promise<Tables[K][]>;
 }
 export interface Transaction extends Reader {
+  /** Serialize only reference writers/retrieval (shared) with operator retirement (exclusive). */
+  lockArtifactReferences?(exclusive?: boolean): Promise<void>;
+  /** Exact live-work and conservative stored evidence/memory reference checks, without materialization. */
+  artifactPinned?(query: ArtifactPinQuery): Promise<boolean>;
   /** Locks the store-wide controller until transaction commit, including on PostgreSQL. */
   lockExecutionController?(): Promise<ExecutionController | null>;
   /** Optional durable execution capability; updates only the exact prior ownership/state. */
@@ -500,6 +526,7 @@ export interface Transaction extends Reader {
   remove<K extends Table>(table: K, id: string): Promise<void>;
 }
 export interface StorageAdapter extends Reader {
+  readonly artifactRetention?: true;
   readonly wakeDecisions?: true;
   readonly executionRuns?: true;
   /** Private bootstrap for a detached supervisor connected to this same physical store. */

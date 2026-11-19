@@ -230,3 +230,7 @@ For manual investigation, fence the old controller, inspect exact authorized run
 Stop the MCP runtime/worker and companion, take a consistent backup including SQLite WAL state, migrate with schema-owner privileges, rebuild, then restart and reconnect clients. Do not hot-reload this stack into an old process: the earlier project-memory migration rebuilds a SQLite table, and new adapters require the recovery schema.
 
 Migration identity is the complete filename in `schema_migrations`, not a unique numeric prefix. Preserve the accepted `013_project_memory.sql` / `014_execution_runs.sql` (SQLite `005_project_memory.sql` / `006_execution_runs.sql`) alongside main's independent `013_review_fixes.sql` (SQLite `005_review_fixes.sql`). Their exact names and bytes are retained so either already-applied history upgrades once without replaying ALTERs or losing data. Recovery appends PostgreSQL `015_execution_recovery.sql` and SQLite `007_execution_recovery.sql`. Operator controls append PostgreSQL `016_execution_control.sql` and SQLite `008_execution_control.sql`. Both adapters test main-first and accepted-stack-first upgrade histories, preserving existing tickets, claims, checkpoints, receipts and runs.
+
+## Explicit artifact retention
+
+See [operator artifact retention](artifact-retention.md) to retire an exact expired, unreferenced terminal stdout/stderr capture. Retirement preserves authoritative outcomes, private recovery journals and durable audit/receipt records. It is never automatic or model-controlled.

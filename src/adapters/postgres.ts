@@ -22,6 +22,7 @@ import {
   type SchedulingPolicy,
 } from '../contracts.js';
 import { MAX_INDEX_JOB_ATTEMPTS } from './index-job-policy.js';
+import { artifactPinSql } from './artifact-pins.js';
 
 const knowledgeColumns = [
   'id',
@@ -41,6 +42,21 @@ const knowledgeColumns = [
   'updated_at',
 ];
 const columns: Record<Table, string[]> = {
+  artifact_retirements: [
+    'id',
+    'project_id',
+    'run_id',
+    'attempt_id',
+    'ticket_id',
+    'checkpoint_id',
+    'actor_id',
+    'requested_at',
+    'expires_at',
+    'size_bytes',
+    'sha256',
+    'root_identity',
+    'file_identity',
+  ],
   execution_admissions: ['id', 'paused', 'actor_id', 'updated_at'],
   execution_cancellations: [
     'id',
@@ -319,6 +335,19 @@ function repository(db: Executor): Transaction {
     return `"${key}"`;
   };
   return {
+    async lockArtifactReferences(exclusive = false) {
+      await db.query(
+        `SELECT ${exclusive ? 'pg_advisory_xact_lock' : 'pg_advisory_xact_lock_shared'}(71402912)`,
+      );
+    },
+    async artifactPinned(query) {
+      const values: string[] = [];
+      const sql = artifactPinSql(query, (value) => {
+        values.push(value);
+        return `$${values.length}`;
+      });
+      return (await db.query(sql, values)).rows[0].pinned === true;
+    },
     async lockExecutionController() {
       const result = await db.query("SELECT * FROM execution_controllers WHERE id='execution' FOR UPDATE");
       return result.rows[0] ? (decode(result.rows[0]) as unknown as Tables['execution_controllers']) : null;
@@ -450,6 +479,7 @@ function repository(db: Executor): Transaction {
       const values = keys.map((key) => (jsonColumns.has(key) ? JSON.stringify(record[key]) : record[key]));
       const names = keys.map((key) => field(table, key));
       const conflict =
+        table === 'artifact_retirements' ||
         table === 'github_evidence' ||
         table === 'outbound_deliveries' ||
         table === 'knowledge_revisions' ||
@@ -475,6 +505,7 @@ function repository(db: Executor): Transaction {
       );
       ensure(
         ![
+          'artifact_retirements',
           'execution_jobs',
           'continuations',
           'execution_attempts',
@@ -499,6 +530,7 @@ function repository(db: Executor): Transaction {
 }
 
 export class PostgresStorage implements StorageAdapter {
+  readonly artifactRetention = true as const;
   readonly wakeDecisions = true;
   readonly executionRuns = true as const;
   readonly executionLaunchStorage;
