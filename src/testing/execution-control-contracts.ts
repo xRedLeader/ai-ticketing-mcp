@@ -166,6 +166,16 @@ export function registerExecutionControlContractTests(
     const after = await f.view();
     assert.equal(after.run.error_code, 'CANCELLED_NOT_STARTED');
     assert.equal(after.continuation.status, 'failed');
+    const [settlement, duplicate] = await f.storage.find('events', {
+      where: { project_id: project, entity_id: before.run.ticket_id, type: 'run.settled' },
+    });
+    assert.equal(duplicate, undefined);
+    assert.deepEqual(settlement?.data, {
+      run_id: f.runId,
+      continuation_id: after.continuation.id,
+      status: 'failed',
+      code: 'CANCELLED_NOT_STARTED',
+    });
     assert.deepEqual(after.checkpoint, before.checkpoint);
     assert.ok(await f.storage.get('claims', before.run.ticket_id));
     assert.equal((await f.state()).attempt, null);
