@@ -248,7 +248,9 @@ export async function claimWake(
   ensure(input.expected_generation === row.generation, 'VERSION_CONFLICT', 'Wake generation changed.');
   if (row.active || !row.pending.length) return null;
   const caughtUp = row.cursor === project.event_seq;
-  const reasons = caughtUp ? row.pending : row.pending.filter((reason) => reason.kind !== 'event');
+  const reasons = caughtUp
+    ? row.pending
+    : row.pending.filter((reason) => reason.kind !== 'event' || reason.code === 'run.settled');
   if (!reasons.length) return null;
   ensure(row.generation < 2147483647, 'CONFLICT', 'Wake generation exhausted.');
   const active: WakeDecision = {
@@ -262,7 +264,7 @@ export async function claimWake(
     ...row,
     generation: active.generation,
     active,
-    pending: caughtUp ? [] : row.pending.filter((reason) => reason.kind === 'event'),
+    pending: caughtUp ? [] : row.pending.filter((reason) => !reasons.includes(reason)),
     revision: row.revision + 1,
     updated_at: now,
   });

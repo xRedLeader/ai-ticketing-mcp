@@ -307,6 +307,86 @@ export function registerWakeContractTests(
         );
       },
     );
+  for (const exit_code of [0, 1])
+    check(
+      `claims a run.settled selector for ${exit_code ? 'TIMEOUT' : 'satisfaction'} during unrelated traffic without releasing partial bursts`,
+      async (f) => {
+        const app = createApplication({
+          storage: f.storage,
+          search: f.search,
+          now: () => f.clock.now,
+          executionRecipes: [{ id: 'validation', fingerprint: 'a'.repeat(64), project_ids: [f.project.id] }],
+        });
+        const claim = await f.claim(f.target.id);
+        const receipt = (await app.execute(f.worker.id, 'run_submit', {
+          project_id: f.project.id,
+          ticket_id: f.target.id,
+          claim_token: claim.claim.token,
+          recipe_id: 'validation',
+          idempotency_key: randomUUID(),
+          checkpoint: { progress: 'Waiting for validation.' },
+          completion_condition: { kind: 'exit_code', exit_code: 0 },
+        })) as any;
+        await f.register({ condition: { kind: 'events', types: ['run.settled', 'ticket.note_added'] } });
+        await f.note();
+        const reserved = (await app.reserveExecutionRun(f.admin.id, f.project.id, receipt.run_id, 60_000))!;
+        await app.startExecutionRun(
+          f.admin.id,
+          f.project.id,
+          reserved.id,
+          reserved.reservation_token!,
+          60_000,
+        );
+        assert.equal(
+          await app.settleExecutionRun(f.admin.id, f.project.id, reserved.id, reserved.reservation_token!, {
+            exit_code,
+            signal: null,
+            artifacts: ['private-result-content'],
+            error_code: exit_code ? 'TIMEOUT' : null,
+          }),
+          true,
+        );
+        await f.note();
+        assert.equal((await f.evaluate({ event_limit: 2 })).events, 2);
+        const observedCursor = (await f.get()).cursor;
+        await f.append('ticket.updated', { revision: 1 }, randomUUID());
+        const urgent = await f.claimWake();
+        assert.ok(urgent, 'A terminal run.settled selector must not wait for unrelated traffic.');
+        const terminalEvent = (
+          await f.storage.find('events', { where: { project_id: f.project.id, type: 'run.settled' } })
+        )[0]!;
+        assert.equal(terminalEvent.data.code, exit_code ? 'TIMEOUT' : 'CONTINUATION_SATISFIED');
+        assert.deepEqual(urgent.reasons, [
+          {
+            kind: 'event',
+            code: 'run.settled',
+            first_seq: terminalEvent.seq,
+            last_seq: terminalEvent.seq,
+            count: 1,
+          },
+        ]);
+        assert.equal(urgent.through_cursor, observedCursor);
+        assert.equal(JSON.stringify(urgent).includes('private-result-content'), false);
+        assert.equal(JSON.stringify(urgent).includes('TIMEOUT'), false);
+        const pending = (await f.get()).pending;
+        assert.equal(pending.length, 1);
+        assert.equal(pending[0]!.kind === 'event' && pending[0]!.code, 'ticket.note_added');
+        assert.equal(pending[0]!.kind === 'event' && pending[0]!.count, 1);
+        await f.evaluate({ event_limit: 1 });
+        await f.append('ticket.updated', { revision: 2 }, randomUUID());
+        assert.equal(await f.claimWake(1), null);
+        assert.equal(await f.finish(urgent), true);
+        assert.equal(await f.claimWake(1), null);
+        await f.drain();
+        const burst = (await f.claimWake(1))!;
+        assert.equal(burst.generation, 2);
+        assert.equal(burst.reasons.length, 1);
+        assert.equal(burst.reasons[0]!.kind === 'event' && burst.reasons[0]!.code, 'ticket.note_added');
+        assert.equal(burst.reasons[0]!.kind === 'event' && burst.reasons[0]!.count, 2);
+        assert.equal(await f.finish(urgent), false);
+        assert.equal(await f.finish(burst), true);
+      },
+    );
   check(
     'claims a latched deadline during unrelated traffic while preserving partially collected event bursts',
     async (f) => {
