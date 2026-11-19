@@ -53,6 +53,7 @@ export interface ExecutionCompanionOptions {
 }
 const LEASE_MS = 60_000;
 type ResultJournal = ExecutionOutcome & {
+  capacity?: HostCapacityNeverStartedProof | null;
   note?: string;
   run_id: string;
   attempt_id?: string;
@@ -455,7 +456,18 @@ export class ExecutionCompanion {
   private result(state: ExecutionReconciliation, directory: string): ResultJournal | null {
     for (const name of ['operator-reconciliation.json', 'termination.json', 'result.json']) {
       const result = this.journal(directory, name);
-      if (this.matches(state, result) && this.validResult(result)) return result;
+      if (
+        name === 'operator-reconciliation.json' &&
+        (result?.cleanup_verified !== true ||
+          result.process_exit_confirmed !== true ||
+          result.effects_reconciled !== true ||
+          result.source !== 'operator_external_execution_exit')
+      )
+        continue;
+      if (this.matches(state, result) && this.validResult(result))
+        return name === 'operator-reconciliation.json'
+          ? { ...result, capacity: result.capacity ?? null }
+          : result;
     }
     return null;
   }
@@ -697,7 +709,10 @@ export class ExecutionCompanion {
   }
   private releaseCapacity(
     runId: string,
-    result: Pick<ResultJournal, 'started_at' | 'finished_at' | 'exit_code' | 'error_code' | 'spawned'>,
+    result: Pick<
+      ResultJournal,
+      'started_at' | 'finished_at' | 'exit_code' | 'error_code' | 'spawned' | 'capacity'
+    >,
   ) {
     const { capacity, host_id: host } = this.options;
     const entry = capacity.inspect(host).entries.find((entry) => entry.queue_id === runId);
@@ -707,6 +722,20 @@ export class ExecutionCompanion {
       entry.run_id !== runId ||
       entry.project_id !== this.options.project_id ||
       !['running', 'reconciling'].includes(entry.state)
+    )
+      return;
+    if (
+      result.capacity !== undefined &&
+      (!result.capacity ||
+        result.capacity.host_id !== host ||
+        result.capacity.queue_id !== runId ||
+        result.capacity.run_id !== entry.run_id ||
+        result.capacity.project_id !== entry.project_id ||
+        result.capacity.execution_token !== entry.execution_token ||
+        !(
+          result.capacity.state === entry.state ||
+          (result.capacity.state === 'running' && entry.state === 'reconciling')
+        ))
     )
       return;
     const takeover = capacity.takeOver(host, runId, entry.lease.generation, this.owner);
@@ -767,6 +796,28 @@ export class ExecutionCompanion {
           'CONFLICT',
           'Existing terminal outcome differs from the supplied external evidence.',
         );
+      if (state.attempt && ['succeeded', 'failed'].includes(state.run.status)) {
+        const filename = join(this.directory, runId, state.attempt.id, 'operator-reconciliation.json');
+        if (existsSync(filename)) {
+          const proof = this.journal(
+            join(this.directory, runId, state.attempt.id),
+            'operator-reconciliation.json',
+          );
+          ensure(
+            this.matches(state, proof) &&
+              proof.cleanup_verified === true &&
+              proof.process_exit_confirmed === true &&
+              proof.effects_reconciled === true &&
+              proof.source === 'operator_external_execution_exit' &&
+              this.validResult(proof) &&
+              JSON.stringify(this.outcome(proof)) === JSON.stringify(this.outcome(state.run)) &&
+              proof.note === evidence.note,
+            'CONFLICT',
+            'Existing operator evidence differs; preserve it for investigation.',
+          );
+          this.releaseCapacity(runId, { ...proof, capacity: proof.capacity ?? null });
+        }
+      }
       if (!['succeeded', 'failed'].includes(state.run.status)) {
         state = (await app.adoptExecutionRun(actor, project, runId, controller, LEASE_MS))!;
         ensure(state?.attempt, 'CONFLICT', 'Could not acquire the execution attempt.');
@@ -788,6 +839,22 @@ export class ExecutionCompanion {
           cleanup_verified: true,
           spawned: state.run.status === 'running',
         };
+        const { capacity, host_id: host } = this.options;
+        const entry = capacity.inspect(host).entries.find((entry) => entry.queue_id === runId);
+        result.capacity =
+          entry?.kind === 'script' &&
+          entry.run_id === runId &&
+          entry.project_id === project &&
+          ['queued', 'running', 'reconciling'].includes(entry.state)
+            ? {
+                host_id: host,
+                queue_id: runId,
+                run_id: runId,
+                project_id: project,
+                state: entry.state as HostCapacityNeverStartedProof['state'],
+                execution_token: entry.execution_token,
+              }
+            : null;
         ensure(
           this.validResult(result),
           'INVALID_INPUT',
@@ -805,6 +872,10 @@ export class ExecutionCompanion {
         const proof = this.journal(directory, 'operator-reconciliation.json');
         ensure(
           this.matches(state, proof) &&
+            proof.cleanup_verified === true &&
+            proof.process_exit_confirmed === true &&
+            proof.effects_reconciled === true &&
+            proof.source === 'operator_external_execution_exit' &&
             this.validResult(proof) &&
             JSON.stringify(this.outcome(proof)) === JSON.stringify(this.outcome(result)) &&
             proof.note === evidence.note,

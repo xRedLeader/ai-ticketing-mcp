@@ -70,12 +70,10 @@ export function executionProcessIdentity(pid: number): ExecutionProcessIdentity 
   }
 }
 
-/** Only an exact owned root can authorize termination; inspection failure never proves exit. */
-export async function terminateExecutionProcessTree(identity: ExecutionProcessIdentity): Promise<boolean> {
-  if (executionProcessIdentity(identity.pid)?.start_marker !== identity.start_marker) return false;
-  if (process.platform === 'win32') {
-    if (!/^\d{1,20}$/.test(identity.start_marker)) return false;
-    const script = `
+export function windowsExecutionTerminationScript(identity: ExecutionProcessIdentity): string {
+  if (!Number.isSafeInteger(identity.pid) || identity.pid <= 0 || !/^\d{1,20}$/.test(identity.start_marker))
+    throw new Error('Invalid Windows process identity.');
+  return `
 $ErrorActionPreference='Stop'
 $root=Get-Process -Id ${identity.pid}
 $null=$root.Handle
@@ -91,9 +89,11 @@ do {
       if ($owned.ContainsKey([int]$row.ProcessId) -or !$owned.ContainsKey([int]$row.ParentProcessId)) { continue }
       $parent=$owned[[int]$row.ParentProcessId]
       $child=Get-Process -Id $row.ProcessId -ErrorAction SilentlyContinue
-      if (!$child) { continue }
+      if (!$child -or !$row.CreationDate) { exit 7 }
       $null=$child.Handle
-      if ($child.StartTime -lt $parent.StartTime -or ($parent.HasExited -and $child.StartTime -gt $parent.ExitTime)) { $child.Dispose(); continue }
+      # CIM creation times have microsecond precision; compare the handle at that same precision.
+      if ($child.Id -ne [int]$row.ProcessId -or $child.StartTime.ToUniversalTime().ToString('yyyyMMddHHmmss.ffffff') -cne $row.CreationDate.ToUniversalTime().ToString('yyyyMMddHHmmss.ffffff')) { $child.Dispose(); exit 7 }
+      if ($child.StartTime -lt $parent.StartTime -or ($parent.HasExited -and $child.StartTime -gt $parent.ExitTime)) { $child.Dispose(); exit 7 }
       $owned[$child.Id]=$child; $added=$true; $found=$true
     }
   } while ($added)
@@ -105,9 +105,15 @@ do {
 } while ([DateTime]::UtcNow -lt $deadline)
 exit 6
 `;
+}
+/** Only an exact owned root can authorize termination; inspection failure never proves exit. */
+export async function terminateExecutionProcessTree(identity: ExecutionProcessIdentity): Promise<boolean> {
+  if (executionProcessIdentity(identity.pid)?.start_marker !== identity.start_marker) return false;
+  if (process.platform === 'win32') {
+    if (!/^\d{1,20}$/.test(identity.start_marker)) return false;
     spawnSync(
       `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
-      ['-NoProfile', '-NonInteractive', '-Command', script],
+      ['-NoProfile', '-NonInteractive', '-Command', windowsExecutionTerminationScript(identity)],
       { encoding: 'utf8', timeout: 15_000, maxBuffer: 1024, windowsHide: true },
     );
     // Windows has no enforced containment here; captured-handle exit cannot prove no escaped descendant.

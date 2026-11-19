@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 import { createApplication } from '../application.js';
 import { ExecutionCompanion } from '../execution-companion.js';
 import { ExecutionRecipeRegistry } from '../execution-recipes.js';
@@ -286,4 +287,110 @@ export function registerExecutionControlContractTests(
       assert.ok((await f.storage.find('execution_observations', { where: { run_id: f.runId } })).length >= 3);
     },
   );
+  for (const replacement of [false, true])
+    check(
+      `replays external evidence after terminal commit without releasing ${replacement ? 'a replacement capacity token' : 'anything before matching the original note'}`,
+      async (f) => {
+        const actor = f.admin.id,
+          project = f.project.id,
+          app = f.app;
+        const controller = (await app.acquireExecutionController(actor, project, 'first', 60_000))!;
+        const run = (await app.reserveExecutionRun(actor, project, f.runId, 60_000, controller))!;
+        await app.admitExecutionRun(actor, project, f.runId, run.reservation_token!, controller, () => {
+          f.capacity.enqueue('test', {
+            kind: 'script',
+            queue_id: f.runId,
+            run_id: f.runId,
+            project_id: project,
+            created_at: Date.now(),
+          });
+          assert.equal(
+            f.capacity.claimNext('test', 'first', { kind: 'script', queue_ids: [f.runId] }).admitted,
+            true,
+          );
+        });
+        await app.startExecutionRun(actor, project, f.runId, run.reservation_token!, 60_000, controller);
+        await app.cancelExecutionRun(actor, project, f.runId);
+        await app.releaseExecutionController(actor, project, controller);
+        const evidence = {
+          process_exit_confirmed: true as const,
+          effects_reconciled: true as const,
+          outcome: {
+            exit_code: null,
+            signal: null,
+            artifacts: ['external:receipt'],
+            error_code: 'CANCELLED',
+          },
+          note: 'External receipt confirms exit and records the partial effect. No rollback.',
+        };
+        const takeOver = f.capacity.takeOver;
+        f.capacity.takeOver = () => {
+          throw new Error('Injected crash after terminal commit');
+        };
+        try {
+          await assert.rejects(
+            new ExecutionCompanion(f.options).reconcileCancellation(f.runId, evidence),
+            /Injected crash/,
+          );
+        } finally {
+          f.capacity.takeOver = takeOver;
+        }
+        const state = await f.state();
+        assert.equal(state.run.status, 'failed');
+        assert.equal(state.cancellation!.effects_state, 'unresolved');
+        assert.equal(f.capacity.inspect('test').occupied.script, 1);
+        const filename = join(
+          f.options.artifacts_directory,
+          f.runId,
+          state.attempt!.id,
+          'operator-reconciliation.json',
+        );
+        const original = await readFile(filename, 'utf8'),
+          proof = JSON.parse(original);
+        assert.equal(proof.capacity.execution_token, f.capacity.inspect('test').entries[0]!.execution_token);
+        await assert.rejects(
+          new ExecutionCompanion(f.options).reconcileCancellation(f.runId, {
+            ...evidence,
+            note: 'Conflicting new evidence',
+          }),
+          hasCode('CONFLICT'),
+        );
+        await assert.rejects(
+          new ExecutionCompanion(f.options).reconcileCancellation(f.runId, {
+            ...evidence,
+            outcome: { ...evidence.outcome, exit_code: 7 },
+          }),
+          hasCode('CONFLICT'),
+        );
+        assert.equal((await f.state()).cancellation!.effects_state, 'unresolved');
+        assert.equal(f.capacity.inspect('test').occupied.script, 1);
+        let replacementToken: string | undefined;
+        if (replacement) {
+          replacementToken = randomUUID();
+          const db = new DatabaseSync(join(f.directory, 'capacity.sqlite'));
+          try {
+            const host = JSON.parse(
+              db.prepare('SELECT state FROM host_capacity WHERE id=?').get('test')!.state as string,
+            );
+            host.entries[0].execution_token = replacementToken;
+            db.prepare('UPDATE host_capacity SET state=? WHERE id=?').run(JSON.stringify(host), 'test');
+          } finally {
+            db.close();
+          }
+        }
+        const resolved = await new ExecutionCompanion(f.options).reconcileCancellation(f.runId, evidence);
+        assert.equal(resolved.effects_state, 'reconciled');
+        assert.equal(f.capacity.inspect('test').occupied.script, replacement ? 1 : 0);
+        if (replacement)
+          assert.equal(f.capacity.inspect('test').entries[0]!.execution_token, replacementToken);
+        assert.equal(await readFile(filename, 'utf8'), original);
+        assert.deepEqual((await f.state()).attempt, state.attempt);
+        await new ExecutionCompanion(f.options).runOnce();
+        assert.equal(f.capacity.inspect('test').occupied.script, replacement ? 1 : 0);
+        assert.deepEqual(
+          await new ExecutionCompanion(f.options).reconcileCancellation(f.runId, evidence),
+          resolved,
+        );
+      },
+    );
 }
