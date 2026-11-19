@@ -241,12 +241,20 @@ export interface ExecutionRecipeRegistration {
   id: string;
   fingerprint: string;
   project_ids: readonly string[];
+  cacheable?: true;
+}
+export interface ExecutionCacheHit {
+  key: string;
+  source_run_id: string;
+  source_attempt_id: string;
+  artifacts: { artifact_id: string; sha256: string; size_bytes: number }[];
 }
 export interface ExecutionOutcome {
   exit_code: number | null;
   signal: string | null;
   artifacts: string[];
   error_code: string | null;
+  cache?: ExecutionCacheHit;
 }
 export interface ArtifactRetirement {
   id: string;

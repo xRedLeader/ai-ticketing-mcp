@@ -283,6 +283,22 @@ const executionJob = z.object({
   signal: z.string().nullable(),
   artifacts: z.array(z.string()),
   error_code: z.string().nullable(),
+  cache: z
+    .object({
+      key: z.string().regex(/^[a-f0-9]{64}$/),
+      source_run_id: id,
+      source_attempt_id: id,
+      artifacts: z
+        .array(
+          z.object({
+            artifact_id: z.string(),
+            sha256: z.string().regex(/^[a-f0-9]{64}$/),
+            size_bytes: z.number().int().nonnegative(),
+          }),
+        )
+        .max(3),
+    })
+    .optional(),
 });
 const continuation = z.object({
   id,
@@ -400,6 +416,7 @@ const executionView = z.object({
       signal: true,
       error_code: true,
       artifacts: true,
+      cache: true,
     }),
   ]),
   continuation: z.union([continuation, continuation.pick({ id: true, status: true, failure_reason: true })]),

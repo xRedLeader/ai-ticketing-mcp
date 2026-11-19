@@ -31,6 +31,7 @@ import {
   type ExecutionRecipeRegistration,
   type ExecutionJob,
   type ExecutionOutcome,
+  type ExecutionCacheHit,
   type ExecutionController,
   type ExecutionControllerFence,
   type ExecutionAttempt,
@@ -61,6 +62,8 @@ import {
   unavailableArtifact,
 } from './execution-artifacts.js';
 import { ClientCapabilities } from './client-capabilities.js';
+import { pipelineIdentityError, type VerificationPipeline } from './verification-pipeline.js';
+import { inspectVerificationCache } from './execution-cache.js';
 
 export interface ApplicationOptions {
   storage: StorageAdapter;
@@ -2264,6 +2267,153 @@ export class Application {
       return true;
     });
   }
+  /** Operator-declared deterministic verification only; cache hits never launch a process. */
+  async tryReuseExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    token: string,
+    controller: ExecutionControllerFence,
+    pipeline: VerificationPipeline,
+  ): Promise<boolean> {
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      const registered = this.executionRecipes.get(run.recipe_id);
+      if (
+        !pipeline.cacheable ||
+        !registered?.cacheable ||
+        !this.executionArtifacts ||
+        !registered.project_ids.includes(projectId) ||
+        registered.fingerprint !== pipeline.fingerprint ||
+        run.recipe_fingerprint !== pipeline.fingerprint ||
+        run.recipe_id !== pipeline.id ||
+        !pipeline.project_ids.includes(projectId) ||
+        !(await this.currentExecutionController(tx, controller)) ||
+        (await tx.get('execution_admissions', projectId))?.paused ||
+        (await tx.get('execution_cancellations', runId)) ||
+        run.status !== 'reserved' ||
+        run.reservation_token !== token ||
+        !run.locked_until ||
+        run.locked_until <= this.timestamp() ||
+        !(await this.executionAuthority(tx, run))
+      )
+        return false;
+      ensure(
+        tx.lockArtifactReferences,
+        'UNSUPPORTED_ARTIFACT_RETENTION',
+        'Serialize cache artifact references.',
+      );
+      await tx.lockArtifactReferences();
+      const project = (await tx.get('projects', projectId))!;
+      const actor = await this.actor(actorId, tx);
+      const miss = async (code: string) => {
+        await this.event(tx, project, actor, 'run.cache_miss', run.ticket_id, {
+          run_id: runId,
+          code,
+        });
+        return false;
+      };
+      if (pipelineIdentityError(pipeline)) return miss('IDENTITY_CHANGED');
+      const continuation = await tx.get('continuations', run.continuation_id);
+      const attempt = await this.executionAttempt(tx, runId);
+      const observation = attempt ? await this.latestExecutionObservation(tx, attempt) : null;
+      if (
+        !attempt ||
+        observation?.kind !== 'reserved' ||
+        observation.next_step !== 'dispatch' ||
+        observation.controller_generation !== controller.generation ||
+        !continuation
+      )
+        return miss('OWNERSHIP_CHANGED');
+      // shortcut: inspect only the latest matching actual execution, broaden only if measured misses justify it.
+      const source = (
+        await tx.find('execution_jobs', {
+          where: {
+            project_id: projectId,
+            ticket_id: run.ticket_id,
+            actor_id: run.actor_id,
+            requirements_revision: run.requirements_revision,
+            recipe_id: run.recipe_id,
+            recipe_fingerprint: run.recipe_fingerprint,
+            status: 'succeeded',
+            started_at: { gt: '1970-01-01T00:00:00.000Z' },
+          },
+          order: [
+            { field: 'finished_at', direction: 'desc' },
+            { field: 'id', direction: 'desc' },
+          ],
+          limit: 1,
+        })
+      )[0];
+      if (!source || (await tx.get('execution_cancellations', source.id))) return miss('NO_RETAINED_MATCH');
+      const prior = await tx.get('continuations', source.continuation_id);
+      const sourceAttempt = await this.executionAttempt(tx, source.id);
+      if (
+        !sourceAttempt ||
+        prior?.status !== 'satisfied' ||
+        digest(prior.completion_condition) !== digest(continuation.completion_condition)
+      )
+        return miss('REQUEST_CHANGED');
+      for (const id of source.artifacts)
+        if (await tx.get('artifact_retirements', id)) return miss('ARTIFACT_UNAVAILABLE');
+      const artifacts = inspectVerificationCache(
+        this.executionArtifacts,
+        source,
+        sourceAttempt,
+        pipeline,
+        this.now().getTime(),
+      );
+      if (!artifacts) return miss('ARTIFACT_UNAVAILABLE');
+      const cache: ExecutionCacheHit = {
+        key: digest([
+          projectId,
+          run.ticket_id,
+          run.actor_id,
+          run.requirements_revision,
+          run.recipe_id,
+          pipeline.fingerprint,
+          pipeline.source.identity,
+          continuation.completion_condition,
+        ]),
+        source_run_id: source.id,
+        source_attempt_id: sourceAttempt.id,
+        artifacts,
+      };
+      const current = (await tx.get('execution_controllers', 'execution'))!;
+      if (
+        pipelineIdentityError(pipeline) ||
+        current.expires_at <= this.timestamp() ||
+        run.locked_until <= this.timestamp() ||
+        !(await this.executionAuthority(tx, run))
+      )
+        return miss('IDENTITY_CHANGED');
+      if (
+        !(await this.finishExecutionRun(
+          tx,
+          run,
+          actorId,
+          {
+            exit_code: 0,
+            signal: null,
+            error_code: null,
+            artifacts: artifacts.map((item) => item.artifact_id),
+            cache,
+          },
+          controller,
+        ))
+      )
+        return false;
+      // This evidence event deliberately pins the original artifacts through the existing retention policy.
+      await this.event(
+        tx,
+        (await tx.get('projects', projectId))!,
+        actor,
+        'verification.cache_hit',
+        run.ticket_id,
+        { run_id: runId, ...cache },
+      );
+      return true;
+    });
+  }
   /** Native spawn must be synchronous here: takeover waits until the launch boundary has passed. */
   async dispatchExecutionRun(
     actorId: string,
@@ -3528,14 +3678,48 @@ export class Application {
     });
     return pinned ? this.executionArtifacts.read(artifactId, authority, offset, length, now, true) : result;
   }
-  private async executionResume(reader: Reader, run: ExecutionJob) {
+  private async executionArtifactReferences(reader: Reader, run: ExecutionJob, cache?: ExecutionCacheHit) {
+    const source = cache ? await reader.get('execution_jobs', cache.source_run_id) : null;
+    if (
+      cache &&
+      !(
+        source?.project_id === run.project_id &&
+        source.ticket_id === run.ticket_id &&
+        source.actor_id === run.actor_id &&
+        source.requirements_revision === run.requirements_revision &&
+        source.recipe_fingerprint === run.recipe_fingerprint &&
+        source.status === 'succeeded' &&
+        run.started_at === null &&
+        cache.artifacts.length === run.artifacts.length &&
+        cache.artifacts.every(
+          (item) => source.artifacts.includes(item.artifact_id) && run.artifacts.includes(item.artifact_id),
+        )
+      )
+    )
+      cache = undefined;
     const artifacts: string[] = [];
     for (const artifact of run.artifacts) {
       const identity = artifactIdentity.exec(artifact);
-      if (!identity || identity[1] !== run.id) continue;
+      if (
+        !identity ||
+        (identity[1] !== run.id &&
+          !(
+            cache &&
+            identity[1] === cache.source_run_id &&
+            identity[2] === cache.source_attempt_id &&
+            cache.artifacts.some((item) => item.artifact_id === artifact)
+          ))
+      )
+        continue;
       const attempt = await reader.get('execution_attempts', identity[2]!);
-      if (attempt?.project_id === run.project_id && attempt.run_id === run.id) artifacts.push(artifact);
+      if (attempt?.project_id === run.project_id && attempt.run_id === identity[1]) artifacts.push(artifact);
     }
+    return { artifacts, ...(cache ? { cache } : {}) };
+  }
+  private async executionResume(reader: Reader, run: ExecutionJob) {
+    const attempt = await this.executionAttempt(reader, run.id);
+    const observation = attempt ? await this.latestExecutionObservation(reader, attempt) : null;
+    const references = await this.executionArtifactReferences(reader, run, observation?.outcome?.cache);
     const continuation = await reader.get('continuations', run.continuation_id);
     ensure(
       continuation?.project_id === run.project_id && continuation.run_id === run.id,
@@ -3543,7 +3727,7 @@ export class Application {
       'Execution continuation is missing.',
     );
     return executionResumeSchema.parse({
-      run: { ...run, artifacts },
+      run: { ...run, ...references },
       continuation,
       stale: !(await this.executionAuthority(reader, run)),
     });
@@ -3735,14 +3919,17 @@ export class Application {
           'Execution checkpoint or continuation is missing.',
         );
         const recovery = await this.executionReconciliation(reader, run);
+        const references = await this.executionArtifactReferences(
+          reader,
+          run,
+          recovery.observation?.outcome?.cache,
+        );
         const output = await Promise.all(
-          run.artifacts
-            .filter((id) => artifactIdentity.test(id))
-            .map((id) => this.readArtifact(reader, input.project_id, id, 0, 0)),
+          references.artifacts.map((id) => this.readArtifact(reader, input.project_id, id, 0, 0)),
         );
         const stderr = output.find((artifact) => artifact.artifact_id.endsWith(':stderr'));
         const response = {
-          run,
+          run: { ...run, ...references },
           continuation,
           checkpoint: checkpoint as Note | null,
           output,
@@ -3803,6 +3990,7 @@ export class Application {
               signal: run.signal,
               error_code: run.error_code,
               artifacts: [],
+              ...(references.cache ? { cache: references.cache } : {}),
             },
             continuation: {
               id: continuation.id,

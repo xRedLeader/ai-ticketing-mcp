@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, existsSync, lstatSync, openSync, readSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { release, version } from 'node:os';
 import { z } from 'zod';
 import { ensure } from './contracts.js';
 import type { ExecutionCommand } from './execution-recipes.js';
@@ -10,6 +11,7 @@ import type { ExecutionCommand } from './execution-recipes.js';
 const id = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/);
 export const verificationPipelineSchema = z.strictObject({
   id,
+  cacheable: z.literal(true).optional(),
   project_ids: z.array(z.uuid()).min(1).max(128),
   source: z.strictObject({ recipe_id: id, commit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/) }),
   steps: z
@@ -47,13 +49,19 @@ export interface SourceIdentity {
 }
 export interface VerificationPipeline {
   readonly kind: 'verification_pipeline';
+  readonly cacheable?: true;
   readonly id: string;
   readonly project_ids: readonly string[];
   readonly fingerprint: string;
   readonly timeout_ms: number;
   readonly max_log_bytes: number;
   readonly resources: Readonly<{ cpu_millis: number; memory_bytes: number }>;
-  readonly runtime: Readonly<{ node_sha256: string; runner_sha256: string; identity_sha256: string }>;
+  readonly runtime: Readonly<{
+    node_sha256: string;
+    runner_sha256: string;
+    identity_sha256: string;
+    environment_sha256: string;
+  }>;
   readonly source: Readonly<{
     command: ExecutionCommand;
     executable_sha256: string;
@@ -88,6 +96,7 @@ export function verificationRunnerPath(): string {
 }
 function runtimeIdentity() {
   return {
+    environment_sha256: digest([process.platform, process.arch, release(), version(), process.versions]),
     node_sha256: fileSha256(process.execPath),
     runner_sha256: fileSha256(verificationRunnerPath()),
     identity_sha256: fileSha256(fileURLToPath(import.meta.url)),
@@ -218,6 +227,7 @@ export function pinVerificationPipeline(
   });
   const normalized = {
     kind: 'verification_pipeline' as const,
+    ...(input.cacheable ? { cacheable: true as const } : {}),
     id: input.id,
     project_ids: Object.freeze([...new Set(input.project_ids)].sort()),
     timeout_ms: input.timeout_ms,
