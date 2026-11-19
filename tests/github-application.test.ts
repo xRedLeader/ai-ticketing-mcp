@@ -211,6 +211,23 @@ it('retains immutable SHA snapshots and marks superseded or changed-head evidenc
         idempotency_key: randomUUID(),
       })) as any;
       assert.equal(result.github_evidence.status, status);
+      const packet = (await app.execute(
+        f.reviewer.id,
+        'ticket_context',
+        { ...base, max_tokens: 1024 },
+        'reviewer',
+      )) as any;
+      assert.ok(packet.review_blockers.some((item: any) => item.code === 'GITHUB_EVIDENCE_UNVERIFIED'));
+      const omitted = packet.omitted.find((item: any) => item.section === 'github_evidence');
+      if (omitted) assert.equal(omitted.required_before, 'review');
+      const received =
+        packet.github_evidence ??
+        ((await app.execute(f.reviewer.id, omitted.retrieve_with, omitted.arguments)) as any).items[0];
+      assert.equal(received.id, result.github_evidence.id);
+      assert.equal(received.status, status);
+      assert.equal(received.head_sha, observation.head_sha);
+      assert.equal(received.observed_head_sha, observation.observed_head_sha);
+      assert.ok(received.observed_at);
     }
     await f.call(f.worker.id, 'ticket_note', {
       ticket_id: ticket.id,

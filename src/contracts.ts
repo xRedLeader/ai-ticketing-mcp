@@ -104,6 +104,16 @@ export interface Claim {
   expires_at: string;
   execution?: ClientSelection;
 }
+export interface ClaimHandoff {
+  id: string;
+  project_id: string;
+  ticket_id: string;
+  source_actor_id: string;
+  recipient_id: string;
+  source_claim_hash: string;
+  requirements_revision: number;
+  ticket_revision: number;
+}
 export interface Evidence {
   criterion_id: string;
   result: 'pass' | 'fail';
@@ -241,12 +251,20 @@ export interface ExecutionRecipeRegistration {
   id: string;
   fingerprint: string;
   project_ids: readonly string[];
+  cacheable?: true;
+}
+export interface ExecutionCacheHit {
+  key: string;
+  source_run_id: string;
+  source_attempt_id: string;
+  artifacts: { artifact_id: string; sha256: string; size_bytes: number }[];
 }
 export interface ExecutionOutcome {
   exit_code: number | null;
   signal: string | null;
   artifacts: string[];
   error_code: string | null;
+  cache?: ExecutionCacheHit;
 }
 export interface ArtifactRetirement {
   id: string;
@@ -339,6 +357,32 @@ export interface WakeDecision {
   reasons: WakeReason[];
   through_cursor: number;
   created_at: string;
+  dispatch?: ContinuationDispatch;
+}
+export interface ContinuationInvocation {
+  host_id: string;
+  queue_id: string;
+  execution_token: string;
+}
+export interface ContinuationDispatch {
+  state: 'waiting' | 'starting' | 'running' | 'completed' | 'needs_attention';
+  code: string | null;
+  invocation: ContinuationInvocation | null;
+  identity: string | null;
+  admission_uncertain?: boolean;
+}
+export interface ContinuationDispatchContext {
+  actor_id: string;
+  ticket_id: string;
+  requirements_revision: number;
+  continuation_id: string;
+  run_id: string;
+  execution: ClientSelection;
+}
+export interface WakeFence {
+  ticket_id: string;
+  generation: number;
+  token: string;
 }
 export interface WakeRegistration {
   id: string;
@@ -474,6 +518,7 @@ export interface Tables {
   links: Link;
   notes: Note;
   claims: Claim;
+  claim_handoffs: ClaimHandoff;
   submissions: Submission;
   reviews: Review;
   knowledge: Knowledge;

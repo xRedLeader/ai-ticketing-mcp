@@ -1,4 +1,4 @@
-import { McpServer, ResourceTemplate } from '@modelcontextprotocol/server';
+import { McpServer, ResourceTemplate, type ServerContext } from '@modelcontextprotocol/server';
 import type { Application } from './application.js';
 import { DomainError, ensure } from './contracts.js';
 import { schemas, descriptions, readOperations } from './schemas.js';
@@ -20,7 +20,7 @@ export function createMcpServer(app: Application, principal: Principal, profile:
     planner:
       'Use project_list, project_get, and ticket_list to inspect authorized work. Search prior decisions, create bounded tickets with explicit criteria and dependencies, and update project knowledge.',
     reviewer:
-      'Use project_list, project_get, and ticket_list to find work awaiting review. Read current requirements and the relevant submission evidence through ticket_context or ticket_history before ticket_review. For linked PRs, ticket_github_refresh observes the current head and required checks; compare exact SHAs and observed_at.',
+      'Use project_list, project_get, and ticket_list to find work awaiting review. Read fresh ticket_context and recover every required_before:review omission from your own responses before ticket_review. Independently check all current criterion evidence; worker success is not acceptance. artifact_read permits exact references in the current submission. Other references need independent inspection. For linked PRs, ticket_github_refresh observes the current head and required checks; compare exact SHAs and observed_at.',
     full: 'Use project_list and project_get to discover authorized work. Plan with tickets_create, execute with work_claim and its returned context, and review independently with ticket_review. Use work_next when explicit candidate selection is needed. Persist claim tokens, heartbeat at least every three minutes, checkpoint progress, and submit evidence for every criterion.',
   };
   const instructions =
@@ -49,7 +49,7 @@ export function createMcpServer(app: Application, principal: Principal, profile:
             operation === 'search' || operation === 'ticket_context' || operation === 'ticket_github_refresh',
         },
       },
-      async (input: unknown) => {
+      async (input: unknown, context: ServerContext) => {
         app.recordReferenceTokens?.('request', JSON.stringify({ operation, input }));
         try {
           requireRead();
@@ -59,7 +59,13 @@ export function createMcpServer(app: Application, principal: Principal, profile:
               'INSUFFICIENT_SCOPE',
               'ticketing:write scope is required.',
             );
-          const result = await app.execute(principal.actorId, operation, input);
+          const result = await app.execute(
+            principal.actorId,
+            operation,
+            input,
+            profile,
+            context.mcpReq._meta?.['ticketing/context-manifest'] === true,
+          );
           const text = serializeSuccessEnvelope(result);
           app.recordReferenceTokens?.('result', text);
           return {

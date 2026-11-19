@@ -22,6 +22,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { getEncoding } from 'js-tiktoken';
+import { observeArtifactEvidence, validateRole } from './real-client-observation.js';
 
 const encoding = getEncoding('o200k_base');
 const tokens = (text: string) => encoding.encode(text, [], []).length;
@@ -145,6 +146,7 @@ export function deliveryProof(calls: any[], actor: string, profile: string, tool
   const targetIds =
     tool === 'ticket_link' ? [args.source_id, args.target_id] : args.ticket_id ? [args.ticket_id] : [];
   const facts: Record<string, boolean> = {};
+  let reviewValidation: ReturnType<typeof validateRole> | undefined;
   let instructions: any, policy: any, projectRevision: any;
   for (const call of calls.filter((call) => call.ok)) {
     const data = call.result?.structuredContent?.data;
@@ -169,6 +171,7 @@ export function deliveryProof(calls: any[], actor: string, profile: string, tool
       dependencies: any,
       claim: any,
       checkpoint: any;
+    let reviewBlockers: any[] = [];
     let pending: any[] = [],
       submissions: any[] = [];
     for (const call of calls.filter((call) => call.ok)) {
@@ -196,11 +199,14 @@ export function deliveryProof(calls: any[], actor: string, profile: string, tool
         dependencies = context?.dependencies ?? data.links ?? dependencies;
         claim = data.claim ?? context?.claim ?? claim;
         if (context) {
+          reviewBlockers = context.review_blockers ?? [];
           checkpoint = context.latest_checkpoint ?? checkpoint;
           submissions.push(...(context.submissions ?? []));
           pending = (context.omitted ?? [])
             .filter(
-              (item: any) => item.required_before === (tool === 'ticket_review' ? 'review' : 'execution'),
+              (item: any) =>
+                item.required_before === (tool === 'ticket_review' ? 'review' : 'execution') &&
+                !(tool === 'ticket_review' && item.retrieve_with === 'artifact_read'),
             )
             .map((item: any) => ({ ...item, nextOffset: item.arguments?.offset ?? 0 }));
         }
@@ -229,7 +235,7 @@ export function deliveryProof(calls: any[], actor: string, profile: string, tool
             !Array.isArray(data?.items)
           )
             return [item];
-          return data.items.length >= (item.arguments.limit ?? 10)
+          return (data.has_more ?? data.items.length >= (item.arguments.limit ?? 10))
             ? [{ ...item, nextOffset: offset + data.items.length }]
             : [];
         }
@@ -262,6 +268,37 @@ export function deliveryProof(calls: any[], actor: string, profile: string, tool
           Array.isArray(checkpoint.metadata?.decisions));
     if (tool === 'ticket_review') {
       const selected = submissions.find((item) => item.id === args.submission_id);
+      reviewValidation = validateRole(
+        {
+          calls: calls.map((call, index) => ({
+            ...call,
+            id: String(index),
+            started: index * 2,
+            completed: index * 2 + 1,
+            envelope:
+              call.ok && (!call.actor_id || call.actor_id === actor) ? call.result?.structuredContent : null,
+          })),
+          errors: [],
+        } as any,
+        'reviewer',
+        {
+          workflow: { policy },
+          project: { id: args.project_id },
+          ticket,
+          description: ticket.description,
+          workerId: selected?.actor_id,
+          reviewerId: actor,
+          contract: { project: { instructions, criteria } },
+        },
+        { tool: 'ticket_review', arguments: args, started: calls.length * 2 },
+      );
+      facts[prefix + 'independent_review'] = reviewValidation.success;
+      const artifacts = reviewValidation.proofs.find((item) => item.tool === 'ticket_review')?.artifacts;
+      facts[prefix + 'submitted_artifacts_verified'] =
+        !!selected &&
+        !!artifacts &&
+        !artifacts.missing.length &&
+        (args.decision !== 'approve' || (!artifacts.unverified.length && !reviewBlockers.length));
       facts[prefix + 'selected_submission_evidence'] =
         selected?.requirements_revision === ticket.requirements_revision &&
         typeof selected?.actor_id === 'string' &&
@@ -284,7 +321,11 @@ export function deliveryProof(calls: any[], actor: string, profile: string, tool
         );
     }
   }
-  return { success: Object.values(facts).every(Boolean), facts };
+  return {
+    success: Object.values(facts).every(Boolean),
+    facts,
+    ...(reviewValidation ? { review_validation: reviewValidation } : {}),
+  };
 }
 // The relay captures original Buffer bytes, including MCP newline framing, without reserializing messages.
 const relay = `import {spawn} from 'node:child_process';import {openSync,writeSync,closeSync} from 'node:fs';
@@ -528,6 +569,7 @@ export async function recoverOmissions(
   for (const omission of context.omitted ?? []) {
     if (!omission.retrieve_with || !omission.arguments) continue;
     let args = { ...omission.arguments };
+    let artifact = { ...omission, nextOffset: args.offset ?? 0 };
     const seen = new Set<string>();
     for (let page = 0; ; page++) {
       assert.ok(page < 1000, 'Omission pagination did not terminate.');
@@ -541,13 +583,22 @@ export async function recoverOmissions(
         arguments: args,
         data,
       });
+      if (omission.retrieve_with === 'artifact_read') {
+        const result = observeArtifactEvidence(artifact, args, data);
+        assert.ok(!result.unverified, 'Submitted artifact is unavailable, incomplete, or failed.');
+        if (!result.pending) break;
+        assert.ok(result.pending.nextOffset > artifact.nextOffset, 'Artifact recovery made no progress.');
+        artifact = result.pending;
+        args = { ...args, offset: artifact.nextOffset };
+        continue;
+      }
       if (omission.retrieve_with !== 'ticket_history' || args.item_id) break;
       const limit = args.limit ?? 10;
       for (const item of data.items) {
         assert.ok(!seen.has(item.id), 'Duplicate omission item across pages.');
         seen.add(item.id);
       }
-      if (data.items.length < limit) break;
+      if (!(data.has_more ?? data.items.length >= limit)) break;
       args = { ...args, offset: (args.offset ?? 0) + data.items.length };
     }
   }

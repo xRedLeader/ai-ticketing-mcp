@@ -1,7 +1,7 @@
 import { existsSync, lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import { durableExecutionFile, readExecutionFile } from './execution-journal.js';
-import { fileSha256 } from './verification-pipeline.js';
+import { fileSha256, MAX_VERIFICATION_REPORT_BYTES } from './verification-pipeline.js';
 import type { ExecutionManifest } from './execution-supervisor.js';
 import type { VerificationReport } from './verification-runner.js';
 
@@ -18,7 +18,7 @@ export function readVerificationTimeout(
       return null;
     const path = join(directory, 'pipeline-report.json');
     if (marker.report_sha256 !== fileSha256(path)) return null;
-    const report = readExecutionFile(path) as VerificationReport;
+    const report = readExecutionFile(path, MAX_VERIFICATION_REPORT_BYTES) as VerificationReport;
     return report.recipe_fingerprint === identity.recipe_fingerprint &&
       report.status === 'failed' &&
       report.cleanup_verified === false &&
@@ -53,7 +53,15 @@ export function recordVerificationTimeout(
     total_bytes[stream] = Math.max(
       stat.size,
       report.steps.reduce(
-        (total, step) => Math.min(Number.MAX_SAFE_INTEGER, total + step.diagnostics[stream].total_bytes),
+        (total, step) =>
+          Math.min(
+            Number.MAX_SAFE_INTEGER,
+            total +
+              (step.attempts ?? [step]).reduce(
+                (sum, attempt) => sum + attempt.diagnostics[stream].total_bytes,
+                0,
+              ),
+          ),
         0,
       ),
     );
@@ -77,7 +85,7 @@ export function recordVerificationTimeout(
       sha256: { stdout: sha256.stdout, stderr: sha256.stderr },
       verification: { ...report, status: 'failed', cleanup_verified: true },
     });
-  const outcome = readExecutionFile(outcomePath) as Record<string, any>;
+  const outcome = readExecutionFile(outcomePath, MAX_VERIFICATION_REPORT_BYTES) as Record<string, any>;
   if (
     outcome.run_id !== identity.run_id ||
     outcome.attempt_id !== identity.attempt_id ||

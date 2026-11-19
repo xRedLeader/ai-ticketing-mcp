@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, mkdtemp } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import {
   parseCodexInvocation,
   validateRole,
@@ -284,6 +285,412 @@ it('requires the reviewer to receive current evidence through its own model chan
   const rejected = validateRole(parseCodexInvocation(encode(events), 0), 'reviewer', reviewExpected);
   assert.equal(rejected.success, false);
   assert.ok(rejected.errors.some((error) => error.includes('current_submission_evidence')));
+});
+
+it('requires complete exact reviewer evidence and all review omission pages before acceptance', () => {
+  const reviewExpected = { ...expected, workflow: { ...workflow, policy: 'independent', review: true } };
+  const submission = {
+    id: 'submission',
+    actor_id: 'worker',
+    requirements_revision: 1,
+    ticket_revision: 3,
+    evidence: [
+      {
+        criterion_id: context.criteria[0].id,
+        result: 'pass',
+        summary: 'Observed both responses.',
+        references: ['https://example.test/evidence'],
+      },
+    ],
+  };
+  const args = { project_id: 'project', ticket_id: 'ticket', kind: 'reviews', limit: 1 };
+  const review = {
+    id: 'review',
+    tool: 'ticket_review',
+    arguments: {
+      submission_id: submission.id,
+      decision: 'approve',
+      feedback: `Checked ${context.criteria[0].id} at https://example.test/evidence`,
+    },
+    data: {},
+  };
+  const packet = {
+    ...context,
+    approval_policy: 'independent',
+    submissions: [submission],
+    omitted: [{ retrieve_with: 'ticket_history', arguments: args, required_before: 'review' }],
+  };
+  const check = (entries: any[]) =>
+    validateRole(parseCodexInvocation(encode(trace(entries)), 0), 'reviewer', reviewExpected);
+  const received = [{ id: 'context', tool: 'ticket_context', data: packet }];
+  assert.equal(check([...received, review]).success, false);
+  const first = {
+    id: 'page1',
+    tool: 'ticket_history',
+    arguments: args,
+    data: { items: [{ id: 'rejection', decision: 'request_changes' }], has_more: true },
+  };
+  assert.equal(check([...received, first, review]).success, false);
+  const terminal = {
+    id: 'page2',
+    tool: 'ticket_history',
+    arguments: { ...args, offset: 1 },
+    data: { items: [], has_more: false },
+  };
+  assert.equal(check([...received, first, terminal, review]).success, true);
+  assert.equal(
+    check([...received, { ...terminal, arguments: { ...terminal.arguments, kind: 'notes' } }, review])
+      .success,
+    false,
+  );
+  for (const evidence of [
+    [],
+    [submission.evidence[0], submission.evidence[0]],
+    [{ ...submission.evidence[0], summary: '' }],
+    [{ ...submission.evidence[0], references: [''] }],
+    [{ ...submission.evidence[0], result: 'fail' }],
+  ])
+    assert.equal(
+      check([
+        { ...received[0], data: { ...packet, omitted: [], submissions: [{ ...submission, evidence }] } },
+        review,
+      ]).success,
+      false,
+    );
+  assert.equal(
+    check([{ ...received[0], data: { fingerprint: 'cached-worker-success', not_modified: true } }, review])
+      .success,
+    false,
+  );
+  assert.equal(
+    check([
+      {
+        ...received[0],
+        data: { ...packet, omitted: [], review_blockers: [{ code: 'GITHUB_EVIDENCE_UNVERIFIED' }] },
+      },
+      review,
+    ]).success,
+    false,
+  );
+});
+
+it('requires all exact native artifact bytes with stable size and hashes, retaining unavailable evidence', () => {
+  const reviewExpected = { ...expected, workflow: { ...workflow, policy: 'independent', review: true } };
+  const artifact =
+    'execution:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222:result';
+  const bytes = Buffer.from(
+    JSON.stringify({
+      exit_code: 0,
+      verification: {
+        status: 'passed',
+        error_code: null,
+        cleanup_verified: true,
+        steps: [{ status: 'passed', exit_code: 0, signal: null, error_code: null, blocked_by: [] }],
+      },
+    }),
+  );
+  const hash = (value: Buffer) => createHash('sha256').update(value).digest('hex');
+  const args = { project_id: 'project', artifact_id: artifact, offset: 0, length: 65536, max_tokens: 8192 };
+  const submission = {
+    id: 'submission',
+    actor_id: 'worker',
+    requirements_revision: 1,
+    ticket_revision: 3,
+    evidence: [
+      {
+        criterion_id: context.criteria[0].id,
+        result: 'pass',
+        summary: 'Worker reports success.',
+        references: [artifact],
+      },
+    ],
+  };
+  const initial = {
+    id: 'context',
+    tool: 'ticket_context',
+    data: {
+      ...context,
+      approval_policy: 'independent',
+      submissions: [submission],
+      omitted: [{ retrieve_with: 'artifact_read', arguments: args, required_before: 'review' }],
+    },
+  };
+  const review = {
+    id: 'review',
+    tool: 'ticket_review',
+    arguments: {
+      submission_id: submission.id,
+      decision: 'approve',
+      feedback: `Checked ${context.criteria[0].id} at ${artifact}`,
+    },
+    data: {},
+  };
+  const page = (offset: number, end: number) => ({
+    id: `artifact-${offset}`,
+    tool: 'artifact_read',
+    arguments: { ...args, offset },
+    data: {
+      artifact_id: artifact,
+      status: 'available',
+      size_bytes: bytes.length,
+      total_bytes: bytes.length,
+      omitted_bytes: 0,
+      truncated: false,
+      sha256: hash(bytes),
+      range: {
+        offset,
+        returned_length: end - offset,
+        data: bytes.subarray(offset, end).toString('base64'),
+        sha256: hash(bytes.subarray(offset, end)),
+        complete: true,
+      },
+    },
+  });
+  const check = (entries: any[]) =>
+    validateRole(parseCodexInvocation(encode(trace(entries)), 0), 'reviewer', reviewExpected);
+  assert.equal(check([initial, page(0, 8), review]).success, false);
+  assert.equal(check([initial, page(0, 8), page(8, bytes.length), review]).success, true);
+  const failed = page(0, bytes.length),
+    failure = Buffer.from('{"exit_code":7,"verification":{"status":"failed"}}');
+  failed.data = {
+    ...failed.data,
+    size_bytes: failure.length,
+    total_bytes: failure.length,
+    sha256: hash(failure),
+    range: {
+      ...failed.data.range,
+      returned_length: failure.length,
+      data: failure.toString('base64'),
+      sha256: hash(failure),
+    },
+  };
+  assert.equal(check([initial, failed, review]).success, false);
+  const wrong = page(8, bytes.length);
+  wrong.data.sha256 = '0'.repeat(64);
+  assert.equal(check([initial, page(0, 8), wrong, review]).success, false);
+  const unavailable = {
+    id: 'missing',
+    tool: 'artifact_read',
+    arguments: args,
+    data: { artifact_id: artifact, status: 'expired' },
+  };
+  assert.equal(check([initial, unavailable, review]).success, false);
+  assert.equal(
+    check([
+      initial,
+      unavailable,
+      { ...review, arguments: { ...review.arguments, decision: 'request_changes' } },
+    ]).success,
+    true,
+  );
+});
+
+it('refuses independent acceptance of missing, stale, failed or wrong-origin exact GitHub checks', () => {
+  const reviewExpected = { ...expected, workflow: { ...workflow, policy: 'independent', review: true } };
+  const sha = 'a'.repeat(40);
+  const submission = {
+    id: 'submission',
+    actor_id: 'worker',
+    requirements_revision: 1,
+    ticket_revision: 3,
+    evidence: [
+      {
+        criterion_id: context.criteria[0].id,
+        result: 'pass',
+        summary: 'Observed both responses.',
+        references: ['https://example.test/evidence'],
+      },
+    ],
+  };
+  const github = {
+    repository: 'owner/repo',
+    pull_request_number: 7,
+    status: 'passed',
+    stale: false,
+    requirements_revision: 1,
+    head_sha: sha,
+    observed_head_sha: sha,
+    checks: [
+      {
+        app_id: 42,
+        required_app_id: 42,
+        run_id: 123,
+        head_sha: sha,
+        status: 'completed',
+        conclusion: 'success',
+      },
+    ],
+  };
+  const check = (evidence: any) =>
+    validateRole(
+      parseCodexInvocation(
+        encode(
+          trace([
+            {
+              id: 'context',
+              tool: 'ticket_context',
+              data: {
+                ...context,
+                ticket: { ...context.ticket, github_pull_request: { repository: 'owner/repo', number: 7 } },
+                approval_policy: 'independent',
+                submissions: [submission],
+                github_evidence: evidence,
+              },
+            },
+            {
+              id: 'review',
+              tool: 'ticket_review',
+              arguments: {
+                submission_id: submission.id,
+                decision: 'approve',
+                feedback: `Checked ${context.criteria[0].id} at https://example.test/evidence`,
+              },
+              data: {},
+            },
+          ]),
+        ),
+        0,
+      ),
+      'reviewer',
+      reviewExpected,
+    );
+  assert.equal(check(github).success, true);
+  for (const evidence of [
+    undefined,
+    { ...github, stale: true },
+    { ...github, status: 'failed' },
+    { ...github, checks: [] },
+    { ...github, observed_head_sha: 'b'.repeat(40) },
+    { ...github, requirements_revision: 2 },
+    { ...github, checks: [{ ...github.checks[0], app_id: 99 }] },
+    { ...github, checks: [{ ...github.checks[0], head_sha: 'b'.repeat(40) }] },
+    { ...github, checks: [{ ...github.checks[0], conclusion: 'failure' }] },
+  ])
+    assert.equal(check(evidence).success, false);
+});
+
+it('derives native reads from exact submission history without a packet and reconciles the actual report', () => {
+  const reviewExpected = { ...expected, workflow: { ...workflow, policy: 'independent', review: true } };
+  const artifact =
+    'execution:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222:result';
+  const submission = {
+    id: 'submission',
+    ticket_id: 'ticket',
+    project_id: 'project',
+    actor_id: 'worker',
+    requirements_revision: 1,
+    ticket_revision: 3,
+    evidence: [
+      {
+        criterion_id: context.criteria[0].id,
+        result: 'pass',
+        summary: 'Worker claims every step passed.',
+        references: [artifact],
+      },
+    ],
+  };
+  const readArgs = { project_id: 'project', artifact_id: artifact, offset: 0, length: 65536 };
+  const hash = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
+  const passed = {
+    exit_code: 0,
+    signal: null,
+    error_code: null,
+    verification: {
+      status: 'passed',
+      error_code: null,
+      cleanup_verified: true,
+      steps: [{ status: 'passed', exit_code: 0, signal: null, error_code: null, blocked_by: [] }],
+    },
+  };
+  const read = (report: any, offset = 0, end?: number) => {
+    const bytes = Buffer.from(JSON.stringify(report)),
+      range = bytes.subarray(offset, end ?? bytes.length);
+    return {
+      id: `artifact-${offset}`,
+      tool: 'artifact_read',
+      arguments: { ...readArgs, offset },
+      data: {
+        artifact_id: artifact,
+        status: 'available',
+        size_bytes: bytes.length,
+        total_bytes: bytes.length,
+        truncated: false,
+        omitted_bytes: 0,
+        sha256: hash(bytes),
+        range: { offset, returned_length: range.length, data: range.toString('base64'), sha256: hash(range) },
+      },
+    };
+  };
+  const initial = [
+    {
+      id: 'project',
+      tool: 'project_get',
+      data: {
+        project: { id: 'project', instructions: contract.project.instructions, policy: 'independent' },
+      },
+    },
+    {
+      id: 'ticket',
+      tool: 'ticket_get',
+      data: { ticket: context.ticket, criteria: context.criteria, blockers: [], links: [] },
+    },
+    {
+      id: 'submission',
+      tool: 'ticket_history',
+      arguments: { project_id: 'project', ticket_id: 'ticket', kind: 'submissions', item_id: submission.id },
+      data: { items: [submission] },
+    },
+  ];
+  const review = {
+    id: 'review',
+    tool: 'ticket_review',
+    arguments: {
+      submission_id: submission.id,
+      decision: 'approve',
+      feedback: `Checked ${context.criteria[0].id} at ${artifact}`,
+    },
+    data: {},
+  };
+  const check = (entries: any[]) =>
+    validateRole(parseCodexInvocation(encode(trace(entries)), 0), 'reviewer', reviewExpected);
+  const missing = check([...initial, review]);
+  assert.equal(missing.success, false);
+  assert.ok(missing.proofs[0].missing.includes('submitted_artifact_bytes'));
+  assert.equal(check([...initial, read(passed, 0, 8), review]).success, false);
+  assert.equal(check([...initial, read(passed, 0, 8), read(passed, 8), review]).success, true);
+  assert.equal(check([initial[0], initial[1], read(passed), initial[2], review]).success, false);
+  for (const report of [
+    { ...passed, exit_code: 7 },
+    { ...passed, verification: { ...passed.verification, cleanup_verified: false } },
+    { ...passed, verification: { ...passed.verification, status: 'failed' } },
+    {
+      ...passed,
+      verification: {
+        ...passed.verification,
+        steps: [{ ...passed.verification.steps[0], status: 'failed', exit_code: 7 }],
+      },
+    },
+    { ...passed, verification: { ...passed.verification, steps: [] } },
+  ]) {
+    const rejected = check([...initial, read(report), review]);
+    assert.equal(rejected.success, false);
+    assert.deepEqual(rejected.proofs[0].artifacts.unverified, [artifact]);
+  }
+  const failure = read({ ...passed, exit_code: 7 });
+  assert.equal(
+    check([
+      ...initial,
+      failure,
+      { ...review, arguments: { ...review.arguments, decision: 'request_changes' } },
+    ]).success,
+    true,
+  );
+  const corrupt = read(passed);
+  corrupt.data.range.sha256 = '0'.repeat(64);
+  assert.equal(check([...initial, corrupt, review]).success, false);
+  const foreign = read(passed);
+  foreign.arguments.project_id = 'other-project';
+  assert.equal(check([...initial, foreign, review]).success, false);
 });
 
 it('counts identical mutation retries separately from repeated reads and fresh keys', () => {

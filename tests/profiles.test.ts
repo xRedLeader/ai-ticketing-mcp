@@ -59,7 +59,7 @@ const expected = {
     'knowledge_write',
     'ticket_github_refresh',
   ],
-  reviewer: [...shared, 'ticket_review', 'ticket_note', 'ticket_github_refresh'],
+  reviewer: [...shared, 'ticket_review', 'ticket_note', 'ticket_github_refresh', 'artifact_read'],
   full: Object.keys(schemas),
 };
 const prompts = {

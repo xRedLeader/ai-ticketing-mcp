@@ -26,6 +26,10 @@ const hash = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('h
 const count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 export const artifactResultSchema = z.object({
   artifact_id: z.string(),
+  authorization_binding: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
   status: z.enum(['available', 'missing', 'expired', 'not_configured']),
   size_bytes: count.nullable(),
   total_bytes: count.nullable(),
@@ -394,6 +398,7 @@ export class ExecutionArtifacts {
     length: number,
     now: number,
     pinned = false,
+    requireCapturedHash = false,
   ): ArtifactResult {
     const identity = artifactIdentity.exec(artifactId);
     ensure(
@@ -459,6 +464,11 @@ export class ExecutionArtifacts {
           Number.isSafeInteger(total) && total >= file.size ? total : result.truncated ? null : file.size;
         result.omitted_bytes = result.total_bytes === null ? null : result.total_bytes - file.size;
         const capturedHash = metadata.sha256?.[name];
+        ensure(
+          !requireCapturedHash || (typeof capturedHash === 'string' && /^[a-f0-9]{64}$/.test(capturedHash)),
+          'INVALID_ARTIFACT',
+          'Verified reuse requires an original captured hash.',
+        );
         if (typeof capturedHash === 'string' && /^[a-f0-9]{64}$/.test(capturedHash)) {
           ensure(
             name === 'result' || metadata.bytes?.[name] === file.size,

@@ -31,11 +31,11 @@ export function durableExecutionFile(path: string, value: unknown, beforePublish
     unlinkSync(temporary);
   }
 }
-export function readExecutionFile(path: string): unknown {
+export function readExecutionFile(path: string, maxBytes = 262_144): unknown {
   const fd = openSync(path, 'r');
   try {
     // Journals are operator-owned and bounded; reject a damaged or replaced file before parsing.
-    if (fstatSync(fd).size > 262_144) throw new Error('Execution journal exceeds limit.');
+    if (fstatSync(fd).size > maxBytes) throw new Error('Execution journal exceeds limit.');
     return JSON.parse(readFileSync(fd, 'utf8'));
   } finally {
     closeSync(fd);

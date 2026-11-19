@@ -232,12 +232,19 @@ export const schemas = {
       ...mutation,
       client_id: clientId.optional(),
       ticket_id: ref.optional(),
+      handoff_checkpoint_id: z
+        .string()
+        .refine((value) => id.safeParse(value).success)
+        .optional(),
       capabilities: labels.default([]),
       labels: labels.default([]),
       include_context: z.boolean().default(true),
       max_tokens: maxTokens.default(4096),
     })
-    .strict(),
+    .strict()
+    .refine((value) => !value.handoff_checkpoint_id || (value.ticket_id && value.include_context), {
+      message: 'Handoff acknowledgment requires ticket_id and complete context.',
+    }),
   work_heartbeat: z.object({ ...ticket, ...mutation, claim_token: id }).strict(),
   work_release: z.object({ ...ticket, ...mutation, claim_token: id, reason: text.max(2000) }).strict(),
   ticket_checkpoint: z
@@ -246,8 +253,19 @@ export const schemas = {
       ...mutation,
       claim_token: id,
       ...checkpointFields,
+      handoff: z
+        .object({
+          recipient_id: id,
+          workspace_id: z.string().regex(/^[\w.-]{1,80}$/),
+          commit: z.string().regex(/^[a-f0-9]{40}$/),
+        })
+        .strict()
+        .optional(),
     })
-    .strict(),
+    .strict()
+    .refine((value) => !value.handoff || value.remaining.length > 0, {
+      message: 'Handoffs require remaining responsibility.',
+    }),
   ticket_note: z
     .object({
       ...ticket,
@@ -393,7 +411,7 @@ export const descriptions: Record<Operation, string> = {
   run_cancel: 'Request cancellation; project admin required. Inspect effects with run_get.',
   artifact_read: 'Read untrusted artifact byte ranges as base64 with SHA-256 hashes.',
   ticket_github_refresh:
-    'Link or refresh a PR in the configured trusted repository; retrieve immutable evidence for its exact head SHA. Never approves or merges work.',
+    'Link or refresh a configured repository PR and read immutable checks for its exact head SHA.',
   project_list: 'List accessible projects.',
   project_get: 'Read project instructions, policy and members.',
   project_create: 'Create a project. Requires system administrator access.',
@@ -411,10 +429,10 @@ export const descriptions: Record<Operation, string> = {
   ticket_link:
     'Add or remove a blocking or related relationship. source_id is the prerequisite when kind is blocks.',
   work_next: 'Find eligible execution or review work, ordered by priority and age. Does not claim work.',
-  work_claim: 'Claim eligible work for ten minutes; keep the token.',
+  work_claim: 'Claim or accept handoff; keep token.',
   work_heartbeat: 'Renew the claim for 10 minutes. Use a new idempotency key.',
   work_release: 'Release claim and return work to ready. Checkpoints persist.',
-  ticket_checkpoint: 'Save progress, remaining work, decisions and references under your claim.',
+  ticket_checkpoint: 'Save progress or offer a checkpoint handoff.',
   ticket_note: 'Append comments, questions or answers; blocking unanswered questions prevent work.',
   ticket_submit: 'Submit passing criterion evidence with a live claim and current revision.',
   ticket_review: 'Approve or request changes to the current submission.',

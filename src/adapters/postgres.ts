@@ -42,6 +42,16 @@ const knowledgeColumns = [
   'updated_at',
 ];
 const columns: Record<Table, string[]> = {
+  claim_handoffs: [
+    'id',
+    'project_id',
+    'ticket_id',
+    'source_actor_id',
+    'recipient_id',
+    'source_claim_hash',
+    'requirements_revision',
+    'ticket_revision',
+  ],
   artifact_retirements: [
     'id',
     'project_id',
@@ -479,6 +489,7 @@ function repository(db: Executor): Transaction {
       const values = keys.map((key) => (jsonColumns.has(key) ? JSON.stringify(record[key]) : record[key]));
       const names = keys.map((key) => field(table, key));
       const conflict =
+        table === 'claim_handoffs' ||
         table === 'artifact_retirements' ||
         table === 'github_evidence' ||
         table === 'outbound_deliveries' ||
@@ -498,6 +509,7 @@ function repository(db: Executor): Transaction {
     },
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
+      ensure(table !== 'claim_handoffs', 'IMMUTABLE_HANDOFF', 'Handoff generation fences cannot be deleted.');
       ensure(
         table !== 'wake_conditions',
         'IMMUTABLE_WAKE',

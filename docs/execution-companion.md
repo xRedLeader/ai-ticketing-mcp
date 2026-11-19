@@ -37,7 +37,7 @@ The registry file is bounded to 1 MiB; each normalized recipe and its private su
 
 ## Deterministic verification pipelines
 
-An optional top-level `pipelines` array registers a finite verification pass as one ordinary execution recipe ID. `run_submit` selects that ID; the built-in runner executes every eligible step without model calls or individual MCP turns. The existing supervisor owns the runner and its foreground step children, and the existing attempt, continuation, cancellation, recovery and capacity fences still apply. A pipeline never retries a step.
+An optional top-level `pipelines` array registers a finite verification pass as one ordinary execution recipe ID. `run_submit` selects that ID; the built-in runner executes every eligible step without model calls or individual MCP turns. The existing supervisor owns the runner and its foreground step children, and the existing attempt, continuation, cancellation, recovery and capacity fences still apply. A step retries only through an explicitly registered recovery playbook.
 
 Each step references a registered native-executable recipe. Register an additional Git recipe with empty `argv` and its `cwd` set to the repository root, then add the pipeline to the same registry:
 
@@ -78,6 +78,16 @@ The existing authorized `result` artifact contains a `verification` object with 
 On a Linux step timeout, the runner retains the supervisor-owned process group, publishes the failed `pipeline-report.json` and an exact-attempt `pipeline-timeout.json` marker containing its hash, and waits for outer termination. The supervisor terminates the runner group, including the step and its descendants. If the supervisor exits first, a replacement companion validates the original identity and marker before attempting group termination and publishing the same bounded failure report. Unverifiable cleanup retains capacity. These two immutable files are recovery journals. Cancellation remains a separate primary outcome when it wins the race, while the report retains the timed-out step diagnostics. Total deadlines use monotonic time and are checked after identity validation and immediately before atomic publication; an overdue result cannot be published as passing.
 
 A passing pipeline only satisfies its execution continuation. It does not submit or approve a ticket, replace evidence for current criteria, refresh exact-SHA GitHub CI, or perform independent review. Those operations and their existing validation remain separate. Artifacts identify the source actually checked; a later source revision requires a new pinned pipeline run and current CI/review evidence.
+
+### Exact local verification reuse
+
+Only a pipeline explicitly registered with `"cacheable": true` permits reuse. This is the operator's declaration that verification is deterministic and has no side effects or generated outputs that a later job needs. Ordinary recipes and pipelines without that declaration always execute. Every input must be tracked source or a declared toolchain file, with fixed arguments and environment; work depending on undeclared files, network state, time, randomness or required output effects must remain uncached. The system cannot infer that promise from command text.
+
+The trusted companion checks for reuse before host admission. A hit requires the same project, ticket, actor, current requirements revision, completion condition and registered pipeline fingerprint. That fingerprint pins the exact source revision/tree/tracked bytes, commands, arguments, environment, executables, declared tooling, operating-system/runtime identity and runner. Source and tooling identities are revalidated before lookup and immediately before publication. The lookup inspects only the latest matching actual successful execution; a missing, expired, retired, changed, incomplete or ambiguous candidate is a normal miss and follows ordinary execution. Cached results never become cache sources.
+
+Reuse verifies all three retained canonical artifacts with the existing safe reader, streaming at most 64 KiB per read and requiring the original captured hashes. The result must match its original run/attempt, verified process cleanup and every expected passing pipeline step. The source artifacts remain owned by the original execution. A hit atomically completes the reserved new attempt with those original references and explicit `run.cache` provenance (source run/attempt, exact artifact hashes/sizes and request key). `run_get` and resume packets permit those references only through validated same-project cache provenance. No process starts, no host slot is admitted, and `started_at` stays null; the observation sequence is reserved/completed rather than a new script invocation.
+
+`verification.cache_hit` and `run.cache_miss` audit events attribute the local decision. A hit's evidence references deliberately pin the original artifacts under existing retention checks, including after the ticket closes. Cache publication shares the artifact-retirement lock: an already retired source misses, and a committed hit protects its retained source. Controller, reservation, current claim/authorization, pause and cancellation fences still apply. Cache provenance survives restart in the existing completed observation; no new filesystem publication or schema migration is needed. Reuse satisfies only its execution continuation and never supplies current CI, ticket acceptance, independent review or a claim of billed provider savings.
 
 ## Starting the process
 
@@ -234,3 +244,17 @@ Migration identity is the complete filename in `schema_migrations`, not a unique
 ## Explicit artifact retention
 
 See [operator artifact retention](artifact-retention.md) to retire an exact expired, unreferenced terminal stdout/stderr capture. Retirement preserves authoritative outcomes, private recovery journals and durable audit/receipt records. It is never automatic or model-controlled.
+
+## Registered recovery playbooks
+
+An operator may add `"recovery": { "signature": "RESOURCE_BUSY", "exit_code": 75, "effects": "none" }` to a pipeline step. This declares that the same pinned foreground command may safely run again after that exact transient failure, with no external effects from the failed attempt. The command must emit only this bounded structured JSON on stderr and exit with the registered code:
+
+```json
+{ "kind": "transient_failure", "signature": "RESOURCE_BUSY", "effects": "none", "approval_required": false }
+```
+
+The runner validates the complete stderr object (at most 512 captured bytes), never natural-language output. Unknown signatures or effects, required approvals, source/tool changes, uncertain cleanup, cancellation, journal errors, or a repeated failure stop the whole pipeline even when `on_failure` is `proceed`. A known permitted failure gets at most one retry of the exact same command; no alternate recipe, arguments, credentials, permissions, requirements, CI or review policy are changed.
+
+The original step timeout and pipeline deadline include both attempts and recovery overhead. Retry remains inside the original host admission and resource allocation; it never obtains an extra slot or model turn. Each attempt retains its actual exit, signal, errors, bounded diagnostics, runtime, and exact base64 stderr proof with SHA-256 and completeness. Final step status describes the final attempt; a successful retry still exposes the original adverse evidence under `attempts` and `recovery`. Aggregate log counts include both attempts, and the existing result artifact contains the report. Verification reports are bounded to 1 MiB; other execution journals retain their existing bound.
+
+An immutable `pipeline-recovery-start.json` fences the whole invocation. Before another process can start, an immutable `pipeline-recovery-<step>-1.json` records the original failure and retry intent; ordinal 2 records the outcome or a pre-retry refusal. Existing journals are never replaced. An interrupted or ambiguous retry cannot replay when the runner restarts and cannot claim verified cleanup. The trusted companion's existing dispatch, cancellation, capacity, and reconciliation rules remain in force. Operators must register only commands whose no-external-effects contract and foreground lifetime they have verified; an emitted assertion alone does not authorize a recovery.
