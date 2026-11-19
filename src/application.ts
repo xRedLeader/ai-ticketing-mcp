@@ -69,6 +69,7 @@ export interface ApplicationOptions {
   executionStatus?: ExecutionStatusProvider;
 }
 const LEASE_MS = 600_000;
+const resumeChangeTypes = ['ticket.updated', 'ticket.invalidated', 'ticket.transitioned', 'ticket.linked'];
 const webhookEvents = new Set([
   'ticket.created',
   'ticket.updated',
@@ -3117,7 +3118,12 @@ export class Application {
               input.kind === 'changes'
                 ? await reader.find('events', {
                     ...pageInput,
-                    where: { ...where, entity_id: ticket.id, seq: { gt: input.after_sequence ?? 0 } },
+                    where: {
+                      ...where,
+                      entity_id: ticket.id,
+                      seq: { gt: input.after_sequence ?? 0 },
+                      type: { in: resumeChangeTypes },
+                    },
                     order: [{ field: 'seq', direction: 'desc' }],
                   })
                 : input.kind === 'executions'
@@ -3490,6 +3496,7 @@ export class Application {
       'More than 10,000 dependency links require explicit resolution.',
     );
     const limit = { brief: 1, standard: 3, full: 10 }[input.detail];
+    const resumable = !['in_review', 'done', 'cancelled'].includes(ticket.status);
     const order = [
       { field: 'ticket_revision' as const, direction: 'desc' as const },
       { field: 'id' as const, direction: 'desc' as const },
@@ -3499,7 +3506,7 @@ export class Application {
         reader.find('notes', {
           where: { project_id: project.id, ticket_id: ticket.id, kind: 'checkpoint' },
           order,
-          limit: limit + 2,
+          limit: resumable ? limit + 2 : 1,
         }),
         reader.unansweredQuestions(project.id, ticket.id, false, limit + 1, 0),
         reader.find('reviews', {
@@ -3527,21 +3534,28 @@ export class Application {
               limit: 10001,
             })
           : [],
-        reader.find('execution_jobs', {
-          where: { project_id: project.id, ticket_id: ticket.id },
-          order: [
-            { field: 'created_at', direction: 'desc' },
-            { field: 'id', direction: 'desc' },
-          ],
-          limit: limit + 1,
-        }),
+        resumable
+          ? reader.find('execution_jobs', {
+              where: { project_id: project.id, ticket_id: ticket.id },
+              order: [
+                { field: 'created_at', direction: 'desc' },
+                { field: 'id', direction: 'desc' },
+              ],
+              limit: limit + 1,
+            })
+          : [],
       ]);
     const afterSequence = Number.isSafeInteger(checkpoints[0]?.metadata.event_seq)
       ? (checkpoints[0]!.metadata.event_seq as number)
       : 0;
     const changes = checkpoints.length
       ? await reader.find('events', {
-          where: { project_id: project.id, entity_id: ticket.id, seq: { gt: afterSequence } },
+          where: {
+            project_id: project.id,
+            entity_id: ticket.id,
+            seq: { gt: afterSequence },
+            type: { in: resumeChangeTypes },
+          },
           order: [{ field: 'seq', direction: 'desc' }],
           limit: limit + 1,
         })

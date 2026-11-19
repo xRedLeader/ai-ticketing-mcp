@@ -164,7 +164,9 @@ for (const transport of ['http', 'stdio'] as const)
       for (const omitted of required) {
         assert.ok(profileOperations.executor.includes(omitted.retrieve_with));
         const recovered = await call(omitted.retrieve_with, omitted.arguments);
-        assert.ok(JSON.stringify(recovered).includes(progress));
+        if (omitted.section === 'latest_checkpoint') assert.equal(recovered.body, progress);
+        if (omitted.section === 'execution_outcomes')
+          assert.ok(recovered.items.some((item: any) => item.run.id === submitted.run_id));
       }
       assert.equal(
         await new ExecutionCompanion({
