@@ -151,3 +151,33 @@ it('validates the exact unanswered-question history filter combinations', () => 
   ])
     assert.equal(schemas.ticket_history.safeParse(input).success, false);
 });
+
+it('keeps failed, missing and stale review evidence visible when payloads are omitted', async () => {
+  const f = contextFixture();
+  f.ticket.description = 'Current requirements.';
+  f.ticket.status = 'in_review';
+  (f.ticket as any).github_pull_request = { repository: 'owner/repo', number: 7 };
+  const submission = f.tables.submissions![0];
+  submission.evidence[0].result = 'fail';
+  submission.evidence[0].summary = 'Observed failed requests 0123456789. '.repeat(500);
+  const app = createApplication({ storage: f.storage, search: {} as SearchAdapter, now: () => f.now });
+  const input = { project_id: f.project.id, ticket_id: f.ticket.id, max_tokens: 1536 };
+  const failed = (await app.execute(f.actor.id, 'ticket_context', input, 'reviewer')) as any;
+  assert.ok(failed.review_blockers.some((item: any) => item.code === 'EVIDENCE_FAILED'));
+  assert.ok(
+    failed.review_blockers.some(
+      (item: any) => item.code === 'GITHUB_EVIDENCE_UNVERIFIED' && item.message.includes('missing'),
+    ),
+  );
+  assert.equal(failed.submissions, undefined);
+  assert.ok(
+    failed.omitted.some((item: any) => item.section === 'submissions' && item.required_before === 'review'),
+  );
+  assert.ok(countReferenceTokens(serializeSuccessEnvelope(failed)) <= input.max_tokens);
+  submission.evidence = [];
+  const missing = (await app.execute(f.actor.id, 'ticket_context', input, 'reviewer')) as any;
+  assert.ok(missing.review_blockers.some((item: any) => item.code === 'EVIDENCE_INCOMPLETE'));
+  submission.requirements_revision = 0;
+  const stale = (await app.execute(f.actor.id, 'ticket_context', input, 'reviewer')) as any;
+  assert.ok(stale.review_blockers.some((item: any) => item.code === 'STALE_SUBMISSION'));
+});

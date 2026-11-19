@@ -22,6 +22,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { getEncoding } from 'js-tiktoken';
+import { observeArtifactEvidence } from './real-client-observation.js';
 
 const encoding = getEncoding('o200k_base');
 const tokens = (text: string) => encoding.encode(text, [], []).length;
@@ -169,6 +170,8 @@ export function deliveryProof(calls: any[], actor: string, profile: string, tool
       dependencies: any,
       claim: any,
       checkpoint: any;
+    let unverifiedArtifacts = false,
+      reviewBlockers: any[] = [];
     let pending: any[] = [],
       submissions: any[] = [];
     for (const call of calls.filter((call) => call.ok)) {
@@ -187,6 +190,7 @@ export function deliveryProof(calls: any[], actor: string, profile: string, tool
           dependencies = undefined;
           checkpoint = undefined;
           pending = [];
+          unverifiedArtifacts = false;
           submissions = [];
           claim = undefined;
         }
@@ -196,6 +200,8 @@ export function deliveryProof(calls: any[], actor: string, profile: string, tool
         dependencies = context?.dependencies ?? data.links ?? dependencies;
         claim = data.claim ?? context?.claim ?? claim;
         if (context) {
+          unverifiedArtifacts = false;
+          reviewBlockers = context.review_blockers ?? [];
           checkpoint = context.latest_checkpoint ?? checkpoint;
           submissions.push(...(context.submissions ?? []));
           pending = (context.omitted ?? [])
@@ -229,9 +235,17 @@ export function deliveryProof(calls: any[], actor: string, profile: string, tool
             !Array.isArray(data?.items)
           )
             return [item];
-          return data.items.length >= (item.arguments.limit ?? 10)
+          return (data.has_more ?? data.items.length >= (item.arguments.limit ?? 10))
             ? [{ ...item, nextOffset: offset + data.items.length }]
             : [];
+        }
+        if (call.tool === 'artifact_read') {
+          const { offset: _wantedOffset, ...wanted } = item.arguments;
+          const { offset: _receivedOffset, ...received } = call.arguments;
+          if (stable(wanted) !== stable(received)) return [item];
+          const result = observeArtifactEvidence(item, call.arguments, data);
+          unverifiedArtifacts ||= result.unverified;
+          return result.pending ? [result.pending] : [];
         }
         if (stable(item.arguments) !== stable(call.arguments)) return [item];
         if (item.arguments.item_id && !data?.items?.some((entry: any) => entry.id === item.arguments.item_id))
@@ -261,6 +275,8 @@ export function deliveryProof(calls: any[], actor: string, profile: string, tool
           Array.isArray(checkpoint.metadata?.remaining) &&
           Array.isArray(checkpoint.metadata?.decisions));
     if (tool === 'ticket_review') {
+      facts[prefix + 'submitted_artifacts_verified'] =
+        args.decision !== 'approve' || (!unverifiedArtifacts && !reviewBlockers.length);
       const selected = submissions.find((item) => item.id === args.submission_id);
       facts[prefix + 'selected_submission_evidence'] =
         selected?.requirements_revision === ticket.requirements_revision &&
@@ -528,6 +544,7 @@ export async function recoverOmissions(
   for (const omission of context.omitted ?? []) {
     if (!omission.retrieve_with || !omission.arguments) continue;
     let args = { ...omission.arguments };
+    let artifact = { ...omission, nextOffset: args.offset ?? 0 };
     const seen = new Set<string>();
     for (let page = 0; ; page++) {
       assert.ok(page < 1000, 'Omission pagination did not terminate.');
@@ -541,13 +558,22 @@ export async function recoverOmissions(
         arguments: args,
         data,
       });
+      if (omission.retrieve_with === 'artifact_read') {
+        const result = observeArtifactEvidence(artifact, args, data);
+        assert.ok(!result.unverified, 'Submitted artifact is unavailable, incomplete, or failed.');
+        if (!result.pending) break;
+        assert.ok(result.pending.nextOffset > artifact.nextOffset, 'Artifact recovery made no progress.');
+        artifact = result.pending;
+        args = { ...args, offset: artifact.nextOffset };
+        continue;
+      }
       if (omission.retrieve_with !== 'ticket_history' || args.item_id) break;
       const limit = args.limit ?? 10;
       for (const item of data.items) {
         assert.ok(!seen.has(item.id), 'Duplicate omission item across pages.');
         seen.add(item.id);
       }
-      if (data.items.length < limit) break;
+      if (!(data.has_more ?? data.items.length >= limit)) break;
       args = { ...args, offset: (args.offset ?? 0) + data.items.length };
     }
   }

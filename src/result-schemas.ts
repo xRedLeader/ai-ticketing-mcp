@@ -332,6 +332,7 @@ const context = z.discriminatedUnion('not_modified', [
     approval_policy: z.enum(['self', 'independent', 'human']),
     blockers: z.array(blocker),
     completion_blockers: z.array(blocker),
+    review_blockers: z.array(blocker).optional(),
     dependencies: z.array(link.extend({ ticket: ticketSummary.nullable() })),
     claim: visibleClaim,
     untrusted_content_notice: z.string(),

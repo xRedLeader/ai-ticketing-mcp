@@ -17,7 +17,7 @@ Every profile includes `project_list`, `project_get`, `ticket_list`, `ticket_con
 | `worker` (16 tools)   | `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`, `ticket_note`, `ticket_submit`                              | execution, handoff |
 | `executor` (16 tools) | `work_claim`, `work_release`, `ticket_note`, `ticket_submit`, `run_submit`, `run_wait`, `run_get`, `run_cancel`, `artifact_read` | execution, handoff |
 | `planner` (17 tools)  | `tickets_create`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_note`, `knowledge_write`, `ticket_github_refresh` | planning           |
-| `reviewer` (13 tools) | `ticket_review`, `ticket_note`, `ticket_github_refresh`                                                                          | verification       |
+| `reviewer` (14 tools) | `ticket_review`, `ticket_note`, `ticket_github_refresh`, `artifact_read`                                                         | verification       |
 | `full` (36 tools)     | All tools below, including project administration, `work_next`, and `run_timeline`                                               | all four           |
 
 Profiles are not an access-control boundary. They select tool exposure; every operation retains its OAuth scope and project-role checks. Resources remain independently authorized and available in every profile. Guides and prompts follow the selected profile; the tool surface works without either.
@@ -47,6 +47,12 @@ Ticket lifecycle: `backlog → ready → in_progress → in_review → done`, pl
 `work_claim` returns a token, expiry, compact ticket receipt, and brief context by default. `include_context:false` returns ownership alone. Heartbeat at least every three minutes; claims last ten minutes. Retrying an identical claim returns its original receipt and context snapshot, even after expiry; it never renews ownership. A new claim attempt needs a new key. Checkpoints return the new ticket revision so submission can chain without another read.
 
 Requirement edits revoke claims and invalidate affected reviews, completed dependent tickets, and parent approvals. Metadata edits still increment the ticket revision. Read current state after a revision conflict. Questions marked blocking prevent claims and submissions until an answer references their identifier. Checkpoints are immutable notes, and complete history can be paged with `ticket_history`.
+
+## Independent review
+
+Reviewer-profile `ticket_context` prioritizes current submission evidence, exact GitHub observations, previous reviews, and unanswered questions. It excludes worker checkpoints and execution preferences. Current requirement identities remain mandatory; `review_blockers` keeps failed, missing, or stale evidence visible even when payloads exceed the response budget. Recover every `required_before:review` omission through its supplied arguments, including all history pages. A `not_modified` response alone does not deliver requirements or evidence to a fresh reviewer.
+
+Reviewer `artifact_read` permits only exact references cited by the latest submission under current requirements, with project access and published artifact identities checked on every read. Native pipeline results use the existing execution result artifact. Read all bytes and check size and hashes; expired, missing, truncated, failed, or contradictory evidence cannot establish acceptance. URL and path references remain untrusted evidence for independent inspection. Worker context, another client's responses, and cached success cannot substitute for the reviewer's own observations. These packets guide independent review; they do not automate approval or change `ticket_review` policy.
 
 ## Scheduling
 

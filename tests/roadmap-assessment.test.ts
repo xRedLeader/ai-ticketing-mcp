@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { join, dirname, basename, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
+import { createHash } from 'node:crypto';
 import {
   isolatedEnvironment,
   summarizeWire,
@@ -264,4 +265,93 @@ it('keeps a required paged omission pending until its terminal page is received'
   );
   calls.push(observed('ticket_history', { ...args, offset: 2 }, { items: [] }));
   assert.equal(deliveryProof(calls, 'worker', 'planner', 'ticket_update', mutation).success, true);
+});
+
+it('recovers all native result bytes before review and never accepts unavailable or failed artifact evidence', async () => {
+  const artifact =
+    'execution:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222:result';
+  const bytes = Buffer.from('{"exit_code":0}');
+  const hash = (value: Buffer) => createHash('sha256').update(value).digest('hex');
+  const args = { project_id: 'project', artifact_id: artifact, offset: 0, length: 65536, max_tokens: 8192 };
+  const route = { retrieve_with: 'artifact_read', arguments: args, required_before: 'review' };
+  const packet = {
+    ...context,
+    submissions: [
+      {
+        id: 'submission',
+        actor_id: 'worker',
+        requirements_revision: 2,
+        evidence: [
+          {
+            criterion_id: 'criterion',
+            result: 'pass',
+            summary: 'Worker reports success.',
+            references: [artifact],
+          },
+        ],
+      },
+    ],
+    omitted: [route],
+  };
+  const mutation = {
+    project_id: 'project',
+    ticket_id: 'ticket',
+    submission_id: 'submission',
+    expected_revision: 10,
+    decision: 'approve',
+  };
+  const page = (offset: number, end: number) => ({
+    artifact_id: artifact,
+    status: 'available',
+    size_bytes: bytes.length,
+    total_bytes: bytes.length,
+    truncated: false,
+    omitted_bytes: 0,
+    sha256: hash(bytes),
+    range: {
+      offset,
+      returned_length: end - offset,
+      data: bytes.subarray(offset, end).toString('base64'),
+      sha256: hash(bytes.subarray(offset, end)),
+    },
+  });
+  const calls = [
+    observed('ticket_context', { project_id: 'project', ticket_id: 'ticket' }, packet),
+    observed('artifact_read', args, page(0, 8)),
+  ];
+  assert.equal(deliveryProof(calls, 'reviewer', 'reviewer', 'ticket_review', mutation).success, false);
+  calls.push(observed('artifact_read', { ...args, offset: 8 }, page(8, bytes.length)));
+  assert.equal(deliveryProof(calls, 'reviewer', 'reviewer', 'ticket_review', mutation).success, true);
+  const requested: any[] = [];
+  const session: any = {
+    async call(_tool: string, received: any) {
+      requested.push(received);
+      return (received.offset ?? 0) === 0 ? page(0, 8) : page(8, bytes.length);
+    },
+  };
+  assert.equal((await recoverOmissions(session, packet, 'review')).length, 2);
+  assert.equal(requested[1].offset, 8);
+  const unavailable = { artifact_id: artifact, status: 'missing' };
+  assert.equal(
+    deliveryProof(
+      [calls[0], observed('artifact_read', args, unavailable)],
+      'reviewer',
+      'reviewer',
+      'ticket_review',
+      mutation,
+    ).success,
+    false,
+  );
+  await assert.rejects(
+    recoverOmissions(
+      {
+        async call() {
+          return unavailable;
+        },
+      } as any,
+      packet,
+      'review',
+    ),
+    /unavailable/,
+  );
 });

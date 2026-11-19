@@ -455,7 +455,7 @@ it('rejects cycles, unknown recipes, source mismatch and arbitrary pipeline comm
   }
 });
 
-it('settles one fenced durable run and publishes the pipeline through the existing result artifact without submitting the ticket', async () => {
+it('publishes a fenced native pipeline result for independent review without automatic submission', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'ticketing-pipeline-db-'));
   const adapters = createSqliteAdapters(join(directory, 'store.sqlite'));
   await adapters.storage.migrate();
@@ -511,6 +511,40 @@ it('settles one fenced durable run and publishes the pipeline through the existi
       ['passed', 'passed'],
     );
     assert.equal(await new ExecutionCompanion(options).runOnce(), false);
+    const current = await authority.read(ticket.id);
+    await app.execute(authority.worker.id, 'ticket_submit', {
+      project_id: f.project,
+      ticket_id: ticket.id,
+      claim_token: claim.claim.token,
+      expected_revision: current.ticket.revision,
+      idempotency_key: randomUUID(),
+      summary: 'Inspect the native pipeline result independently.',
+      evidence: current.criteria.map((criterion: any) => ({
+        criterion_id: criterion.id,
+        result: 'pass',
+        summary: 'Both configured steps completed.',
+        references: [result.artifact_id],
+      })),
+    });
+    const review = (await app.execute(
+      authority.reviewer.id,
+      'ticket_context',
+      { project_id: f.project, ticket_id: ticket.id },
+      'reviewer',
+    )) as any;
+    const reference = review.omitted.find((item: any) => item.section === 'submission_artifact');
+    assert.equal(reference.arguments.artifact_id, result.artifact_id);
+    const independent = (await app.execute(
+      authority.reviewer.id,
+      reference.retrieve_with,
+      reference.arguments,
+      'reviewer',
+    )) as any;
+    assert.equal(independent.sha256, result.sha256);
+    assert.deepEqual(
+      JSON.parse(Buffer.from(independent.range.data, 'base64').toString()).verification,
+      outcome.verification,
+    );
   } finally {
     capacity.close();
     await adapters.storage.close();
