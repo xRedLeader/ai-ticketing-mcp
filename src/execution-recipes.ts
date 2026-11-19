@@ -3,6 +3,11 @@ import { closeSync, openSync, readFileSync, readSync, realpathSync, statSync } f
 import { extname, isAbsolute, relative, sep } from 'node:path';
 import { z } from 'zod';
 import { ensure } from './contracts.js';
+import {
+  pinVerificationPipeline,
+  verificationPipelineSchema,
+  type VerificationPipeline,
+} from './verification-pipeline.js';
 
 export const EXECUTION_TIMEOUT_MS = 30 * 60_000;
 export const MAX_EXECUTION_RECIPE_BYTES = 2 * 1024 * 1024;
@@ -36,8 +41,9 @@ const recipeSchema = z.strictObject({
 const registrySchema = z.strictObject({
   workspace_roots: z.array(z.string().min(1).max(4096)).min(1).max(32),
   recipes: z.array(recipeSchema).max(128),
+  pipelines: z.array(verificationPipelineSchema).max(32).default([]),
 });
-export type ExecutionRecipe = Readonly<
+export type ExecutionCommand = Readonly<
   Omit<z.output<typeof recipeSchema>, 'argv' | 'env' | 'project_ids' | 'resources'> & {
     argv: readonly string[];
     env: Readonly<Record<string, string>>;
@@ -46,6 +52,7 @@ export type ExecutionRecipe = Readonly<
     fingerprint: string;
   }
 >;
+export type ExecutionRecipe = ExecutionCommand | VerificationPipeline;
 
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
@@ -70,11 +77,12 @@ export class ExecutionRecipeRegistry {
       return path;
     });
     ensure(
-      new Set(config.recipes.map((recipe) => recipe.id)).size === config.recipes.length,
+      new Set([...config.recipes, ...config.pipelines].map((recipe) => recipe.id)).size ===
+        config.recipes.length + config.pipelines.length,
       'INVALID_CONFIG',
       'Execution recipe IDs must be unique.',
     );
-    this.recipes = Object.freeze(
+    const commands = Object.freeze(
       config.recipes.map((recipe) => {
         ensure(
           isAbsolute(recipe.cwd) && isAbsolute(recipe.executable),
@@ -161,6 +169,10 @@ export class ExecutionRecipeRegistry {
         return pinned;
       }),
     );
+    this.recipes = Object.freeze([
+      ...commands,
+      ...config.pipelines.map((pipeline) => pinVerificationPipeline(pipeline, commands, roots)),
+    ]);
   }
 
   metadata() {

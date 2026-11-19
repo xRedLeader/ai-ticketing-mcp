@@ -35,6 +35,48 @@ The registry resolves real paths, requires an absolute native executable, reject
 
 The registry file is bounded to 1 MiB; each normalized recipe and its private supervisor input are bounded to 2 MiB, checked before dispatch. Timeout defaults to 30 minutes and cannot exceed it. Each stdout/stderr file defaults to 1 MiB, with a configured maximum of 16 MiB each. Both pipes continue draining after the retained byte limit, so truncation does not deadlock the child. Recipe IDs are at most 80 characters. The SHA-256 fingerprint covers normalized registration, including argv, cwd, environment, limits and project allowlist. It does not hash executable/script contents: the operator must protect those files and bump registration when changing their meaning. Changing/removing a recipe does not silently redirect an already submitted job; it fails before spawn.
 
+## Deterministic verification pipelines
+
+An optional top-level `pipelines` array registers a finite verification pass as one ordinary execution recipe ID. `run_submit` selects that ID; the built-in runner executes every eligible step without model calls or individual MCP turns. The existing supervisor owns the runner and its foreground step children, and the existing attempt, continuation, cancellation, recovery and capacity fences still apply. A pipeline never retries a step.
+
+Each step references a registered native-executable recipe. Register an additional Git recipe with empty `argv` and its `cwd` set to the repository root, then add the pipeline to the same registry:
+
+```json
+{
+  "pipelines": [
+    {
+      "id": "verify-pipeline",
+      "project_ids": ["00000000-0000-4000-8000-000000000001"],
+      "source": {
+        "recipe_id": "source-git",
+        "commit": "0123456789abcdef0123456789abcdef01234567"
+      },
+      "steps": [
+        {
+          "id": "checks",
+          "recipe_id": "verify",
+          "needs": [],
+          "on_failure": "stop",
+          "toolchain_files": ["G:\\Work\\repo\\package-lock.json"]
+        }
+      ],
+      "timeout_ms": 1800000,
+      "max_log_bytes": 1048576
+    }
+  ]
+}
+```
+
+The commit must be the exact current Git HEAD, and tracked files must be clean when both processes load the registry. Source identity includes HEAD, its tree object and a SHA-256 digest of every tracked working file's actual bytes, including files hidden by Git index flags. Untracked generated output is excluded. Tracked symbolic links and submodules are rejected. Run verification in a dedicated checkout and declare every additional file consumed by tooling outside the tracked source in `toolchain_files`; those entries must be canonical regular files inside a configured workspace root. The existing trusted foreground-work contract applies to all inputs and commands.
+
+The immutable pipeline fingerprint includes normalized commands and project allowlists, source identity, step/dependency order, stop/proceed rules, executable hashes, declared toolchain-file hashes, and the built-in runner/runtime hashes. Every referenced recipe must allow every pipeline project. Limits are 32 pipelines, 16 steps per pipeline, 64 declared toolchain files per step, a 2 MiB normalized pipeline, and a 30-minute total timeout. Steps execute in declaration order; dependencies must reference earlier unique step IDs. Admission uses the largest declared CPU and memory requirement across the sequential steps.
+
+`on_failure: "stop"` skips all remaining steps after a failed or timed-out step. `"proceed"` permits independent later steps; any step whose dependencies did not pass is recorded as skipped with the failed dependency IDs. Source or toolchain changes always stop further execution. Source, relevant step tooling and runtime identities are checked before and after each executed step, and all identities are checked again before the supervisor publishes its result. Missing or changed identities fail verification. Timeout cleanup that cannot be proved retains unresolved capacity under the existing host rules.
+
+The existing authorized `result` artifact contains a `verification` object with exact identity hashes, ordered step results, exit codes, timeout/failure/skip codes and separate stdout/stderr diagnostics. Each step retains at most 512 diagnostic bytes per stream, with total byte counts and truncation flags. Aggregate stdout/stderr logs share the pipeline capture limits. Reports omit command arguments, environment, source paths and process credentials; captured command output remains untrusted content.
+
+A passing pipeline only satisfies its execution continuation. It does not submit or approve a ticket, replace evidence for current criteria, refresh exact-SHA GitHub CI, or perform independent review. Those operations and their existing validation remain separate. Artifacts identify the source actually checked; a later source revision requires a new pinned pipeline run and current CI/review evidence.
+
 ## Starting the process
 
 Build with `npm run build`. Use a dedicated registered project-admin actor for the trusted companion APIs. The submitting agent still uses its own normal claim and contributor permissions.
