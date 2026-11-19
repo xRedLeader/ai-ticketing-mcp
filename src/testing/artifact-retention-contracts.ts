@@ -296,6 +296,13 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
     });
     await assert.rejects(f.retire(), hasCode('ARTIFACT_PINNED'));
   });
+  check('preserves terminal logs cited by trusted cancellation reconciliation evidence', async (f) => {
+    await f.finish();
+    await f.app.cancelExecutionRun(f.admin.id, f.project.id, f.run.id);
+    await f.app.reconcileExecutionCancellation(f.admin.id, f.project.id, f.run.id, `Inspected ${f.refs[0]}`);
+    await assert.rejects(f.retire(), hasCode('ARTIFACT_PINNED'));
+    assert.ok(existsSync(join(f.path, 'stdout.log')));
+  });
   check('never unlinks a file if the durable decision fails to commit', async (f) => {
     await f.finish();
     const wrapped = proxy(
@@ -354,6 +361,11 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
       );
       assert.equal((await f.retire(app)).removed, true);
       assert.equal((await f.read(app)).status, 'expired');
+      await app.cancelExecutionRun(f.admin.id, f.project.id, f.run.id);
+      await assert.rejects(
+        app.reconcileExecutionCancellation(f.admin.id, f.project.id, f.run.id, `Inspect ${f.refs[0]}`),
+        hasCode('ARTIFACT_RETIRED'),
+      );
     },
   );
   check('recovers unlink-before-audit-commit failure without deleting another file', async (f) => {
