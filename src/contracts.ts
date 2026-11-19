@@ -128,11 +128,18 @@ export interface Knowledge {
   project_id: string;
   title: string;
   body: string;
-  kind: 'policy' | 'decision' | 'runbook' | 'architecture' | 'note';
+  kind: 'policy' | 'decision' | 'convention' | 'pitfall' | 'runbook' | 'architecture' | 'note';
+  sources: { kind: 'ticket' | 'knowledge' | 'checkpoint'; id: string; revision: number }[];
+  status: 'proposed' | 'accepted';
+  verification:
+    { state: 'unverified' } | { state: 'verified'; actor_id: string; verified_at: string; evidence: string };
   revision: number;
   archived: boolean;
   actor_id: string;
   updated_at: string;
+}
+export interface KnowledgeRevision extends Knowledge {
+  knowledge_id: string;
 }
 export interface Event {
   id: string;
@@ -201,6 +208,91 @@ export interface Job {
   lock_token: string | null;
   last_error: string | null;
 }
+export interface ExecutionRecipeRegistration {
+  id: string;
+  fingerprint: string;
+  project_ids: readonly string[];
+}
+export interface ExecutionOutcome {
+  exit_code: number | null;
+  signal: string | null;
+  artifacts: string[];
+  error_code: string | null;
+}
+export interface ExecutionJob extends ExecutionOutcome {
+  id: string;
+  project_id: string;
+  ticket_id: string;
+  actor_id: string;
+  checkpoint_id: string;
+  continuation_id: string;
+  claim_token: string;
+  requirements_revision: number;
+  recipe_id: string;
+  recipe_fingerprint: string;
+  status: 'queued' | 'reserved' | 'running' | 'succeeded' | 'failed';
+  reservation_token: string | null;
+  locked_until: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+}
+export interface Continuation {
+  id: string;
+  project_id: string;
+  ticket_id: string;
+  run_id: string;
+  checkpoint_id: string;
+  requirements_revision: number;
+  completion_condition: { kind: 'exit_code'; exit_code: number };
+  status: 'pending' | 'satisfied' | 'failed';
+  failure_reason: string | null;
+  created_at: string;
+  settled_at: string | null;
+}
+export interface ExecutionControllerFence {
+  token: string;
+  generation: number;
+}
+export interface ExecutionController extends ExecutionControllerFence {
+  id: string;
+  owner_id: string;
+  expires_at: string;
+}
+/** Identity and predecessor never change, including after controller replacement. */
+export interface ExecutionAttempt {
+  id: string;
+  project_id: string;
+  run_id: string;
+  previous_attempt_id: string | null;
+  ordinal: number;
+  process_token: string;
+  created_at: string;
+}
+export interface ExecutionProcessIdentity {
+  pid: number;
+  start_marker: string;
+}
+export interface ExecutionObservation {
+  id: string;
+  project_id: string;
+  run_id: string;
+  attempt_id: string;
+  sequence: number;
+  controller_generation: number;
+  kind: 'reserved' | 'dispatching' | 'running' | 'completed' | 'unresolved';
+  next_step: 'dispatch' | 'inspect_launch' | 'wait_for_result' | 'inspect_side_effects' | 'none';
+  process_identity: ExecutionProcessIdentity | null;
+  outcome: ExecutionOutcome | null;
+  created_at: string;
+}
+export interface ExecutionReconciliation {
+  run: ExecutionJob;
+  attempt: ExecutionAttempt | null;
+  observation: ExecutionObservation | null;
+  state: 'queued' | 'running' | 'completed' | 'unresolved';
+  next_step: ExecutionObservation['next_step'];
+}
 export interface OutboundDelivery {
   id: string;
   event_id: string;
@@ -227,6 +319,11 @@ export interface WebhookTarget {
   send(delivery: OutboundDelivery): Promise<{ error_code: string } | undefined>;
 }
 export interface Tables {
+  execution_controllers: ExecutionController;
+  execution_attempts: ExecutionAttempt;
+  execution_observations: ExecutionObservation;
+  execution_jobs: ExecutionJob;
+  continuations: Continuation;
   outbound_deliveries: OutboundDelivery;
   github_evidence: GitHubEvidence;
   actors: Actor;
@@ -240,6 +337,7 @@ export interface Tables {
   submissions: Submission;
   reviews: Review;
   knowledge: Knowledge;
+  knowledge_revisions: KnowledgeRevision;
   events: Event;
   receipts: Receipt;
   jobs: Job;
@@ -275,10 +373,18 @@ export interface Reader {
   find<K extends Table>(table: K, query?: Query<Tables[K]>): Promise<Tables[K][]>;
 }
 export interface Transaction extends Reader {
+  /** Locks the store-wide controller until transaction commit, including on PostgreSQL. */
+  lockExecutionController?(): Promise<ExecutionController | null>;
+  /** Optional durable execution capability; updates only the exact prior ownership/state. */
+  compareExecutionRun?(previous: ExecutionJob, next: ExecutionJob): Promise<boolean>;
   put<K extends Table>(table: K, value: Tables[K]): Promise<void>;
   remove<K extends Table>(table: K, id: string): Promise<void>;
 }
 export interface StorageAdapter extends Reader {
+  readonly executionRuns?: true;
+  /** Private bootstrap for a detached supervisor connected to this same physical store. */
+  readonly executionLaunchStorage?:
+    { adapter: 'sqlite'; filename: string } | { adapter: 'postgres'; connection_string: string };
   /** Absent capabilities support only the legacy priority_age ordering. */
   readonly schedulingPolicies?: readonly SchedulingPolicy[];
   /** One consistent read-only view, independent of project mutation locks. */
@@ -316,6 +422,11 @@ export interface SearchDocument {
   title: string;
   text: string;
   archived: boolean;
+  memory?: {
+    status: Knowledge['status'];
+    verification_state: Knowledge['verification']['state'];
+    trusted_reuse: false;
+  };
 }
 export interface SearchHit {
   id: string;

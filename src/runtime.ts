@@ -4,6 +4,7 @@ import { HttpEmbeddings } from './adapters/embeddings.js';
 import { createApplication } from './application.js';
 import { GitHubClient } from './github.js';
 import { SignedWebhook } from './webhook.js';
+import { loadExecutionRecipes } from './execution-recipes.js';
 import { ensure, type StorageAdapter, type SearchAdapter, type EmbeddingProvider } from './contracts.js';
 export function createRuntime(env: NodeJS.ProcessEnv = process.env) {
   ensure(
@@ -61,6 +62,9 @@ export function createRuntime(env: NodeJS.ProcessEnv = process.env) {
     search,
     embeddings,
     webhook,
+    executionRecipes: env.EXECUTION_RECIPES_FILE
+      ? loadExecutionRecipes(env.EXECUTION_RECIPES_FILE).metadata()
+      : [],
     referenceTokenMetrics: env.REFERENCE_TOKEN_METRICS === 'true',
     ...(env.TICKETING_GITHUB_REPOSITORY
       ? {

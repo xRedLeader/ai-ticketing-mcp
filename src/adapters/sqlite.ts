@@ -26,7 +26,79 @@ import {
 } from '../contracts.js';
 import { MAX_INDEX_JOB_ATTEMPTS } from './index-job-policy.js';
 
+const knowledgeColumns = [
+  'id',
+  'project_id',
+  'title',
+  'body',
+  'kind',
+  'sources',
+  'status',
+  'verification',
+  'revision',
+  'archived',
+  'actor_id',
+  'updated_at',
+];
 const columns: Record<Table, string[]> = {
+  execution_controllers: ['id', 'owner_id', 'token', 'generation', 'expires_at'],
+  execution_attempts: [
+    'id',
+    'project_id',
+    'run_id',
+    'previous_attempt_id',
+    'ordinal',
+    'process_token',
+    'created_at',
+  ],
+  execution_observations: [
+    'id',
+    'project_id',
+    'run_id',
+    'attempt_id',
+    'sequence',
+    'controller_generation',
+    'kind',
+    'next_step',
+    'process_identity',
+    'outcome',
+    'created_at',
+  ],
+  execution_jobs: [
+    'id',
+    'project_id',
+    'ticket_id',
+    'actor_id',
+    'checkpoint_id',
+    'continuation_id',
+    'claim_token',
+    'requirements_revision',
+    'recipe_id',
+    'recipe_fingerprint',
+    'status',
+    'reservation_token',
+    'locked_until',
+    'started_at',
+    'finished_at',
+    'exit_code',
+    'signal',
+    'artifacts',
+    'error_code',
+    'created_at',
+  ],
+  continuations: [
+    'id',
+    'project_id',
+    'ticket_id',
+    'run_id',
+    'checkpoint_id',
+    'requirements_revision',
+    'completion_condition',
+    'status',
+    'failure_reason',
+    'created_at',
+    'settled_at',
+  ],
   actors: ['id', 'issuer', 'subject', 'name', 'kind', 'system_admin'],
   projects: [
     'id',
@@ -102,7 +174,8 @@ const columns: Record<Table, string[]> = {
     'ticket_revision',
     'created_at',
   ],
-  knowledge: ['id', 'project_id', 'title', 'body', 'kind', 'revision', 'archived', 'actor_id', 'updated_at'],
+  knowledge: knowledgeColumns,
+  knowledge_revisions: [...knowledgeColumns, 'knowledge_id'],
   events: ['id', 'project_id', 'seq', 'actor_id', 'type', 'entity_id', 'data', 'created_at'],
   receipts: ['id', 'project_id', 'actor_id', 'operation', 'input_hash', 'result', 'created_at'],
   jobs: [
@@ -148,6 +221,10 @@ const columns: Record<Table, string[]> = {
   ],
 };
 const json = new Set([
+  'process_identity',
+  'outcome',
+  'artifacts',
+  'completion_condition',
   'labels',
   'capabilities',
   'metadata',
@@ -156,6 +233,8 @@ const json = new Set([
   'execution_hints',
   'github_pull_request',
   'checks',
+  'sources',
+  'verification',
   'data',
   'result',
 ]);
@@ -215,6 +294,42 @@ function repository(db: DatabaseSync): Transaction {
     return `"${key}"`;
   };
   return {
+    async lockExecutionController() {
+      return await this.get('execution_controllers', 'execution');
+    },
+    async compareExecutionRun(previous, next) {
+      ensure(
+        previous.id === next.id && previous.project_id === next.project_id,
+        'INVALID_INPUT',
+        'Execution identity cannot change.',
+      );
+      if (previous.status === 'succeeded' || previous.status === 'failed') return false;
+      const keys = [
+        'status',
+        'reservation_token',
+        'locked_until',
+        'started_at',
+        'finished_at',
+        'exit_code',
+        'signal',
+        'artifacts',
+        'error_code',
+      ] as const;
+      return (
+        db
+          .prepare(
+            `UPDATE execution_jobs SET ${keys.map((key) => `${key}=?`).join(',')} WHERE id=? AND project_id=? AND status=? AND reservation_token IS ? AND locked_until IS ?`,
+          )
+          .run(
+            ...keys.map((key) => encode(key, next[key])),
+            previous.id,
+            previous.project_id,
+            previous.status,
+            previous.reservation_token,
+            previous.locked_until,
+          ).changes === 1
+      );
+    },
     async get<K extends Table>(table: K, id: string) {
       return (await this.find(table, { where: { id } as Query<Tables[K]>['where'], limit: 1 }))[0] ?? null;
     },
@@ -303,7 +418,12 @@ function repository(db: DatabaseSync): Transaction {
         'A record ID is required.',
       );
       const conflict =
-        table === 'github_evidence' || table === 'outbound_deliveries'
+        table === 'github_evidence' ||
+        table === 'outbound_deliveries' ||
+        table === 'knowledge_revisions' ||
+        table === 'execution_jobs' ||
+        table === 'execution_attempts' ||
+        table === 'execution_observations'
           ? ''
           : ` ON CONFLICT(id) DO UPDATE SET ${keys
               .filter((key) => key !== 'id')
@@ -315,6 +435,22 @@ function repository(db: DatabaseSync): Transaction {
     },
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
+      ensure(
+        ![
+          'execution_jobs',
+          'continuations',
+          'execution_attempts',
+          'execution_observations',
+          'execution_controllers',
+        ].includes(table),
+        'IMMUTABLE_EXECUTION',
+        'Execution history cannot be deleted.',
+      );
+      ensure(
+        table !== 'knowledge' && table !== 'knowledge_revisions',
+        'IMMUTABLE_KNOWLEDGE',
+        'Archive knowledge instead of deleting its revision history.',
+      );
       ensure(table !== 'github_evidence', 'IMMUTABLE_EVIDENCE', 'GitHub evidence records are immutable.');
       ensure(
         table !== 'outbound_deliveries',
@@ -425,6 +561,10 @@ class Handle {
   }
 }
 class SqliteStorage extends Handle implements StorageAdapter {
+  readonly executionRuns = true as const;
+  get executionLaunchStorage() {
+    return Object.freeze({ adapter: 'sqlite' as const, filename: this.shared.path });
+  }
   readonly schedulingPolicies = Object.freeze(['priority_age', 'unblocking'] as const);
   get<K extends Table>(table: K, id: string) {
     this.open();

@@ -23,7 +23,79 @@ import {
 } from '../contracts.js';
 import { MAX_INDEX_JOB_ATTEMPTS } from './index-job-policy.js';
 
+const knowledgeColumns = [
+  'id',
+  'project_id',
+  'title',
+  'body',
+  'kind',
+  'sources',
+  'status',
+  'verification',
+  'revision',
+  'archived',
+  'actor_id',
+  'updated_at',
+];
 const columns: Record<Table, string[]> = {
+  execution_controllers: ['id', 'owner_id', 'token', 'generation', 'expires_at'],
+  execution_attempts: [
+    'id',
+    'project_id',
+    'run_id',
+    'previous_attempt_id',
+    'ordinal',
+    'process_token',
+    'created_at',
+  ],
+  execution_observations: [
+    'id',
+    'project_id',
+    'run_id',
+    'attempt_id',
+    'sequence',
+    'controller_generation',
+    'kind',
+    'next_step',
+    'process_identity',
+    'outcome',
+    'created_at',
+  ],
+  execution_jobs: [
+    'id',
+    'project_id',
+    'ticket_id',
+    'actor_id',
+    'checkpoint_id',
+    'continuation_id',
+    'claim_token',
+    'requirements_revision',
+    'recipe_id',
+    'recipe_fingerprint',
+    'status',
+    'reservation_token',
+    'locked_until',
+    'started_at',
+    'finished_at',
+    'exit_code',
+    'signal',
+    'artifacts',
+    'error_code',
+    'created_at',
+  ],
+  continuations: [
+    'id',
+    'project_id',
+    'ticket_id',
+    'run_id',
+    'checkpoint_id',
+    'requirements_revision',
+    'completion_condition',
+    'status',
+    'failure_reason',
+    'created_at',
+    'settled_at',
+  ],
   outbound_deliveries: [
     'id',
     'event_id',
@@ -128,7 +200,8 @@ const columns: Record<Table, string[]> = {
     'ticket_revision',
     'created_at',
   ],
-  knowledge: ['id', 'project_id', 'title', 'body', 'kind', 'revision', 'archived', 'actor_id', 'updated_at'],
+  knowledge: knowledgeColumns,
+  knowledge_revisions: [...knowledgeColumns, 'knowledge_id'],
   events: ['id', 'project_id', 'seq', 'actor_id', 'type', 'entity_id', 'data', 'created_at'],
   receipts: ['id', 'project_id', 'actor_id', 'operation', 'input_hash', 'result', 'created_at'],
   jobs: [
@@ -145,6 +218,10 @@ const columns: Record<Table, string[]> = {
   ],
 };
 const jsonColumns = new Set([
+  'process_identity',
+  'outcome',
+  'artifacts',
+  'completion_condition',
   'metadata',
   'evidence',
   'data',
@@ -153,6 +230,8 @@ const jsonColumns = new Set([
   'execution_hints',
   'github_pull_request',
   'checks',
+  'sources',
+  'verification',
 ]);
 type Executor = Pick<pg.Pool, 'query'> | Pick<pg.PoolClient, 'query'>;
 function decode(row: Record<string, unknown>) {
@@ -166,7 +245,7 @@ function decode(row: Record<string, unknown>) {
         key,
         value instanceof Date
           ? value.toISOString()
-          : key === 'seq' || key === 'event_seq'
+          : key === 'seq' || key === 'event_seq' || (key === 'exit_code' && value !== null)
             ? Number(value)
             : value,
       ]),
@@ -185,6 +264,44 @@ function repository(db: Executor): Transaction {
     return `"${key}"`;
   };
   return {
+    async lockExecutionController() {
+      const result = await db.query("SELECT * FROM execution_controllers WHERE id='execution' FOR UPDATE");
+      return result.rows[0] ? (decode(result.rows[0]) as unknown as Tables['execution_controllers']) : null;
+    },
+    async compareExecutionRun(previous, next) {
+      ensure(
+        previous.id === next.id && previous.project_id === next.project_id,
+        'INVALID_INPUT',
+        'Execution identity cannot change.',
+      );
+      if (previous.status === 'succeeded' || previous.status === 'failed') return false;
+      const keys = [
+        'status',
+        'reservation_token',
+        'locked_until',
+        'started_at',
+        'finished_at',
+        'exit_code',
+        'signal',
+        'artifacts',
+        'error_code',
+      ] as const;
+      const values: unknown[] = keys.map((key) =>
+        jsonColumns.has(key) ? JSON.stringify(next[key]) : next[key],
+      );
+      values.push(
+        previous.id,
+        previous.project_id,
+        previous.status,
+        previous.reservation_token,
+        previous.locked_until,
+      );
+      const result = await db.query(
+        `UPDATE execution_jobs SET ${keys.map((key, i) => `${key}=$${i + 1}`).join(',')} WHERE id=$10 AND project_id=$11 AND status=$12 AND reservation_token IS NOT DISTINCT FROM $13::uuid AND locked_until IS NOT DISTINCT FROM $14::timestamptz`,
+        values,
+      );
+      return result.rowCount === 1;
+    },
     async unansweredQuestions(projectId, ticketId, blocking, limit, offset) {
       ensure(
         Number.isInteger(limit) && limit >= 1 && limit <= 10001 && Number.isInteger(offset) && offset >= 0,
@@ -278,7 +395,12 @@ function repository(db: Executor): Transaction {
       const values = keys.map((key) => (jsonColumns.has(key) ? JSON.stringify(record[key]) : record[key]));
       const names = keys.map((key) => field(table, key));
       const conflict =
-        table === 'github_evidence' || table === 'outbound_deliveries'
+        table === 'github_evidence' ||
+        table === 'outbound_deliveries' ||
+        table === 'knowledge_revisions' ||
+        table === 'execution_jobs' ||
+        table === 'execution_attempts' ||
+        table === 'execution_observations'
           ? ''
           : ` ON CONFLICT(id) DO UPDATE SET ${names
               .filter((name) => name !== '"id"')
@@ -291,6 +413,22 @@ function repository(db: Executor): Transaction {
     },
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
+      ensure(
+        ![
+          'execution_jobs',
+          'continuations',
+          'execution_attempts',
+          'execution_observations',
+          'execution_controllers',
+        ].includes(table),
+        'IMMUTABLE_EXECUTION',
+        'Execution history cannot be deleted.',
+      );
+      ensure(
+        table !== 'knowledge' && table !== 'knowledge_revisions',
+        'IMMUTABLE_KNOWLEDGE',
+        'Archive knowledge instead of deleting its revision history.',
+      );
       ensure(table !== 'github_evidence', 'IMMUTABLE_EVIDENCE', 'GitHub evidence snapshots are immutable.');
       ensure(table !== 'outbound_deliveries', 'IMMUTABLE_DELIVERY', 'Outbound deliveries are immutable.');
       await db.query(`DELETE FROM "${table}" WHERE id=$1`, [id]);
@@ -299,10 +437,16 @@ function repository(db: Executor): Transaction {
 }
 
 export class PostgresStorage implements StorageAdapter {
+  readonly executionRuns = true as const;
+  readonly executionLaunchStorage;
   readonly schedulingPolicies = Object.freeze(['priority_age', 'unblocking'] as const);
   readonly pool: pg.Pool;
   private reader: Transaction;
   constructor(connectionString: string) {
+    this.executionLaunchStorage = Object.freeze({
+      adapter: 'postgres' as const,
+      connection_string: connectionString,
+    });
     this.pool = new pg.Pool({
       connectionString,
       max: 20,
