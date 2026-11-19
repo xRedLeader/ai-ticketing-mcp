@@ -45,6 +45,7 @@ export type ExecutionApplication = Pick<
   | 'recoverExecutionRun'
   | 'cancelExecutionRun'
   | 'reconcileExecutionCancellation'
+  | 'evaluateWakeConditions'
 >;
 export interface ExecutionCompanionOptions {
   application: ExecutionApplication;
@@ -79,6 +80,7 @@ export class ExecutionCompanion {
   private readonly heartbeatMs: number;
   private recoveryCursor?: string;
   private capacityCursor?: string;
+  private wakeCursor?: string;
   constructor(private readonly options: ExecutionCompanionOptions) {
     ensure(
       options.application.storage.executionLaunchStorage,
@@ -100,8 +102,16 @@ export class ExecutionCompanion {
   async runOnce(signal?: AbortSignal): Promise<boolean> {
     const { application: app, actor_id: actor, project_id: project, capacity, host_id: host } = this.options;
     signal?.throwIfAborted();
+    let wakeWork = false;
+    if (app.storage.wakeDecisions) {
+      const pass = await app.evaluateWakeConditions(actor, project, {
+        ...(this.wakeCursor ? { after: this.wakeCursor } : {}),
+      });
+      this.wakeCursor = pass.has_more ? (pass.next_cursor ?? undefined) : undefined;
+      wakeWork = pass.changed > 0;
+    }
     const controller = await app.acquireExecutionController(actor, project, this.owner, LEASE_MS);
-    if (!controller) return false;
+    if (!controller) return wakeWork;
     let owned = true,
       busy = false;
     const heartbeat = setInterval(() => {
@@ -344,7 +354,7 @@ export class ExecutionCompanion {
         );
         return true;
       }
-      return false;
+      return wakeWork;
     } finally {
       clearInterval(heartbeat);
       await app.releaseExecutionController(actor, project, controller);

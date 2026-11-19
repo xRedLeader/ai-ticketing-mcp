@@ -53,6 +53,23 @@ const columns: Record<Table, string[]> = {
     'reconciled_by',
     'reconciled_at',
   ],
+  wake_conditions: [
+    'id',
+    'project_id',
+    'ticket_id',
+    'actor_id',
+    'condition',
+    'deadline',
+    'cursor',
+    'revision',
+    'generation',
+    'observed',
+    'deadline_fired',
+    'pending',
+    'active',
+    'finished_token',
+    'updated_at',
+  ],
   execution_controllers: ['id', 'owner_id', 'token', 'generation', 'expires_at'],
   execution_attempts: [
     'id',
@@ -233,6 +250,10 @@ const columns: Record<Table, string[]> = {
   ],
 };
 const jsonColumns = new Set([
+  'condition',
+  'observed',
+  'pending',
+  'active',
   'process_identity',
   'outcome',
   'artifacts',
@@ -264,7 +285,10 @@ function decode(row: Record<string, unknown>) {
         key,
         value instanceof Date
           ? value.toISOString()
-          : key === 'seq' || key === 'event_seq' || (key === 'exit_code' && value !== null)
+          : key === 'seq' ||
+              key === 'event_seq' ||
+              key === 'cursor' ||
+              (key === 'exit_code' && value !== null)
             ? Number(value)
             : value,
       ]),
@@ -433,6 +457,11 @@ function repository(db: Executor): Transaction {
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
       ensure(
+        table !== 'wake_conditions',
+        'IMMUTABLE_WAKE',
+        'Durable wake cursors and consumption fences cannot be deleted.',
+      );
+      ensure(
         ![
           'execution_jobs',
           'continuations',
@@ -458,6 +487,7 @@ function repository(db: Executor): Transaction {
 }
 
 export class PostgresStorage implements StorageAdapter {
+  readonly wakeDecisions = true;
   readonly executionRuns = true as const;
   readonly executionLaunchStorage;
   readonly schedulingPolicies = Object.freeze(['priority_age', 'unblocking'] as const);

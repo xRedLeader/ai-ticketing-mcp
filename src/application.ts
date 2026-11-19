@@ -41,6 +41,7 @@ import {
 import { resultSchemas, githubEvidenceSchema } from './result-schemas.js';
 import { inspectMemory } from './memory.js';
 import { serializeSuccessEnvelope } from './envelope.js';
+import { registerWake, evaluateWakes, wakeRegistration, claimWake, finishWake } from './wake-events.js';
 import { countReferenceTokens, queryExcerpt } from './tokens.js';
 import { CachedEmbeddings } from './query-embeddings.js';
 import {
@@ -881,7 +882,7 @@ export class Application {
       await tx.put('execution_cancellations', cancellation);
       if (neverStarted)
         ensure(
-          await this.finishExecutionRun(tx, run, {
+          await this.finishExecutionRun(tx, run, actorId, {
             exit_code: null,
             signal: null,
             artifacts: [],
@@ -926,6 +927,59 @@ export class Application {
       };
       await tx.put('execution_cancellations', next);
       return next;
+    });
+  }
+
+  private async wakeTransaction<T>(
+    actorId: string,
+    projectId: string,
+    work: (tx: Transaction, project: Project, actor: Actor) => Promise<T>,
+  ) {
+    ensure(
+      this.storage.wakeDecisions,
+      'UNSUPPORTED_WAKE_DECISIONS',
+      'Storage does not support durable wake decisions.',
+    );
+    return this.storage.transaction(projectId, async (tx) => {
+      const actor = await this.actor(actorId, tx);
+      const project = await this.access(tx, actor, projectId, ['admin']);
+      return work(tx, project, actor);
+    });
+  }
+  /** Trusted deterministic companion API; no model launch or MCP exposure. */
+  async registerWakeCondition(actorId: string, projectId: string, input: unknown) {
+    return this.wakeTransaction(actorId, projectId, (tx, project) =>
+      registerWake(tx, project, actorId, input, this.timestamp()),
+    );
+  }
+  async evaluateWakeConditions(actorId: string, projectId: string, input: unknown = {}) {
+    return this.wakeTransaction(actorId, projectId, (tx, project) =>
+      evaluateWakes(tx, project, input, this.timestamp()),
+    );
+  }
+  async getWakeCondition(actorId: string, projectId: string, ticketId: string) {
+    return this.wakeTransaction(actorId, projectId, (tx) => wakeRegistration(tx, projectId, ticketId));
+  }
+  async claimWakeDecision(actorId: string, projectId: string, input: unknown) {
+    return this.wakeTransaction(actorId, projectId, async (tx, project, actor) => {
+      const decision = await claimWake(tx, project, input, this.timestamp());
+      if (decision)
+        await this.event(tx, project, actor, 'wake.claimed', (input as { ticket_id: string }).ticket_id, {
+          generation: decision.generation,
+          through_cursor: decision.through_cursor,
+          reasons: decision.reasons,
+        });
+      return decision;
+    });
+  }
+  async finishWakeDecision(actorId: string, projectId: string, input: unknown) {
+    return this.wakeTransaction(actorId, projectId, async (tx, project, actor) => {
+      const result = await finishWake(tx, projectId, input, this.timestamp());
+      if (result.changed)
+        await this.event(tx, project, actor, 'wake.finished', result.ticket_id, {
+          generation: result.generation,
+        });
+      return result.completed;
     });
   }
   /** Trusted companion API; these methods are deliberately absent from the MCP catalog. */
@@ -1494,12 +1548,13 @@ export class Application {
         )
           return false;
       }
-      return this.finishExecutionRun(tx, run, result, controller);
+      return this.finishExecutionRun(tx, run, actorId, result, controller);
     });
   }
   private async finishExecutionRun(
     tx: Transaction,
     run: ExecutionJob,
+    actorId: string,
     result: ExecutionOutcome,
     controller?: ExecutionControllerFence,
   ) {
@@ -1545,15 +1600,24 @@ export class Application {
       !result.error_code &&
       !result.signal &&
       result.exit_code === continuation.completion_condition.exit_code;
+    const failureReason = satisfied
+      ? null
+      : current
+        ? (result.error_code ?? 'EXIT_CONDITION_FAILED')
+        : 'STALE_AUTHORITY';
     await tx.put('continuations', {
       ...continuation,
       status: satisfied ? 'satisfied' : 'failed',
-      failure_reason: satisfied
-        ? null
-        : current
-          ? (result.error_code ?? 'EXIT_CONDITION_FAILED')
-          : 'STALE_AUTHORITY',
+      failure_reason: failureReason,
       settled_at: finishedAt,
+    });
+    const project = await tx.get('projects', projectId);
+    ensure(project, 'NOT_FOUND', 'Project not found.');
+    await this.event(tx, project, await this.actor(actorId, tx), 'run.settled', run.ticket_id, {
+      run_id: run.id,
+      continuation_id: continuation.id,
+      status: satisfied ? 'satisfied' : 'failed',
+      code: failureReason ?? 'CONTINUATION_SATISFIED',
     });
     return true;
   }

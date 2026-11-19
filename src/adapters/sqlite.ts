@@ -56,6 +56,23 @@ const columns: Record<Table, string[]> = {
     'reconciled_by',
     'reconciled_at',
   ],
+  wake_conditions: [
+    'id',
+    'project_id',
+    'ticket_id',
+    'actor_id',
+    'condition',
+    'deadline',
+    'cursor',
+    'revision',
+    'generation',
+    'observed',
+    'deadline_fired',
+    'pending',
+    'active',
+    'finished_token',
+    'updated_at',
+  ],
   execution_controllers: ['id', 'owner_id', 'token', 'generation', 'expires_at'],
   execution_attempts: [
     'id',
@@ -236,6 +253,10 @@ const columns: Record<Table, string[]> = {
   ],
 };
 const json = new Set([
+  'condition',
+  'observed',
+  'pending',
+  'active',
   'process_identity',
   'outcome',
   'artifacts',
@@ -256,7 +277,7 @@ const json = new Set([
   'data',
   'result',
 ]);
-const booleans = new Set(['system_admin', 'blocking', 'archived', 'paused']);
+const booleans = new Set(['system_admin', 'blocking', 'archived', 'paused', 'deadline_fired']);
 function encode(key: string, value: unknown): SQLInputValue {
   if (value === undefined) return null;
   if (json.has(key))
@@ -457,6 +478,11 @@ function repository(db: DatabaseSync): Transaction {
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
       ensure(
+        table !== 'wake_conditions',
+        'IMMUTABLE_WAKE',
+        'Durable wake cursors and consumption fences cannot be deleted.',
+      );
+      ensure(
         ![
           'execution_jobs',
           'continuations',
@@ -584,6 +610,7 @@ class Handle {
   }
 }
 class SqliteStorage extends Handle implements StorageAdapter {
+  readonly wakeDecisions = true;
   readonly executionRuns = true as const;
   get executionLaunchStorage() {
     return Object.freeze({ adapter: 'sqlite' as const, filename: this.shared.path });

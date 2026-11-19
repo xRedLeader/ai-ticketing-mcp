@@ -29,6 +29,7 @@ export function registerExecutionUpgradeContractTests(
               !file.includes('execution_recovery') &&
               !file.includes('memory_validity') &&
               !file.includes('execution_control') &&
+              !file.includes('durable_wakes') &&
               (history === 'main'
                 ? !file.includes('project_memory') && !file.includes('execution_runs')
                 : !file.includes('review_fixes')),

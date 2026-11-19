@@ -2,6 +2,8 @@
 
 The optional companion runs operator-registered finite foreground scripts in a separate Node 24+ process. Start it independently of the MCP server/client: closing the submitting chat or MCP connection does not terminate that process. It makes no model calls, uses no agent token budget, and never retries an execution. MCP `run_submit` selects only a registered recipe ID and atomically stores its checkpoint, immutable recipe fingerprint and exit-code continuation; `run_get` reads that exact authorized project run later. These tools use the `full` MCP profile.
 
+When storage supports [durable wakes](durable-wakes.md), each companion pass also evaluates a bounded page of explicitly registered wake conditions. It stores coalesced reasons and cursors, without consuming decisions or starting models. Terminal execution settlement emits one durable `run.settled` event with run/continuation IDs and result code; repeated identical settlement does not emit duplicates. Restart resumes each registration's durable cursor and retains active consumption fences.
+
 ## Trusted host contract
 
 Recipes, executables, script files, workspaces, environment and artifact directory are operator-owned. Register only finite foreground work that waits for its children, never detaches/backgrounds work, and never escapes the supervisor. This is a trusted local execution boundary, not an OS sandbox for untrusted scripts. A normal exit, including a nonzero exit, is authoritative under this contract. CPU/memory declarations are HostCapacity admission estimates, not OS resource enforcement.

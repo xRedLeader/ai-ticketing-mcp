@@ -288,6 +288,42 @@ export interface ExecutionCancellation {
   reconciled_by: string | null;
   reconciled_at: string | null;
 }
+export type WakeCondition =
+  { kind: 'events'; types: string[] } | { kind: 'continuation'; continuation_id: string };
+export type WakeReason =
+  | { kind: 'event'; code: string; first_seq: number; last_seq: number; count: number }
+  | {
+      kind: 'continuation';
+      continuation_id: string;
+      run_id: string;
+      status: 'satisfied' | 'failed';
+      code: string;
+    }
+  | { kind: 'deadline'; at: string };
+export interface WakeDecision {
+  generation: number;
+  token: string;
+  reasons: WakeReason[];
+  through_cursor: number;
+  created_at: string;
+}
+export interface WakeRegistration {
+  id: string;
+  project_id: string;
+  ticket_id: string;
+  actor_id: string;
+  condition: WakeCondition;
+  deadline: string | null;
+  cursor: number;
+  revision: number;
+  generation: number;
+  observed: Record<string, string>;
+  deadline_fired: boolean;
+  pending: WakeReason[];
+  active: WakeDecision | null;
+  finished_token: string | null;
+  updated_at: string;
+}
 export interface ExecutionController extends ExecutionControllerFence {
   id: string;
   owner_id: string;
@@ -356,6 +392,7 @@ export interface WebhookTarget {
 export interface Tables {
   execution_admissions: ExecutionAdmission;
   execution_cancellations: ExecutionCancellation;
+  wake_conditions: WakeRegistration;
   execution_controllers: ExecutionController;
   execution_attempts: ExecutionAttempt;
   execution_observations: ExecutionObservation;
@@ -418,6 +455,7 @@ export interface Transaction extends Reader {
   remove<K extends Table>(table: K, id: string): Promise<void>;
 }
 export interface StorageAdapter extends Reader {
+  readonly wakeDecisions?: true;
   readonly executionRuns?: true;
   /** Private bootstrap for a detached supervisor connected to this same physical store. */
   readonly executionLaunchStorage?:

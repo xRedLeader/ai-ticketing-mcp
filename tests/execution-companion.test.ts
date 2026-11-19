@@ -80,6 +80,7 @@ async function fixture(script: string, extra: Record<string, unknown> = {}) {
     cancelExecutionRun: registered.cancelExecutionRun.bind(registered),
     reconcileExecutionCancellation: registered.reconcileExecutionCancellation.bind(registered),
     storage: adapters.storage,
+    evaluateWakeConditions: registered.evaluateWakeConditions.bind(registered),
     async acquireExecutionController(_actor, _project, owner, lease) {
       if (controller) return null;
       const acquired = await registered.acquireExecutionController(actor, project, owner, lease);
