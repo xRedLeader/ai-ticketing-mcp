@@ -53,38 +53,60 @@ export function checkProductionConfig(env, compose, realm) {
     env.OAUTH_JWKS_URL === 'http://keycloak:8080/realms/ticketing/protocol/openid-connect/certs',
     'OAUTH_JWKS_URL: use the private bundled Keycloak JWKS endpoint for this deployment.',
   );
-  if (realm) {
+  if (arguments.length >= 3 && (!realm || typeof realm !== 'object' || Array.isArray(realm))) {
+    errors.push('Keycloak realm: supply a JSON realm object, then export current realm again.');
+  } else if (realm) {
+    const scopes = Array.isArray(realm.clientScopes) ? realm.clientScopes : [];
+    const clients = Array.isArray(realm.clients) ? realm.clients : [];
     fail(
       !realm.attributes?.frontendUrl || realm.attributes.frontendUrl === env.KEYCLOAK_PUBLIC_URL,
       'Keycloak issuer: clear the realm Frontend URL override or set it to exactly KEYCLOAK_PUBLIC_URL, then export the current realm again.',
     );
-    const scope = realm.clientScopes?.find((s) => s.name === 'ticketing:read');
-    const mapper = scope?.protocolMappers?.find(
-      (m) =>
-        m.protocolMapper === 'oidc-audience-mapper' &&
-        m.config?.['included.custom.audience'] === env.OAUTH_AUDIENCE &&
-        m.config?.['access.token.claim'] === 'true',
-    );
+    const scope = scopes.find((s) => s?.name === 'ticketing:read');
+    const mapper =
+      Array.isArray(scope?.protocolMappers) &&
+      scope.protocolMappers.find(
+        (m) =>
+          m?.protocolMapper === 'oidc-audience-mapper' &&
+          m.config?.['included.custom.audience'] === env.OAUTH_AUDIENCE &&
+          m.config?.['access.token.claim'] === 'true',
+      );
     fail(
       realm.realm === 'ticketing' && mapper,
       'Keycloak realm: update ticketing:read > ticketing-audience to the exact OAUTH_AUDIENCE with access-token claim enabled, then export the current realm again.',
     );
     for (const name of ['ticketing:read', 'ticketing:write']) {
-      const scope = realm.clientScopes?.find((scope) => scope.name === name);
+      const scope = scopes.find((scope) => scope?.name === name);
       fail(
         scope?.protocol === 'openid-connect' && scope.attributes?.['include.in.token.scope'] === 'true',
         `Keycloak scopes: set ${name} protocol to openid-connect and include.in.token.scope to true, then export the current realm again.`,
       );
     }
     fail(
-      realm.clients?.filter((c) => ['ai-ticketing-cli', 'ai-ticketing-agent'].includes(c.clientId)).length ===
-        2 &&
-        realm.clients
-          .filter((c) => ['ai-ticketing-cli', 'ai-ticketing-agent'].includes(c.clientId))
-          .every((c) =>
-            ['ticketing:read', 'ticketing:write'].every((scope) => c.defaultClientScopes?.includes(scope)),
+      clients.filter((c) => ['ai-ticketing-cli', 'ai-ticketing-agent'].includes(c?.clientId)).length === 2 &&
+        clients
+          .filter((c) => ['ai-ticketing-cli', 'ai-ticketing-agent'].includes(c?.clientId))
+          .every(
+            (c) =>
+              c.enabled === true &&
+              (c.protocol === undefined || c.protocol === 'openid-connect') &&
+              Array.isArray(c.defaultClientScopes) &&
+              ['ticketing:read', 'ticketing:write'].every((scope) => c.defaultClientScopes.includes(scope)),
           ),
-      'Keycloak clients: assign ticketing:read and ticketing:write default scopes to both bundled clients.',
+      'Keycloak clients: enable both bundled OpenID Connect clients and assign ticketing:read and ticketing:write default scopes.',
+    );
+    const cli = clients.find((client) => client?.clientId === 'ai-ticketing-cli');
+    fail(
+      cli?.publicClient === true &&
+        cli.standardFlowEnabled === true &&
+        cli.attributes?.['pkce.code.challenge.method'] === 'S256' &&
+        cli.attributes?.['oauth2.device.authorization.grant.enabled'] === 'true',
+      'Keycloak ai-ticketing-cli: use a public client with standard authorization-code flow, S256 PKCE and device authorization enabled.',
+    );
+    const agent = clients.find((client) => client?.clientId === 'ai-ticketing-agent');
+    fail(
+      agent?.publicClient === false && agent.serviceAccountsEnabled === true,
+      'Keycloak ai-ticketing-agent: use a confidential client with service accounts enabled for client_credentials.',
     );
   }
   if (compose) {
@@ -231,6 +253,9 @@ async function main() {
       'Cannot read realm JSON. Run --prepare-realm to create the required mounted import for both new and existing installations; existing realms additionally require --realm-file with a private current export.',
     );
   }
+  errors = checkProductionConfig(process.env, undefined, importRealm);
+  if (args.includes('--realm-file')) errors.push(...checkProductionConfig(process.env, undefined, realm));
+  if (errors.length) throw new Error(errors.join('\n'));
   try {
     const { stdout } = await promisify(execFile)(
       'docker',
@@ -256,8 +281,7 @@ async function main() {
       'Cannot render production Compose. Check Docker Compose >=2.24.4 and required private .env passwords locally; do not publish rendered config.',
     );
   }
-  errors = checkProductionConfig(process.env, compose, importRealm);
-  if (args.includes('--realm-file')) errors.push(...checkProductionConfig(process.env, undefined, realm));
+  errors = checkProductionConfig(process.env, compose);
   if (errors.length) {
     process.stderr.write(errors.join('\n') + '\n');
     process.exitCode = 1;
