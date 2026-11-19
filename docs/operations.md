@@ -52,6 +52,14 @@ The worker runs indexing and delivery loops independently. Configured stdio also
 
 The SHA256 fingerprint of the canonical URL binds queued rows to their original destination. Changing the URL leaves old rows pending; it never forwards them to the new URL. Restoring the old URL resumes those deliveries. Retain `changes_since` polling as the recovery source: notifications are hints, and claim expiry itself does not emit an event. PostgreSQL migration 011 and SQLite migration 003 preserve existing data and history. Delivery rows are retained after success; include them in backups.
 
+## Automatic local independent review
+
+`node examples/review-dispatch.mjs --config PATH` checks one project's `in_review` queue every five seconds, including submissions already waiting at startup. Use Node 24+, a signed-in Codex CLI, and a built SQLite ticketing runtime that exposes `reviewer_actor_id`. Set that field on the project to the registered agent with verifier access. The private JSON configuration has absolute paths `runtime` (the built `runtime.js`), `sqlite` (the live store), `ledger` (a separate local SQLite file), `workspace` (the checkout), `evidenceRoot` (the directory containing submitted evidence), and `codex` (the CLI executable), plus `projectId` and `reviewerId` UUIDs. Run it under the desktop account that can read the submitted artifacts. `--once` runs one pass.
+
+The dispatcher starts Astra in read-only mode and records its validated decision through `ticket_review` as the configured reviewer. Independent self-review is skipped. Reassignment, a new submission, and changed requirements are checked before recording a decision. Keep the same ledger across restarts. It prevents duplicate launches and allows retrying a decision that was saved locally before the ticket update succeeded. Check `review_failed` and `record_failed` in the process log. An interrupted model run without a saved decision stays marked `started` in the ledger. A new submission gets its own attempt.
+
+The prompt includes the first 16 KiB of each of the first eight unique referenced text attachments under `evidenceRoot`. Include a compact evidence receipt if the criteria require details beyond those limits. The prompt marks truncated attachments so Astra can report insufficient evidence.
+
 ## Health and metrics
 
 - `/healthz`: process liveness.
