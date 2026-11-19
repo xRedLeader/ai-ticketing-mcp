@@ -303,7 +303,7 @@ it('fails closed on unverified timeout, retaining the direct-child observation a
     timeout_ms: 200,
   });
   try {
-    await assert.rejects(new ExecutionCompanion(f.options).runOnce(), /termination was not verified/);
+    assert.equal(await new ExecutionCompanion(f.options).runOnce(), true);
     assert.equal(f.job().status, 'running');
     assert.equal(f.capacity.inspect('host').occupied.script, 1);
     const result = JSON.parse(await readFile(join(f.artifactDirectory(), 'result.json'), 'utf8'));

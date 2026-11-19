@@ -898,12 +898,14 @@ export class Application {
     actorId: string,
     projectId: string,
     runIds?: string[],
+    afterId?: string,
   ): Promise<ExecutionReconciliation[]> {
     ensure(
       !runIds || (runIds.length <= 100 && runIds.every((id) => uuid.test(id))),
       'INVALID_INPUT',
       'Provide at most 100 run identifiers.',
     );
+    ensure(!afterId || (!runIds && uuid.test(afterId)), 'INVALID_INPUT', 'Invalid recovery cursor.');
     return this.storage.readSnapshot(async (reader) => {
       await this.access(reader, await this.actor(actorId, reader), projectId, ['admin']);
       const runs = await reader.find('execution_jobs', {
@@ -911,12 +913,12 @@ export class Application {
           project_id: projectId,
           ...(runIds
             ? { id: { in: runIds } }
-            : { status: { in: ['reserved', 'running'] as ExecutionJob['status'][] } }),
+            : {
+                status: { in: ['reserved', 'running'] as ExecutionJob['status'][] },
+                ...(afterId ? { id: { gt: afterId } } : {}),
+              }),
         },
-        order: [
-          { field: 'created_at', direction: 'asc' },
-          { field: 'id', direction: 'asc' },
-        ],
+        order: [{ field: 'id', direction: 'asc' }],
         limit: 100,
       });
       const states: ExecutionReconciliation[] = [];

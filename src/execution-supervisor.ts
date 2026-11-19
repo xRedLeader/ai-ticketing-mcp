@@ -6,6 +6,7 @@ import type { ExecutionControllerFence, StorageAdapter } from './contracts.js';
 import { createRuntime } from './runtime.js';
 import { MAX_EXECUTION_RECIPE_BYTES, type ExecutionRecipe } from './execution-recipes.js';
 import { durableExecutionFile, executionProcessIdentity, readExecutionFile } from './execution-journal.js';
+import type { HostCapacityNeverStartedProof } from './host-capacity.js';
 
 export interface ExecutionManifest {
   run_id: string;
@@ -20,6 +21,7 @@ export interface ExecutionLaunch {
   project_id: string;
   reservation_token: string;
   controller: ExecutionControllerFence;
+  capacity: HostCapacityNeverStartedProof;
 }
 /** Detached from the controller, so an observed completion can survive its restart. */
 async function supervise(directory: string) {
@@ -93,6 +95,7 @@ async function supervise(directory: string) {
           started = Date.now();
           timeout = setTimeout(() => stop('TIMEOUT'), recipe.timeout_ms);
           // Consuming this capability before spawn makes a duplicate or uncertain launch non-replayable.
+          durableExecutionFile(join(directory, 'launch.json'), identity);
           durableExecutionFile(join(directory, 'dispatch.json'), { ...identity, started_at: started });
           try {
             child = spawn(recipe.executable, [...recipe.argv], {
@@ -145,7 +148,24 @@ async function supervise(directory: string) {
           }
         },
       );
-      if (!dispatched) return;
+      if (!dispatched) {
+        // A thrown database/native error is ambiguous; only a positive rejection proves no launch.
+        if (!existsSync(join(directory, 'dispatch.json')))
+          durableExecutionFile(join(directory, 'launch.json'), {
+            ...identity,
+            no_launch: true,
+            exit_code: null,
+            signal: null,
+            artifacts: [],
+            error_code: 'DISPATCH_REJECTED',
+            started_at: 0,
+            finished_at: Date.now(),
+            cleanup_verified: true,
+            spawned: false,
+            capacity: launch.capacity,
+          });
+        return;
+      }
     } catch (cause) {
       if (!completion) throw cause;
     } finally {

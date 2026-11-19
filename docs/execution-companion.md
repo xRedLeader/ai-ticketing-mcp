@@ -42,7 +42,7 @@ $env:EXECUTION_RECIPES_FILE = 'G:\Work\operator\recipes.json'
 node dist/execution-companion-cli.js --sqlite 'G:\Work\operator\tickets.sqlite' --actor ACTOR_UUID --project PROJECT_UUID --capacity 'G:\Work\operator\host.sqlite' --host workstation --artifacts 'G:\Work\operator\execution-artifacts'
 ```
 
-For PostgreSQL, omit `--sqlite` and supply the normal storage environment. The companion forces embeddings off. `--once` processes at most one queued job and exits; without it the process waits between queue checks. Use an independent terminal, service or an operator-managed hidden background process so its lifetime is independent of the MCP connection. The CLI prints a startup event with its PID; it never launches itself from MCP.
+For PostgreSQL, first migrate with the schema-owner role, then omit `--sqlite` and supply the normal runtime storage environment (`ticketing_app`). The companion does not run PostgreSQL migrations; SQLite local startup still initializes its schema automatically. The companion forces embeddings off. `--once` processes at most one queued job and exits; without it the process waits between queue checks and continues processing available slots after an individual run becomes unresolved. Use an independent terminal, service or an operator-managed hidden background process so its lifetime is independent of the MCP connection. The CLI prints a startup event with its PID; it never launches itself from MCP.
 
 All dispatchers on the physical host must share the same local HostCapacity SQLite file **and host ID**. A missing host gets the existing two-script/two-agent defaults. Preconfigure immutable host limits through `HostCapacity.configureHost` if required. Separate host files/IDs cannot coordinate physical capacity.
 
@@ -68,9 +68,10 @@ With `--artifacts ROOT`, private write-once files live under `ROOT/<run UUID>/<a
 
 - `manifest.json`: run/attempt identity, process token and recipe fingerprint only.
 - `supervisor.json`, `dispatch.json`, `process.json`: durable supervisor identity, launch intent and native process acknowledgment. Process identity includes PID plus an OS start marker; a bare PID is never sufficient.
+- `launch.json`: the supervisor's write-once launch capability. Native dispatch and an explicit database rejection compete for this same file. A rejection stores `no_launch: true`, `DISPATCH_REJECTED`, immutable attempt identity and the exact admitted capacity token; thrown database/native errors do not prove no launch.
 - `stdout.log`, `stderr.log`, `result.json`: bounded logs and authoritative direct-child outcome, timing, truncation and cleanup observation.
 - `cancel.json`: an optional bounded cancellation request to the supervisor.
-- `never-started.json`: write-once, fsynced pre-dispatch recovery proof bound to the run, immutable attempt/process identity, recipe fingerprint, and exact host capacity execution token. It precedes terminal settlement so restart can drain a stranded slot only when the stored outcome and capacity identity match.
+- `never-started.json`: write-once, fsynced pre-dispatch recovery proof bound to the run, immutable attempt/process identity, recipe fingerprint, and exact host capacity state/execution token captured at admission. It precedes direct pre-start failure and recovered terminal settlement so restart can drain a stranded slot only when the stored outcome and capacity identity match.
 
 Restrict artifact directories with OS permissions/ACLs; logs may contain secrets and the process token is a trusted recovery credential. Requested file modes apply where supported; configure Windows ACLs separately. Older accepted execution installations retain their original `ROOT/<run UUID>/execution.json` and result/log layout; matching legacy journals are inspected without launching another attempt.
 
@@ -80,16 +81,17 @@ Timeout, cancellation, native signals and unverified cleanup retain occupied cap
 
 Journals publish a fully written, fsynced temporary file without replacing existing evidence. Never-started cleanup matches the proof's host, queue, run, project, state and execution token in one capacity transaction; a later admission remains occupied. A legacy torn `never-started.json` can gain an immutable `never-started-recovered.json` only while the database still proves the attempt is reserved and undispatched. Terminal attempts without a valid proof retain capacity for manual investigation.
 
-`run_get.reconciliation` exposes `state` (`queued`, `running`, `completed`, `unresolved`), `attempt_id`, and `next_step` through both PostgreSQL and SQLite. The trusted `listExecutionReconciliations` API provides the same state together with the immutable attempt and latest observation. Restart inspects at most 100 active runs plus 100 queued or occupied script entries for its project per pass; unchanged observations do not append rows on every poll.
+`run_get.reconciliation` exposes `state` (`queued`, `running`, `completed`, `unresolved`), `attempt_id`, and `next_step` through both PostgreSQL and SQLite. The trusted `listExecutionReconciliations` API provides the same state together with the immutable attempt and latest observation; its optional `afterId` cursor scans active runs in immutable ID order. Each companion keeps independent cursors for at most 100 active runs and 100 queued or occupied script entries per pass, wrapping at the end so old unresolved rows cannot starve later recoverable results. Unchanged observations do not append rows on every poll.
 
-| Durable evidence                                            | Recovery action / next step                                                                                    |
-| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| Reserved attempt, before dispatch intent                    | Close as `RECOVERED_NOT_DISPATCHED`; cancel/release only its proven unstarted entry. Never relaunch it.        |
-| Dispatch intent without launch/result evidence              | `unresolved`; inspect launch and side effects. Missing journal or acknowledgment cannot prove non-execution.   |
-| Matching live PID **and OS start marker**                   | `running`; `wait_for_result`. A missing or reused PID leaves side effects unresolved.                          |
-| Matching fsynced result with foreground cleanup observation | Replay the exact outcome, recheck continuation authority, then release the matching host slot.                 |
-| Terminal application outcome before capacity release        | Compare the result journal with the exact stored outcome and release its occupied slot without executing work. |
-| Missing, partial, mismatched result or unverified cleanup   | `unresolved`; `inspect_side_effects`, preserving pending continuation, attempt history and occupied capacity.  |
+| Durable evidence                                                   | Recovery action / next step                                                                                    |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| Reserved attempt, before dispatch intent                           | Close as `RECOVERED_NOT_DISPATCHED`; cancel/release only its proven unstarted entry. Never relaunch it.        |
+| Dispatch intent without launch/result evidence                     | `unresolved`; inspect launch and side effects. Missing journal or acknowledgment cannot prove non-execution.   |
+| Explicit supervisor rejection with a matching no-launch capability | Recover `DISPATCH_REJECTED` and release only the exact proven capacity identity; never relaunch the attempt.   |
+| Matching live PID **and OS start marker**                          | `running`; `wait_for_result`. A missing or reused PID leaves side effects unresolved.                          |
+| Matching fsynced result with foreground cleanup observation        | Replay the exact outcome, recheck continuation authority, then release the matching host slot.                 |
+| Terminal application outcome before capacity release               | Compare the result journal with the exact stored outcome and release its occupied slot without executing work. |
+| Missing, partial, mismatched result or unverified cleanup          | `unresolved`; `inspect_side_effects`, preserving pending continuation, attempt history and occupied capacity.  |
 
 The initial dispatch state can expose `inspect_launch`; after inspecting ambiguous evidence the next step is `inspect_side_effects`. The result journal can outlive the controller: actual crash tests cover dispatch, launch acknowledgment and completion-before-database-settlement on both adapters. Completion without a durable journal remains unresolved even if a side effect appears to have happened.
 
