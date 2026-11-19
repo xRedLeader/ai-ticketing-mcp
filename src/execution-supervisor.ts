@@ -16,6 +16,7 @@ import {
 import type { HostCapacityNeverStartedProof } from './host-capacity.js';
 import { pipelineIdentityError, verificationRunnerPath } from './verification-pipeline.js';
 import type { VerificationReport } from './verification-runner.js';
+import { readVerificationTimeout } from './verification-timeout.js';
 
 export interface ExecutionManifest {
   run_id: string;
@@ -54,6 +55,7 @@ async function supervise(directory: string) {
     recipe_fingerprint: recipe.fingerprint,
   };
   let started = Date.now();
+  let totalDeadline = Infinity;
   durableExecutionFile(join(directory, 'supervisor.json'), {
     ...identity,
     identity: executionProcessIdentity(process.pid),
@@ -83,6 +85,7 @@ async function supervise(directory: string) {
   let timeout: NodeJS.Timeout | undefined;
   const cancellation = setInterval(() => {
     if (existsSync(join(directory, 'cancel.json'))) stop('CANCELLED');
+    else if (pipeline && readVerificationTimeout(directory, manifest)) stop('TIMEOUT');
   }, 100);
   try {
     let completion: Promise<{ code: number | null; signal: NodeJS.Signals | null }> | undefined;
@@ -107,6 +110,7 @@ async function supervise(directory: string) {
           if (stopped || existsSync(join(directory, 'cancel.json')))
             throw new Error('Execution was cancelled before its launch fence was acquired.');
           started = Date.now();
+          totalDeadline = performance.now() + recipe.timeout_ms;
           timeout = setTimeout(() => stop('TIMEOUT'), recipe.timeout_ms + (pipeline ? 15_000 : 0));
           // Consuming this capability before spawn makes a duplicate or uncertain launch non-replayable.
           durableExecutionFile(join(directory, 'launch.json'), identity);
@@ -135,6 +139,7 @@ async function supervise(directory: string) {
                   pipeline,
                   report_path: join(directory, 'pipeline-report.json'),
                   deadline_at: started + recipe.timeout_ms,
+                  identity: manifest,
                 }),
               );
             }
@@ -242,6 +247,8 @@ async function supervise(directory: string) {
     } catch {
       error ??= 'LOG_SYNC_FAILED';
     }
+    if (pipeline && performance.now() >= totalDeadline) error ??= 'TIMEOUT';
+    if (verification && stopped) verification.cleanup_verified = (await termination) === true;
     if (verification && (error || observed.code !== 0 || observed.signal)) {
       verification.status = 'failed';
       verification.error_code ??= error ?? 'PIPELINE_EXIT_FAILED';
@@ -268,7 +275,19 @@ async function supervise(directory: string) {
     };
     const artifact_errors: string[] = [];
     try {
-      durableExecutionFile(join(directory, 'outcome.json'), outcome);
+      const expired = new Error('Pipeline publication deadline exceeded.');
+      try {
+        durableExecutionFile(join(directory, 'outcome.json'), outcome, () => {
+          if (verification?.status === 'passed' && performance.now() >= totalDeadline) throw expired;
+        });
+      } catch (cause) {
+        if (cause !== expired) throw cause;
+        error ??= 'TIMEOUT';
+        outcome.error_code = error;
+        verification!.status = 'failed';
+        verification!.error_code = 'TIMEOUT';
+        durableExecutionFile(join(directory, 'outcome.json'), outcome);
+      }
       sha256.result = createHash('sha256')
         .update(JSON.stringify(outcome) + '\n')
         .digest('hex');

@@ -1,16 +1,19 @@
 import { spawn } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import {
   durableExecutionFile,
   executionProcessIdentity,
   terminateExecutionProcessTree,
 } from './execution-journal.js';
 import {
+  fileSha256,
   pipelineIdentityError,
   type SourceIdentity,
   type VerificationPipeline,
 } from './verification-pipeline.js';
+import type { ExecutionManifest } from './execution-supervisor.js';
 
 const DIAGNOSTIC_BYTES = 512;
 interface Diagnostic {
@@ -47,6 +50,7 @@ export async function runVerificationPipeline(
   pipeline: VerificationPipeline,
   deadlineAt = Date.now() + pipeline.timeout_ms,
 ): Promise<VerificationReport> {
+  const deadline = performance.now() + Math.max(0, deadlineAt - Date.now());
   const report: VerificationReport = {
     pipeline_id: pipeline.id,
     recipe_fingerprint: pipeline.fingerprint,
@@ -84,13 +88,14 @@ export async function runVerificationPipeline(
       result.error_code = stopped ?? 'DEPENDENCY_FAILED';
       continue;
     }
-    if (Date.now() >= deadlineAt) {
+    if (performance.now() >= deadline) {
       result.error_code = 'TIMEOUT';
       report.error_code = 'TIMEOUT';
       stopped = 'PIPELINE_STOPPED';
       continue;
     }
-    const before = pipelineIdentityError(pipeline, step) ?? (Date.now() >= deadlineAt ? 'TIMEOUT' : null);
+    const before =
+      pipelineIdentityError(pipeline, step) ?? (performance.now() >= deadline ? 'TIMEOUT' : null);
     if (before) {
       result.error_code = before;
       stopped = before;
@@ -114,7 +119,12 @@ export async function runVerificationPipeline(
         () => {
           timedOut = true;
           const identity = child.pid ? executionProcessIdentity(child.pid) : null;
-          termination = identity ? terminateExecutionProcessTree(identity) : Promise.resolve(false);
+          termination =
+            process.platform === 'linux'
+              ? Promise.resolve(false)
+              : identity
+                ? terminateExecutionProcessTree(identity)
+                : Promise.resolve(false);
           void termination.then((verified) => {
             if (!verified) {
               report.cleanup_verified = false;
@@ -123,7 +133,7 @@ export async function runVerificationPipeline(
             }
           });
         },
-        Math.max(1, Math.min(step.command.timeout_ms, deadlineAt - Date.now())),
+        Math.max(1, Math.min(step.command.timeout_ms, deadline - performance.now())),
       );
       child.on('error', () => {
         processError = 'SPAWN_FAILED';
@@ -157,7 +167,9 @@ export async function runVerificationPipeline(
     }
     result.exit_code = observed.code;
     result.signal = observed.signal;
-    const after = pipelineIdentityError(pipeline, step);
+    const after = timedOut
+      ? null
+      : (pipelineIdentityError(pipeline, step) ?? (performance.now() >= deadline ? 'TIMEOUT' : null));
     result.error_code =
       after ??
       (timedOut
@@ -166,13 +178,17 @@ export async function runVerificationPipeline(
     result.status = timedOut ? 'timed_out' : result.error_code ? 'failed' : 'passed';
     if (after || !report.cleanup_verified) {
       stopped = after ?? 'TERMINATION_UNCONFIRMED';
-      report.error_code = stopped;
+      report.error_code = timedOut ? 'TIMEOUT' : stopped;
     } else if (result.status !== 'passed' && step.on_failure === 'stop') stopped = 'PIPELINE_STOPPED';
   }
   report.error_code ??=
     pipelineIdentityError(pipeline) ??
     (report.steps.every((step) => step.status === 'passed') ? null : 'STEP_FAILED');
   report.status = !report.error_code && report.cleanup_verified ? 'passed' : 'failed';
+  if (performance.now() >= deadline) {
+    report.error_code = 'TIMEOUT';
+    report.status = 'failed';
+  }
   return report;
 }
 
@@ -188,9 +204,30 @@ async function main() {
     pipeline: VerificationPipeline;
     report_path: string;
     deadline_at: number;
+    identity: ExecutionManifest;
   };
+  const deadline = performance.now() + Math.max(0, input.deadline_at - Date.now());
   const report = await runVerificationPipeline(input.pipeline, input.deadline_at);
-  durableExecutionFile(input.report_path, report);
+  const expired = new Error('Pipeline publication deadline exceeded.');
+  try {
+    durableExecutionFile(input.report_path, report, () => {
+      if (report.status === 'passed' && performance.now() >= deadline) throw expired;
+    });
+  } catch (cause) {
+    if (cause !== expired) throw cause;
+    report.status = 'failed';
+    report.error_code = 'TIMEOUT';
+    durableExecutionFile(input.report_path, report);
+  }
+  if (!report.cleanup_verified && report.steps.some((step) => step.status === 'timed_out')) {
+    durableExecutionFile(join(dirname(input.report_path), 'pipeline-timeout.json'), {
+      ...input.identity,
+      error_code: 'TIMEOUT',
+      report_sha256: fileSha256(input.report_path),
+    });
+    // Keep the group leader alive until its supervisor or a replacement verifies group termination.
+    setInterval(() => {}, 1000);
+  }
   process.exitCode = report.status === 'passed' ? 0 : 1;
 }
 if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {

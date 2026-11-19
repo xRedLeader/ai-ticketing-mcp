@@ -15,7 +15,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { ExecutionProcessIdentity } from './contracts.js';
 
 /** Publish only complete journals, without replacing immutable evidence. */
-export function durableExecutionFile(path: string, value: unknown) {
+export function durableExecutionFile(path: string, value: unknown, beforePublish?: () => void) {
   const temporary = `${path}.${randomUUID()}.tmp`;
   const fd = openSync(temporary, 'wx', 0o600);
   try {
@@ -25,6 +25,7 @@ export function durableExecutionFile(path: string, value: unknown) {
     } finally {
       closeSync(fd);
     }
+    beforePublish?.();
     linkSync(temporary, path);
   } finally {
     unlinkSync(temporary);

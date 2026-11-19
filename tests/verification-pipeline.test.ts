@@ -6,16 +6,19 @@ import { realpathSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { ExecutionRecipeRegistry } from '../src/execution-recipes.js';
 import { runVerificationPipeline } from '../src/verification-runner.js';
 import { createSqliteAdapters } from '../src/adapters/sqlite.js';
 import { createApplication } from '../src/application.js';
 import { fixture as contractFixture } from '../src/testing/contracts.js';
 import { ExecutionCompanion } from '../src/execution-companion.js';
-import { ExecutionArtifacts } from '../src/execution-artifacts.js';
 import { HostCapacity } from '../src/host-capacity.js';
+import { durableExecutionFile, executionProcessIdentity } from '../src/execution-journal.js';
+import { fileSha256 } from '../src/verification-pipeline.js';
+import { readVerificationTimeout, recordVerificationTimeout } from '../src/verification-timeout.js';
 
-async function fixture(scripts: string[], project = randomUUID()) {
+async function fixture(scripts: string[], project: string = randomUUID()) {
   const directory = realpathSync(await mkdtemp(join(tmpdir(), 'ticketing-pipeline-'))),
     repository = join(directory, 'source');
   await mkdir(repository);
@@ -44,7 +47,15 @@ async function fixture(scripts: string[], project = randomUUID()) {
   const config = {
     workspace_roots: [directory],
     recipes: [
-      { id: 'git', project_ids: [project], executable: git, argv: [], cwd: repository, env: {} },
+      {
+        id: 'git',
+        project_ids: [project],
+        executable: git,
+        argv: [],
+        cwd: repository,
+        env: {},
+        timeout_ms: 10000,
+      },
       ...scripts.map((script, index) => ({
         id: `command-${index}`,
         project_ids: [project],
@@ -158,7 +169,7 @@ it('records bounded failure diagnostics, dependency skips and explicit proceed/s
 });
 
 it('records a timed-out step and never proceeds without confirmed process cleanup', async () => {
-  const f = await fixture([`setTimeout(()=>{},10000)`, '']);
+  const f = await fixture([`setTimeout(()=>{},2000)`, '']);
   try {
     f.config.recipes[1]!.timeout_ms = 25;
     const report = await runVerificationPipeline(f.pipeline());
@@ -207,6 +218,190 @@ it('records total pipeline timeout and skips remaining work after its deadline',
     await f.dispose();
   }
 });
+
+it('fails a total deadline crossed during post-step identity validation without inventing failed cleanup', async (t) => {
+  const f = await fixture(['']);
+  try {
+    const pipeline = f.pipeline();
+    let calls = 0;
+    t.mock.method(performance, 'now', () => (++calls <= 4 ? 0 : 100000));
+    const report = await runVerificationPipeline(pipeline);
+    assert.equal(report.status, 'failed');
+    assert.equal(report.error_code, 'TIMEOUT');
+    assert.equal(report.steps[0]!.exit_code, 0);
+    assert.equal(report.steps[0]!.error_code, 'TIMEOUT');
+    assert.equal(report.cleanup_verified, true);
+  } finally {
+    t.mock.restoreAll();
+    await f.dispose();
+  }
+});
+
+it('binds timeout handoff to exact attempt and report bytes and replays partial artifact publication', async () => {
+  const f = await fixture(['']);
+  try {
+    const pipeline = f.pipeline(),
+      report = await runVerificationPipeline(pipeline);
+    report.status = 'failed';
+    report.cleanup_verified = false;
+    report.error_code = 'TIMEOUT';
+    report.steps[0]!.status = 'timed_out';
+    report.steps[0]!.error_code = 'TIMEOUT';
+    const identity = {
+      run_id: randomUUID(),
+      attempt_id: randomUUID(),
+      process_token: randomUUID(),
+      recipe_fingerprint: pipeline.fingerprint,
+    };
+    const path = join(f.directory, 'pipeline-report.json');
+    durableExecutionFile(path, report);
+    durableExecutionFile(join(f.directory, 'pipeline-timeout.json'), {
+      ...identity,
+      error_code: 'TIMEOUT',
+      report_sha256: fileSha256(path),
+    });
+    assert.ok(readVerificationTimeout(f.directory, identity));
+    assert.equal(readVerificationTimeout(f.directory, { ...identity, process_token: randomUUID() }), null);
+    await writeFile(join(f.directory, 'stdout.log'), '');
+    await writeFile(join(f.directory, 'stderr.log'), '');
+    const first = recordVerificationTimeout(f.directory, identity, Date.now() - 1000, 'TIMEOUT');
+    assert.equal(first?.cleanup_verified, true);
+    const outcome = await readFile(join(f.directory, 'outcome.json'), 'utf8');
+    assert.ok(recordVerificationTimeout(f.directory, identity, Date.now() - 1000, 'CANCELLED'));
+    assert.equal(await readFile(join(f.directory, 'outcome.json'), 'utf8'), outcome);
+    await writeFile(path, JSON.stringify({ ...report, status: 'passed' }));
+    assert.equal(readVerificationTimeout(f.directory, identity), null);
+  } finally {
+    await f.dispose();
+  }
+});
+
+for (const crashSupervisor of [false, true])
+  it(
+    `hands step timeout to its supervisor group and retains the structured result (restart=${crashSupervisor})`,
+    { skip: crashSupervisor && process.platform !== 'linux' },
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'ticketing-pipeline-timeout-db-'));
+      const adapters = createSqliteAdapters(join(directory, 'store.sqlite'));
+      await adapters.storage.migrate();
+      const authority = await contractFixture(adapters),
+        f = await fixture(
+          [
+            `require('node:fs').writeFileSync('step.pid',String(process.pid));require('node:child_process').spawn(process.execPath,['-e',"require('node:fs').writeFileSync('descendant.pid',String(process.pid));setInterval(()=>{},1000)"],{stdio:'ignore',detached:false});process.stderr.write('timed step');setInterval(()=>{},1000)`,
+            '',
+          ],
+          authority.project.id,
+        );
+      f.config.recipes[1]!.timeout_ms = 500;
+      const recipes = f.registry(),
+        artifacts = join(f.directory, 'artifacts');
+      const app = createApplication({
+        ...adapters,
+        executionRecipes: recipes.metadata(),
+        executionArtifacts: { directory: artifacts },
+      });
+      const capacity = new HostCapacity(join(f.directory, 'capacity.sqlite'));
+      capacity.configureHost('test');
+      try {
+        const ticket = await authority.ticket(),
+          claim = await authority.claim(ticket.id);
+        const receipt = (await app.execute(authority.worker.id, 'run_submit', {
+          project_id: f.project,
+          ticket_id: ticket.id,
+          claim_token: claim.claim.token,
+          idempotency_key: randomUUID(),
+          recipe_id: 'verify',
+          checkpoint: { progress: 'Timeout configured step.' },
+          completion_condition: { kind: 'exit_code', exit_code: 0 },
+        })) as any;
+        const options = {
+          application: app,
+          capacity,
+          recipes,
+          actor_id: authority.admin.id,
+          project_id: f.project,
+          host_id: 'test',
+          artifacts_directory: artifacts,
+        };
+        const running = new ExecutionCompanion(options).runOnce();
+        if (crashSupervisor) {
+          const until = Date.now() + 10000;
+          let attempt;
+          while (Date.now() < until) {
+            attempt = (
+              await adapters.storage.find('execution_attempts', { where: { run_id: receipt.run_id } })
+            )[0];
+            if (attempt) {
+              try {
+                await readFile(join(f.repository, 'step.pid'));
+                break;
+              } catch {}
+            }
+            await delay(10);
+          }
+          assert.ok(attempt);
+          const path = join(artifacts, receipt.run_id, attempt.id);
+          const supervisor = JSON.parse(await readFile(join(path, 'supervisor.json'), 'utf8')).identity;
+          assert.deepEqual(executionProcessIdentity(supervisor.pid), supervisor);
+          process.kill(supervisor.pid, 'SIGSTOP');
+          while (Date.now() < until) {
+            try {
+              await readFile(join(path, 'pipeline-timeout.json'));
+              break;
+            } catch {}
+            await delay(10);
+          }
+          assert.ok(await readFile(join(path, 'pipeline-timeout.json')));
+          process.kill(supervisor.pid, 'SIGKILL');
+          await running;
+          await new ExecutionCompanion(options).runOnce();
+        } else await running;
+        const run = (await adapters.storage.get('execution_jobs', receipt.run_id))!;
+        const attempt = (
+          await adapters.storage.find('execution_attempts', { where: { run_id: run.id } })
+        )[0]!;
+        const report = JSON.parse(
+          await readFile(join(artifacts, run.id, attempt.id, 'pipeline-report.json'), 'utf8'),
+        );
+        assert.deepEqual(
+          report.steps.map((step: any) => step.status),
+          ['timed_out', 'skipped'],
+        );
+        if (process.platform === 'linux') {
+          for (const name of ['step.pid', 'descendant.pid']) {
+            const pid = Number(await readFile(join(f.repository, name), 'utf8'));
+            assert.equal(
+              executionProcessIdentity(pid),
+              null,
+              'The supervisor must stop the step and its descendants.',
+            );
+          }
+          assert.equal(run.status, 'failed');
+          assert.equal(run.error_code, 'TIMEOUT');
+          assert.equal(capacity.inspect('test').occupied.script, 0);
+          const result = (await app.execute(authority.worker.id, 'artifact_read', {
+            project_id: f.project,
+            artifact_id: run.artifacts.find((item) => item.endsWith(':result'))!,
+            length: 65536,
+            max_tokens: 16000,
+          })) as any;
+          const outcome = JSON.parse(Buffer.from(result.range.data, 'base64').toString('utf8'));
+          assert.equal(outcome.verification.status, 'failed');
+          assert.equal(outcome.verification.cleanup_verified, true);
+          assert.equal(outcome.verification.steps[0].diagnostics.stderr.text, 'timed step');
+        } else {
+          assert.equal(run.status, 'running');
+          assert.equal(capacity.inspect('test').occupied.script, 1);
+        }
+      } finally {
+        capacity.close();
+        await adapters.storage.close();
+        await adapters.search.close();
+        await f.dispose();
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
 
 it('refuses passing evidence when source or a declared toolchain changes during a step', async () => {
   for (const target of ['source', 'toolchain']) {
@@ -271,7 +466,7 @@ it('settles one fenced durable run and publishes the pipeline through the existi
   const app = createApplication({
     ...adapters,
     executionRecipes: recipes.metadata(),
-    executionArtifacts: new ExecutionArtifacts(artifacts),
+    executionArtifacts: { directory: artifacts },
   });
   const capacity = new HostCapacity(join(f.directory, 'capacity.sqlite'));
   capacity.configureHost('test');
