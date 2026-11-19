@@ -87,14 +87,14 @@ export async function inspectMemory(reader: Reader, projectId: string, now: stri
       const others = peers.filter((other) => other.fact!.value !== document.fact!.value);
       if (others.length) conflicts.set(document.id, others);
     }
-  function disputes(document: Knowledge, path = new Set<string>()): Map<string, Knowledge> {
-    if (path.has(document.id)) return new Map();
+  function disputes(document: Knowledge, visited = new Set<string>()): Map<string, Knowledge> {
+    if (visited.has(document.id)) return new Map();
+    visited.add(document.id);
     const peers = conflicts.get(document.id);
     const found = new Map((peers ? [document, ...peers] : []).map((item) => [item.id, item]));
-    const next = new Set(path).add(document.id);
     for (const source of document.sources) {
       const parent = source.kind === 'knowledge' ? byId.get(source.id) : undefined;
-      if (parent) for (const [id, item] of disputes(parent, next)) found.set(id, item);
+      if (parent) for (const [id, item] of disputes(parent, visited)) found.set(id, item);
     }
     return found;
   }
