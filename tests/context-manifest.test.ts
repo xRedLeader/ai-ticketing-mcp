@@ -186,6 +186,33 @@ it('leaves required reviewer artifact bytes explicit and outside retained packet
   assert.equal(f.calls[0]!.arguments.if_none_match, undefined);
 });
 
+it('recovers every required legacy history page before retaining a review packet', async (t) => {
+  const f = await setup(t);
+  for (let index = 0; index < 15; index++)
+    await f.call(f.worker.id, 'ticket_note', {
+      ticket_id: f.ticket.id,
+      kind: 'question',
+      body: `Open reviewer question ${index}.`,
+    });
+  const client = await f.connect(undefined, 'reviewer', 'reviewer');
+  const manifest = createContextManifest(client);
+  const args = { project_id: f.project.id, ticket_id: f.ticket.id };
+  const packet = await manifest.context(args, 'review');
+  assert.equal(packet.complete, true);
+  const notes = new Set(
+    [
+      ...((packet.context.open_questions ?? []) as { body: string }[]),
+      ...packet.retrieved.flatMap((page) =>
+        page.arguments.kind === 'notes' ? (page.data as { items: { body: string }[] }).items : [],
+      ),
+    ].map((note) => note.body),
+  );
+  assert.equal(notes.size, 15);
+  f.calls.length = 0;
+  assert.deepEqual(await manifest.context(args, 'review'), packet);
+  assert.equal(f.calls.length, 1);
+});
+
 it('delivers exact retained context and all required pages after an authorized conditional read', async (t) => {
   const f = await setup(t);
   const client = await f.connect();

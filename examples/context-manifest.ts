@@ -118,9 +118,9 @@ export function createContextManifest(client: Client) {
             'INVALID_RESPONSE',
             'Unsupported required context retrieval.',
           );
-          let args: Arguments = omission.arguments;
+          const operation = omission.retrieve_with as 'checkpoint_get' | 'ticket_history';
+          let args: Arguments = schemas[operation].parse(omission.arguments);
           for (;;) {
-            const operation = omission.retrieve_with as 'checkpoint_get' | 'ticket_history';
             const data = resultSchemas[operation].parse(await call(operation, args));
             ensure(
               (data as { authorization_binding?: string }).authorization_binding ===
@@ -140,14 +140,16 @@ export function createContextManifest(client: Client) {
               );
             }
             packet.retrieved.push({ operation, arguments: args, data });
-            const page = data as { has_more?: boolean; next_offset?: number };
-            if (!page.has_more) break;
+            if (operation !== 'ticket_history' || args.item_id) break;
+            const page = data as { items: unknown[]; has_more?: boolean; next_offset?: number };
+            if (!(page.has_more ?? page.items.length === args.limit)) break;
+            const nextOffset = page.next_offset ?? Number(args.offset) + page.items.length;
             ensure(
-              Number.isSafeInteger(page.next_offset) && page.next_offset! > Number(args.offset ?? 0),
+              Number.isSafeInteger(nextOffset) && nextOffset > Number(args.offset),
               'INVALID_RESPONSE',
               'Required history did not advance.',
             );
-            args = { ...args, offset: page.next_offset };
+            args = { ...args, offset: nextOffset };
           }
         }
         connected();
