@@ -89,11 +89,12 @@ export function checkProductionConfig(env, compose, realm) {
           .every(
             (c) =>
               c.enabled === true &&
+              c.bearerOnly !== true &&
               (c.protocol === undefined || c.protocol === 'openid-connect') &&
               Array.isArray(c.defaultClientScopes) &&
               ['ticketing:read', 'ticketing:write'].every((scope) => c.defaultClientScopes.includes(scope)),
           ),
-      'Keycloak clients: enable both bundled OpenID Connect clients and assign ticketing:read and ticketing:write default scopes.',
+      'Keycloak clients: enable both bundled OpenID Connect clients, disable bearer-only mode and assign ticketing:read and ticketing:write default scopes.',
     );
     const cli = clients.find((client) => client?.clientId === 'ai-ticketing-cli');
     fail(

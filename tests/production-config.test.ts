@@ -65,6 +65,7 @@ it('checks exact production identities, assigned realm audience, private ports a
       (client: any) => delete client.enabled,
       (client: any) => (client.enabled = false),
       (client: any) => (client.enabled = 'true'),
+      (client: any) => (client.bearerOnly = true),
       (client: any) => (client.protocol = 'saml'),
     ]) {
       const invalid = structuredClone(realm);
