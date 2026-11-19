@@ -15,7 +15,12 @@ import {
 } from './contracts.js';
 import { HostCapacity, type HostCapacityNeverStartedProof } from './host-capacity.js';
 import { ExecutionRecipeRegistry } from './execution-recipes.js';
-import { durableExecutionFile, executionProcessIdentity, readExecutionFile } from './execution-journal.js';
+import {
+  durableExecutionFile,
+  executionProcessIdentity,
+  readExecutionFile,
+  terminateExecutionProcessTree,
+} from './execution-journal.js';
 import type { ExecutionLaunch, ExecutionManifest } from './execution-supervisor.js';
 
 export type ExecutionApplication = Pick<
@@ -34,6 +39,8 @@ export type ExecutionApplication = Pick<
   | 'adoptExecutionRun'
   | 'observeExecutionRun'
   | 'recoverExecutionRun'
+  | 'cancelExecutionRun'
+  | 'reconcileExecutionCancellation'
 >;
 export interface ExecutionCompanionOptions {
   application: ExecutionApplication;
@@ -46,6 +53,7 @@ export interface ExecutionCompanionOptions {
 }
 const LEASE_MS = 60_000;
 type ResultJournal = ExecutionOutcome & {
+  note?: string;
   run_id: string;
   attempt_id?: string;
   process_token?: string;
@@ -178,6 +186,17 @@ export class ExecutionCompanion {
             };
           });
           if (!current) {
+            if (
+              (await app.storage.get('execution_admissions', project))?.paused &&
+              !(await app.storage.get('execution_cancellations', job.id)) &&
+              owned &&
+              !signal?.aborted &&
+              Date.now() < capacityDeadline &&
+              (await app.heartbeatExecutionRun(actor, project, job.id, token, LEASE_MS, controller))
+            ) {
+              await delay(1000);
+              continue;
+            }
             await this.settleNeverStarted(job.id, controller, 'NOT_STARTED', noStartCapacity);
             return true;
           }
@@ -256,7 +275,8 @@ export class ExecutionCompanion {
         while (Date.now() <= deadline) {
           if (!owned) throw new Error('Execution controller ownership lost; reconciliation is required.');
           if (signal?.aborted && !existsSync(join(directory, 'cancel.json')))
-            durableExecutionFile(join(directory, 'cancel.json'), { reason: 'CANCELLED' });
+            await app.cancelExecutionRun(actor, project, job.id);
+          await this.requestCancellation(state, directory);
           const proof = this.neverStarted(state, directory);
           const result = this.result(state, directory) ?? proof;
           if (result) {
@@ -433,9 +453,29 @@ export class ExecutionCompanion {
     );
   }
   private result(state: ExecutionReconciliation, directory: string): ResultJournal | null {
-    const result = this.journal(directory, 'result.json');
-    if (!this.matches(state, result) || !this.validResult(result)) return null;
-    return result;
+    for (const name of ['operator-reconciliation.json', 'termination.json', 'result.json']) {
+      const result = this.journal(directory, name);
+      if (this.matches(state, result) && this.validResult(result)) return result;
+    }
+    return null;
+  }
+  private async requestCancellation(state: ExecutionReconciliation, directory: string) {
+    const cancellation = await this.options.application.storage.get('execution_cancellations', state.run.id);
+    if (!cancellation || cancellation.project_id !== state.run.project_id) return false;
+    if (!existsSync(join(directory, 'cancel.json'))) {
+      try {
+        durableExecutionFile(join(directory, 'cancel.json'), {
+          run_id: state.run.id,
+          attempt_id: state.attempt!.id,
+          process_token: state.attempt!.process_token,
+          recipe_fingerprint: state.run.recipe_fingerprint,
+          reason: 'CANCELLED',
+        });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+    }
+    return true;
   }
   private validResult(result: any): result is ResultJournal {
     return (
@@ -476,11 +516,16 @@ export class ExecutionCompanion {
   }
   private async reconcile(original: ExecutionReconciliation, controller: ExecutionControllerFence) {
     const { application: app, actor_id: actor, project_id: project, capacity } = this.options;
-    if (original.state === 'completed') {
+    if (['succeeded', 'failed'].includes(original.run.status)) {
       const directory = original.attempt
         ? join(this.directory, original.run.id, original.attempt.id)
         : join(this.directory, original.run.id);
-      const proof = original.attempt ? this.neverStarted(original, directory) : null;
+      const proof = original.attempt
+        ? (this.neverStarted(original, directory) ??
+          (original.cancellation?.process_state === 'never_started'
+            ? this.recordNeverStarted(original, directory, 'CANCELLED_NOT_STARTED')
+            : null))
+        : null;
       const result =
         (original.attempt ? (this.result(original, directory) ?? proof) : null) ??
         this.legacyResult(original);
@@ -497,6 +542,33 @@ export class ExecutionCompanion {
     const state = await app.adoptExecutionRun(actor, project, original.run.id, controller, LEASE_MS);
     if (!state?.attempt) return;
     const directory = join(this.directory, state.run.id, state.attempt.id);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const cancelled = await this.requestCancellation(state, directory);
+    if (cancelled && !this.liveSupervisor(state, directory)) {
+      const identity = this.liveIdentity(state, directory);
+      if (identity && (await terminateExecutionProcessTree(identity))) {
+        const previous = this.result(state, directory);
+        const result: ResultJournal = {
+          run_id: state.run.id,
+          attempt_id: state.attempt.id,
+          process_token: state.attempt.process_token,
+          recipe_fingerprint: state.run.recipe_fingerprint,
+          exit_code: previous?.exit_code ?? null,
+          signal: previous?.signal ?? null,
+          error_code: 'CANCELLED',
+          artifacts:
+            previous?.artifacts ??
+            ['stdout', 'stderr']
+              .filter((name) => existsSync(join(directory, `${name}.log`)))
+              .map((name) => `execution:${state.run.id}:${state.attempt!.id}:${name}`),
+          started_at: previous?.started_at ?? Date.parse(state.run.started_at!),
+          finished_at: Date.now(),
+          cleanup_verified: true,
+          spawned: true,
+        };
+        durableExecutionFile(join(directory, 'termination.json'), result);
+      }
+    }
     const proof = this.neverStarted(state, directory);
     const result = this.result(state, directory) ?? proof ?? this.legacyResult(state);
     if (result?.cleanup_verified && result.error_code !== 'RECOVERED_NOT_DISPATCHED') {
@@ -549,6 +621,14 @@ export class ExecutionCompanion {
       identity ? 'running' : 'unresolved',
     );
   }
+  private liveSupervisor(state: ExecutionReconciliation, directory: string) {
+    const journal = this.journal(directory, 'supervisor.json');
+    return (
+      this.matches(state, journal) &&
+      journal.identity &&
+      executionProcessIdentity(journal.identity.pid)?.start_marker === journal.identity.start_marker
+    );
+  }
   private neverStarted(state: ExecutionReconciliation, directory: string): NeverStartedJournal | null {
     if (existsSync(join(directory, 'dispatch.json'))) return null;
     for (const name of ['never-started.json', 'never-started-recovered.json', 'launch.json']) {
@@ -567,6 +647,7 @@ export class ExecutionCompanion {
           'RECIPE_UNAVAILABLE',
           'SPAWN_FAILED',
           'DISPATCH_REJECTED',
+          'CANCELLED_NOT_STARTED',
         ].includes(proof.error_code) ||
         proof.exit_code !== null ||
         proof.signal !== null ||
@@ -620,7 +701,14 @@ export class ExecutionCompanion {
   ) {
     const { capacity, host_id: host } = this.options;
     const entry = capacity.inspect(host).entries.find((entry) => entry.queue_id === runId);
-    if (!entry?.lease || !['running', 'reconciling'].includes(entry.state)) return;
+    if (
+      !entry?.lease ||
+      entry.kind !== 'script' ||
+      entry.run_id !== runId ||
+      entry.project_id !== this.options.project_id ||
+      !['running', 'reconciling'].includes(entry.state)
+    )
+      return;
     const takeover = capacity.takeOver(host, runId, entry.lease.generation, this.owner);
     capacity.reconcile(takeover.lease, {
       source: 'execution-companion-recovery',
@@ -641,6 +729,107 @@ export class ExecutionCompanion {
   async run(signal?: AbortSignal) {
     while (!signal?.aborted) {
       if (!(await this.runOnce(signal))) await delay(1000, undefined, { signal });
+    }
+  }
+  /** Operator attests externally verified exit/effects; this is evidence, never rollback. */
+  async reconcileCancellation(
+    runId: string,
+    evidence: {
+      process_exit_confirmed: true;
+      effects_reconciled: true;
+      outcome: ExecutionOutcome;
+      note: string;
+    },
+  ) {
+    ensure(
+      evidence?.process_exit_confirmed === true &&
+        evidence.effects_reconciled === true &&
+        typeof evidence.note === 'string' &&
+        evidence.note.trim().length > 0 &&
+        evidence.note.length <= 4000,
+      'INVALID_INPUT',
+      'Require confirmed external execution exit and bounded effect-reconciliation evidence.',
+    );
+    const { application: app, actor_id: actor, project_id: project } = this.options;
+    const controller = await app.acquireExecutionController(actor, project, this.owner, LEASE_MS);
+    ensure(
+      controller,
+      'CONFLICT',
+      'An execution controller is active; retry after it drains or its lease expires.',
+    );
+    try {
+      let state = (await app.listExecutionReconciliations(actor, project, [runId]))[0];
+      ensure(state?.cancellation, 'INVALID_REFERENCE', 'Request cancellation before reconciliation.');
+      if (['succeeded', 'failed'].includes(state.run.status))
+        ensure(
+          evidence.outcome &&
+            JSON.stringify(this.outcome(evidence.outcome)) === JSON.stringify(this.outcome(state.run)),
+          'CONFLICT',
+          'Existing terminal outcome differs from the supplied external evidence.',
+        );
+      if (!['succeeded', 'failed'].includes(state.run.status)) {
+        state = (await app.adoptExecutionRun(actor, project, runId, controller, LEASE_MS))!;
+        ensure(state?.attempt, 'CONFLICT', 'Could not acquire the execution attempt.');
+        const directory = join(this.directory, runId, state.attempt.id);
+        mkdirSync(directory, { recursive: true, mode: 0o700 });
+        ensure(
+          !this.liveIdentity(state, directory, true),
+          'CONFLICT',
+          'A verified owned process is still live; confirm its exit before external reconciliation.',
+        );
+        const result: ResultJournal = {
+          ...evidence.outcome,
+          run_id: runId,
+          attempt_id: state.attempt.id,
+          process_token: state.attempt.process_token,
+          recipe_fingerprint: state.run.recipe_fingerprint,
+          started_at: state.run.started_at ? Date.parse(state.run.started_at) : 0,
+          finished_at: Date.now(),
+          cleanup_verified: true,
+          spawned: state.run.status === 'running',
+        };
+        ensure(
+          this.validResult(result),
+          'INVALID_INPUT',
+          'Provide the observed authoritative execution outcome.',
+        );
+        const filename = join(directory, 'operator-reconciliation.json');
+        if (!existsSync(filename))
+          durableExecutionFile(filename, {
+            ...result,
+            process_exit_confirmed: true,
+            effects_reconciled: true,
+            note: evidence.note,
+            source: 'operator_external_execution_exit',
+          });
+        const proof = this.journal(directory, 'operator-reconciliation.json');
+        ensure(
+          this.matches(state, proof) &&
+            this.validResult(proof) &&
+            JSON.stringify(this.outcome(proof)) === JSON.stringify(this.outcome(result)) &&
+            proof.note === evidence.note,
+          'CONFLICT',
+          'Existing operator evidence differs; preserve it for investigation.',
+        );
+        ensure(
+          await app.recoverExecutionRun(
+            actor,
+            project,
+            runId,
+            state.run.reservation_token!,
+            state.attempt.id,
+            state.attempt.process_token,
+            this.outcome(proof),
+            controller,
+          ),
+          'CONFLICT',
+          'External result was not fenced.',
+        );
+        this.releaseCapacity(runId, proof);
+      }
+      return await app.reconcileExecutionCancellation(actor, project, runId, evidence.note);
+    } finally {
+      await app.releaseExecutionController(actor, project, controller);
     }
   }
 }

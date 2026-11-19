@@ -41,6 +41,18 @@ const knowledgeColumns = [
   'updated_at',
 ];
 const columns: Record<Table, string[]> = {
+  execution_admissions: ['id', 'paused', 'actor_id', 'updated_at'],
+  execution_cancellations: [
+    'id',
+    'project_id',
+    'requested_by',
+    'requested_at',
+    'process_state',
+    'effects_state',
+    'reconciliation_note',
+    'reconciled_by',
+    'reconciled_at',
+  ],
   execution_controllers: ['id', 'owner_id', 'token', 'generation', 'expires_at'],
   execution_attempts: [
     'id',
@@ -425,6 +437,8 @@ function repository(db: Executor): Transaction {
           'execution_attempts',
           'execution_observations',
           'execution_controllers',
+          'execution_admissions',
+          'execution_cancellations',
         ].includes(table),
         'IMMUTABLE_EXECUTION',
         'Execution history cannot be deleted.',

@@ -33,6 +33,7 @@ import {
   type ExecutionObservation,
   type ExecutionProcessIdentity,
   type ExecutionReconciliation,
+  type ExecutionCancellation,
   type Continuation,
   validateGitHubConfiguration,
 } from './contracts.js';
@@ -741,7 +742,7 @@ export class Application {
       const run = await tx.get('execution_jobs', runId);
       ensure(run?.project_id === projectId, 'NOT_FOUND', 'Execution run not found.');
       ensure(
-        tx.compareExecutionRun,
+        tx.compareExecutionRun && tx.lockExecutionController,
         'UNSUPPORTED_EXECUTION_RUNS',
         'Storage does not support execution ownership fencing.',
       );
@@ -755,6 +756,98 @@ export class Application {
       'Execution lease must be 1000–3600000 milliseconds.',
     );
     return new Date(this.now().getTime() + leaseMs).toISOString();
+  }
+  async setExecutionAdmissions(actorId: string, projectId: string, paused: boolean) {
+    ensure(typeof paused === 'boolean', 'INVALID_INPUT', 'Provide a boolean admission state.');
+    return this.storage.transaction(projectId, async (tx) => {
+      await this.access(tx, await this.actor(actorId, tx), projectId, ['admin']);
+      ensure(
+        tx.lockExecutionController,
+        'UNSUPPORTED_EXECUTION_RUNS',
+        'Storage must fence execution controls.',
+      );
+      await tx.lockExecutionController();
+      const previous = await tx.get('execution_admissions', projectId);
+      if (previous?.paused === paused) return previous;
+      const next = { id: projectId, paused, actor_id: actorId, updated_at: this.timestamp() };
+      await tx.put('execution_admissions', next);
+      return next;
+    });
+  }
+  async cancelExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+  ): Promise<ExecutionCancellation> {
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      await tx.lockExecutionController!();
+      const previous = await tx.get('execution_cancellations', runId);
+      if (previous) return previous;
+      const neverStarted = ['queued', 'reserved'].includes(run.status);
+      const cancellation: ExecutionCancellation = {
+        id: runId,
+        project_id: projectId,
+        requested_by: actorId,
+        requested_at: this.timestamp(),
+        process_state: neverStarted
+          ? 'never_started'
+          : ['succeeded', 'failed'].includes(run.status)
+            ? 'exit_confirmed'
+            : 'requested',
+        effects_state: neverStarted ? 'not_started' : 'unresolved',
+        reconciliation_note: null,
+        reconciled_by: null,
+        reconciled_at: null,
+      };
+      await tx.put('execution_cancellations', cancellation);
+      if (neverStarted)
+        ensure(
+          await this.finishExecutionRun(tx, run, {
+            exit_code: null,
+            signal: null,
+            artifacts: [],
+            error_code: 'CANCELLED_NOT_STARTED',
+          }),
+          'CONFLICT',
+          'Cancellation could not acquire the execution fence.',
+        );
+      return cancellation;
+    });
+  }
+  async reconcileExecutionCancellation(actorId: string, projectId: string, runId: string, note: string) {
+    ensure(
+      typeof note === 'string' && note.trim().length > 0 && note.length <= 4000,
+      'INVALID_INPUT',
+      'Provide bounded external-effect reconciliation evidence.',
+    );
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      await tx.lockExecutionController!();
+      const cancellation = await tx.get('execution_cancellations', runId);
+      ensure(cancellation, 'INVALID_REFERENCE', 'Request cancellation before reconciliation.');
+      if (cancellation.effects_state === 'reconciled') {
+        ensure(
+          cancellation.reconciliation_note === note,
+          'CONFLICT',
+          'Reconciliation evidence is already recorded.',
+        );
+        return cancellation;
+      }
+      ensure(
+        ['succeeded', 'failed'].includes(run.status) &&
+          ['never_started', 'exit_confirmed'].includes(cancellation.process_state),
+        'CONFLICT',
+        'Confirm execution exit before reconciling external effects.',
+      );
+      const next: ExecutionCancellation = {
+        ...cancellation,
+        effects_state: 'reconciled',
+        reconciliation_note: note,
+        reconciled_by: actorId,
+        reconciled_at: this.timestamp(),
+      };
+      await tx.put('execution_cancellations', next);
+      return next;
+    });
   }
   /** Trusted companion API; these methods are deliberately absent from the MCP catalog. */
   async acquireExecutionController(
@@ -890,22 +983,31 @@ export class Application {
   private async executionReconciliation(reader: Reader, run: ExecutionJob): Promise<ExecutionReconciliation> {
     const attempt = await this.executionAttempt(reader, run.id);
     const observation = attempt ? await this.latestExecutionObservation(reader, attempt) : null;
+    const cancellation = await reader.get('execution_cancellations', run.id);
+    const needsInspection = cancellation?.effects_state === 'unresolved';
     const completed = ['succeeded', 'failed'].includes(run.status);
-    const state = completed
-      ? 'completed'
-      : run.status === 'queued'
-        ? 'queued'
-        : observation?.kind === 'running'
-          ? 'running'
-          : 'unresolved';
+    const state =
+      needsInspection && completed
+        ? 'unresolved'
+        : completed
+          ? 'completed'
+          : run.status === 'queued'
+            ? 'queued'
+            : observation?.kind === 'running'
+              ? 'running'
+              : 'unresolved';
     return {
       run,
       attempt,
       observation,
+      cancellation,
       state,
-      next_step: completed
-        ? 'none'
-        : (observation?.next_step ?? (run.status === 'queued' ? 'dispatch' : 'inspect_launch')),
+      next_step:
+        needsInspection && completed
+          ? 'inspect_side_effects'
+          : completed
+            ? 'none'
+            : (observation?.next_step ?? (run.status === 'queued' ? 'dispatch' : 'inspect_launch')),
     };
   }
   async listExecutionReconciliations(
@@ -1015,6 +1117,9 @@ export class Application {
       )
         return false;
       const previous = await this.latestExecutionObservation(tx, attempt);
+      const cancellation = await tx.get('execution_cancellations', runId);
+      if (cancellation && state === 'unresolved' && cancellation.process_state === 'requested')
+        await tx.put('execution_cancellations', { ...cancellation, process_state: 'unresolved' });
       if (previous?.kind === state && digest(previous.process_identity) === digest(identity)) return true;
       await this.observeExecution(
         tx,
@@ -1091,6 +1196,8 @@ export class Application {
       if (
         !(await this.currentExecutionController(tx, controller)) ||
         run.status !== 'queued' ||
+        (await tx.get('execution_admissions', projectId))?.paused ||
+        (await tx.get('execution_cancellations', runId)) ||
         !(await this.executionAuthority(tx, run))
       )
         return null;
@@ -1128,6 +1235,7 @@ export class Application {
       if (
         !(await this.currentExecutionController(tx, controller)) ||
         run.status !== 'reserved' ||
+        (await tx.get('execution_cancellations', runId)) ||
         run.reservation_token !== token ||
         !run.locked_until ||
         run.locked_until <= this.timestamp() ||
@@ -1162,6 +1270,8 @@ export class Application {
     return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
       if (
         !(await this.currentExecutionController(tx, controller)) ||
+        (await tx.get('execution_admissions', projectId))?.paused ||
+        (await tx.get('execution_cancellations', runId)) ||
         run.status !== 'reserved' ||
         run.reservation_token !== token ||
         !run.locked_until ||
@@ -1192,6 +1302,7 @@ export class Application {
     return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
       if (
         !(await this.currentExecutionController(tx, controller)) ||
+        (await tx.get('execution_cancellations', runId)) ||
         run.status !== 'running' ||
         run.reservation_token !== token ||
         !run.locked_until ||
@@ -1304,41 +1415,68 @@ export class Application {
         )
           return false;
       }
-      const finishedAt = this.timestamp();
-      const next: ExecutionJob = {
-        ...run,
-        ...result,
-        status: result.exit_code === 0 && !result.signal && !result.error_code ? 'succeeded' : 'failed',
-        finished_at: finishedAt,
-      };
-      if (!(await tx.compareExecutionRun!(run, next))) return false;
-      const attempt = await this.executionAttempt(tx, runId);
-      if (attempt)
-        await this.observeExecution(tx, next, attempt, controller, 'completed', 'none', undefined, result);
-      const continuation = await tx.get('continuations', run.continuation_id);
-      ensure(
-        continuation?.project_id === projectId && continuation.run_id === run.id,
-        'INVALID_REFERENCE',
-        'Execution continuation is missing.',
-      );
-      const current = await this.executionAuthority(tx, run);
-      const satisfied =
-        current &&
-        !result.error_code &&
-        !result.signal &&
-        result.exit_code === continuation.completion_condition.exit_code;
-      await tx.put('continuations', {
-        ...continuation,
-        status: satisfied ? 'satisfied' : 'failed',
-        failure_reason: satisfied
-          ? null
-          : current
-            ? (result.error_code ?? 'EXIT_CONDITION_FAILED')
-            : 'STALE_AUTHORITY',
-        settled_at: finishedAt,
-      });
-      return true;
+      return this.finishExecutionRun(tx, run, result, controller);
     });
+  }
+  private async finishExecutionRun(
+    tx: Transaction,
+    run: ExecutionJob,
+    result: ExecutionOutcome,
+    controller?: ExecutionControllerFence,
+  ) {
+    const projectId = run.project_id,
+      runId = run.id;
+    const finishedAt = this.timestamp();
+    const next: ExecutionJob = {
+      ...run,
+      ...result,
+      status: result.exit_code === 0 && !result.signal && !result.error_code ? 'succeeded' : 'failed',
+      finished_at: finishedAt,
+    };
+    if (!(await tx.compareExecutionRun!(run, next))) return false;
+    const attempt = await this.executionAttempt(tx, runId);
+    if (attempt)
+      await this.observeExecution(tx, next, attempt, controller, 'completed', 'none', undefined, result);
+    const cancellation = await tx.get('execution_cancellations', runId);
+    if (cancellation && cancellation.process_state !== 'never_started') {
+      const neverStarted = [
+        'CANCELLED_NOT_STARTED',
+        'RECOVERED_NOT_DISPATCHED',
+        'DISPATCH_REJECTED',
+        'SPAWN_FAILED',
+        'NOT_STARTED',
+        'RECIPE_UNAVAILABLE',
+      ].includes(result.error_code ?? '');
+      await tx.put('execution_cancellations', {
+        ...cancellation,
+        process_state: neverStarted ? 'never_started' : 'exit_confirmed',
+        effects_state: neverStarted ? 'not_started' : cancellation.effects_state,
+      });
+    }
+    const continuation = await tx.get('continuations', run.continuation_id);
+    ensure(
+      continuation?.project_id === projectId && continuation.run_id === run.id,
+      'INVALID_REFERENCE',
+      'Execution continuation is missing.',
+    );
+    const current = await this.executionAuthority(tx, run);
+    const satisfied =
+      !cancellation &&
+      current &&
+      !result.error_code &&
+      !result.signal &&
+      result.exit_code === continuation.completion_condition.exit_code;
+    await tx.put('continuations', {
+      ...continuation,
+      status: satisfied ? 'satisfied' : 'failed',
+      failure_reason: satisfied
+        ? null
+        : current
+          ? (result.error_code ?? 'EXIT_CONDITION_FAILED')
+          : 'STALE_AUTHORITY',
+      settled_at: finishedAt,
+    });
+    return true;
   }
   private async childrenDone(tx: Reader, ticket: Ticket) {
     const children = await tx.find('tickets', {
@@ -2300,6 +2438,7 @@ export class Application {
             state: recovery.state,
             next_step: recovery.next_step,
             attempt_id: recovery.attempt?.id ?? null,
+            cancellation: recovery.cancellation,
           },
         };
         const tokens = () => this.responseTokens(this.result('run_get', response));

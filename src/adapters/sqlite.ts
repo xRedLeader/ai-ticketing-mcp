@@ -44,6 +44,18 @@ const knowledgeColumns = [
   'updated_at',
 ];
 const columns: Record<Table, string[]> = {
+  execution_admissions: ['id', 'paused', 'actor_id', 'updated_at'],
+  execution_cancellations: [
+    'id',
+    'project_id',
+    'requested_by',
+    'requested_at',
+    'process_state',
+    'effects_state',
+    'reconciliation_note',
+    'reconciled_by',
+    'reconciled_at',
+  ],
   execution_controllers: ['id', 'owner_id', 'token', 'generation', 'expires_at'],
   execution_attempts: [
     'id',
@@ -243,7 +255,7 @@ const json = new Set([
   'data',
   'result',
 ]);
-const booleans = new Set(['system_admin', 'blocking', 'archived']);
+const booleans = new Set(['system_admin', 'blocking', 'archived', 'paused']);
 function encode(key: string, value: unknown): SQLInputValue {
   if (value === undefined) return null;
   if (json.has(key))
@@ -447,6 +459,8 @@ function repository(db: DatabaseSync): Transaction {
           'execution_attempts',
           'execution_observations',
           'execution_controllers',
+          'execution_admissions',
+          'execution_cancellations',
         ].includes(table),
         'IMMUTABLE_EXECUTION',
         'Execution history cannot be deleted.',

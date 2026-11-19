@@ -6,7 +6,12 @@ import { fileURLToPath } from 'node:url';
 import type { ExecutionControllerFence, StorageAdapter } from './contracts.js';
 import { createRuntime } from './runtime.js';
 import { MAX_EXECUTION_RECIPE_BYTES, type ExecutionRecipe } from './execution-recipes.js';
-import { durableExecutionFile, executionProcessIdentity, readExecutionFile } from './execution-journal.js';
+import {
+  durableExecutionFile,
+  executionProcessIdentity,
+  readExecutionFile,
+  terminateExecutionProcessTree,
+} from './execution-journal.js';
 import type { HostCapacityNeverStartedProof } from './host-capacity.js';
 
 export interface ExecutionManifest {
@@ -61,12 +66,13 @@ async function supervise(directory: string) {
     terminal = false,
     error: string | null = null;
   let deadline: NodeJS.Timeout | undefined;
+  let termination: Promise<boolean> | undefined;
   const stop = (reason: string) => {
     if (terminal || stopped) return;
     stopped = true;
     error ??= reason;
-    child?.kill('SIGKILL');
-    // shortcut: native direct-child termination cannot prove process-tree cleanup; retain capacity for inspection.
+    const root = child?.pid ? executionProcessIdentity(child.pid) : null;
+    if (root) termination = terminateExecutionProcessTree(root);
     deadline = setTimeout(() => process.exit(1), 15_000);
   };
   let timeout: NodeJS.Timeout | undefined;
@@ -105,6 +111,7 @@ async function supervise(directory: string) {
               cwd: recipe.cwd,
               env: { ...recipe.env },
               shell: false,
+              detached: process.platform !== 'win32',
               windowsHide: true,
               stdio: ['ignore', 'pipe', 'pipe'],
             });
@@ -231,7 +238,7 @@ async function supervise(directory: string) {
       sha256,
       artifact_errors,
       truncated,
-      cleanup_verified: !stopped && observed.signal === null,
+      cleanup_verified: stopped ? (await termination) === true : observed.signal === null,
     });
   } finally {
     if (timeout) clearTimeout(timeout);

@@ -39,6 +39,8 @@ The validity extension also requires nullable `Knowledge.fact`, nullable UTC `ex
 
 Execution companion compatibility now also requires `StorageAdapter.executionLaunchStorage`, an immutable same-physical-store descriptor: `{ adapter: 'sqlite', filename: ABSOLUTE_CANONICAL_PATH }` or `{ adapter: 'postgres', connection_string: DATABASE_URL }`. The detached supervisor supports these two built-in storage protocols and receives this trusted bootstrap only over private stdin; the recipe never receives storage credentials. Custom adapters without a compatible descriptor now fail companion construction, while ordinary application/MCP operation remains supported. Capacity admission and synchronous native spawn must hold the same project/controller locks as takeover. Never-started recovery settlement is accepted only for a still-reserved pre-dispatch observation; missing launch evidence is insufficient.
 
+Operator controls additionally require `Tables.execution_admissions` and `Tables.execution_cancellations` (seven execution tables in total). Serialize admission pause and cancellation requests with the same controller singleton and project transaction as reserve/admit/dispatch. Keep cancellation request identity and reconciliation evidence durable; never infer cleanup or effect rollback from lease expiry or a missing process. Reject deletion of these records. Apply PostgreSQL `016_execution_control.sql` / SQLite `008_execution_control.sql` and run `registerExecutionControlContractTests` from `src/testing/execution-control-contracts.ts` against the replacement adapter.
+
 ## SQLite adapters
 
 Node 24's built-in SQLite and FTS5 implementation is available through one coordinated factory:

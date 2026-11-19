@@ -77,6 +77,8 @@ async function fixture(script: string, extra: Record<string, unknown> = {}) {
     next_step: observed?.next_step ?? (job.status === 'reserved' ? 'dispatch' : 'inspect_launch'),
   });
   const app: ExecutionApplication = {
+    cancelExecutionRun: registered.cancelExecutionRun.bind(registered),
+    reconcileExecutionCancellation: registered.reconcileExecutionCancellation.bind(registered),
     storage: adapters.storage,
     async acquireExecutionController(_actor, _project, owner, lease) {
       if (controller) return null;
@@ -379,20 +381,21 @@ it('preserves the authoritative exit journal when the public outcome artifact ca
   }
 });
 
-it('fails closed on unverified timeout, retaining the direct-child observation and occupied slot without rerun', async () => {
+it('releases a verified timed-out process group and retains unverified cleanup without rerun', async () => {
   const f = await fixture(`process.stdout.write('started'); setTimeout(() => {}, 10000);`, {
     timeout_ms: 200,
   });
   try {
     assert.equal(await new ExecutionCompanion(f.options).runOnce(), true);
-    assert.equal(f.job().status, 'running');
-    assert.equal(f.capacity.inspect('host').occupied.script, 1);
+    const verified = process.platform === 'linux';
+    assert.equal(f.job().status, verified ? 'failed' : 'running');
+    assert.equal(f.capacity.inspect('host').occupied.script, verified ? 0 : 1);
     const result = JSON.parse(await readFile(join(f.artifactDirectory(), 'result.json'), 'utf8'));
     assert.equal(result.error_code, 'TIMEOUT');
-    assert.equal(result.cleanup_verified, false);
+    assert.equal(result.cleanup_verified, verified);
     assert.ok(result.signal !== null || result.exit_code !== null);
     assert.equal(await new ExecutionCompanion(f.options).runOnce(), false);
-    assert.deepEqual(f.events, ['reserved', 'running']);
+    assert.deepEqual(f.events, verified ? ['reserved', 'running', 'settled'] : ['reserved', 'running']);
   } finally {
     await f.dispose();
   }

@@ -366,6 +366,20 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
       state: z.enum(['queued', 'running', 'completed', 'unresolved']),
       next_step: z.enum(['dispatch', 'inspect_launch', 'wait_for_result', 'inspect_side_effects', 'none']),
       attempt_id: id.nullable(),
+      cancellation: z
+        .object({
+          id,
+          project_id: id,
+          requested_by: id,
+          requested_at: timestamp,
+          process_state: z.enum(['requested', 'never_started', 'exit_confirmed', 'unresolved']),
+          effects_state: z.enum(['not_started', 'unresolved', 'reconciled']),
+          reconciliation_note: z.string().nullable(),
+          reconciled_by: id.nullable(),
+          reconciled_at: timestamp.nullable(),
+        })
+        .nullable()
+        .optional(),
     }),
   }),
   ticket_github_refresh: z.object({

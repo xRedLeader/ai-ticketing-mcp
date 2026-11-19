@@ -257,6 +257,23 @@ export interface ExecutionControllerFence {
   token: string;
   generation: number;
 }
+export interface ExecutionAdmission {
+  id: string;
+  paused: boolean;
+  actor_id: string;
+  updated_at: string;
+}
+export interface ExecutionCancellation {
+  id: string;
+  project_id: string;
+  requested_by: string;
+  requested_at: string;
+  process_state: 'requested' | 'never_started' | 'exit_confirmed' | 'unresolved';
+  effects_state: 'not_started' | 'unresolved' | 'reconciled';
+  reconciliation_note: string | null;
+  reconciled_by: string | null;
+  reconciled_at: string | null;
+}
 export interface ExecutionController extends ExecutionControllerFence {
   id: string;
   owner_id: string;
@@ -295,6 +312,7 @@ export interface ExecutionReconciliation {
   observation: ExecutionObservation | null;
   state: 'queued' | 'running' | 'completed' | 'unresolved';
   next_step: ExecutionObservation['next_step'];
+  cancellation?: ExecutionCancellation | null;
 }
 export interface OutboundDelivery {
   id: string;
@@ -322,6 +340,8 @@ export interface WebhookTarget {
   send(delivery: OutboundDelivery): Promise<{ error_code: string } | undefined>;
 }
 export interface Tables {
+  execution_admissions: ExecutionAdmission;
+  execution_cancellations: ExecutionCancellation;
   execution_controllers: ExecutionController;
   execution_attempts: ExecutionAttempt;
   execution_observations: ExecutionObservation;
