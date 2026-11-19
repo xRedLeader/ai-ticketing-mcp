@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, openSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -51,6 +52,8 @@ async function supervise(directory: string) {
   const stdout = openSync(join(directory, 'stdout.log'), 'wx', 0o600);
   const stderr = openSync(join(directory, 'stderr.log'), 'wx', 0o600);
   const bytes = { stdout: 0, stderr: 0 },
+    total_bytes = { stdout: 0, stderr: 0 },
+    hashes = { stdout: createHash('sha256'), stderr: createHash('sha256') },
     truncated = { stdout: false, stderr: false };
   let child: ChildProcess | undefined,
     spawned = false,
@@ -127,13 +130,17 @@ async function supervise(directory: string) {
               });
             });
             const capture = (stream: 'stdout' | 'stderr', fd: number) => (chunk: Buffer) => {
+              total_bytes[stream] = Math.min(Number.MAX_SAFE_INTEGER, total_bytes[stream] + chunk.length);
               const length = Math.min(chunk.length, Math.max(0, recipe.max_log_bytes - bytes[stream]));
               try {
-                if (length) writeFileSync(fd, chunk.subarray(0, length));
+                if (length) {
+                  writeFileSync(fd, chunk.subarray(0, length));
+                  hashes[stream].update(chunk.subarray(0, length));
+                  bytes[stream] += length;
+                }
               } catch {
                 stop('LOG_WRITE_FAILED');
               }
-              bytes[stream] += length;
               if (length < chunk.length) truncated[stream] = true;
             };
             child.stdout!.on('data', capture('stdout', stdout));
@@ -172,9 +179,40 @@ async function supervise(directory: string) {
       await Promise.allSettled([app.storage.close(), app.searchAdapter.close()]);
     }
     const observed = await completion!;
-    fsyncSync(stdout);
-    fsyncSync(stderr);
+    try {
+      fsyncSync(stdout);
+      fsyncSync(stderr);
+    } catch {
+      error ??= 'LOG_SYNC_FAILED';
+    }
     const finished = Date.now();
+    const sha256 = {
+      stdout: hashes.stdout.digest('hex'),
+      stderr: hashes.stderr.digest('hex'),
+      result: null as string | null,
+    };
+    const outcome = {
+      run_id: manifest.run_id,
+      attempt_id: manifest.attempt_id,
+      started_at: started,
+      finished_at: finished,
+      exit_code: spawned ? observed.code : null,
+      signal: observed.signal,
+      error_code: error,
+      bytes,
+      total_bytes,
+      truncated,
+      sha256: { stdout: sha256.stdout, stderr: sha256.stderr },
+    };
+    const artifact_errors: string[] = [];
+    try {
+      durableExecutionFile(join(directory, 'outcome.json'), outcome);
+      sha256.result = createHash('sha256')
+        .update(JSON.stringify(outcome) + '\n')
+        .digest('hex');
+    } catch {
+      artifact_errors.push('OUTCOME_WRITE_FAILED');
+    }
     // Natural foreground completion relies on the operator recipe contract, not OS tree containment.
     durableExecutionFile(join(directory, 'result.json'), {
       ...identity,
@@ -189,6 +227,9 @@ async function supervise(directory: string) {
         (name) => `execution:${manifest.run_id}:${manifest.attempt_id}:${name}`,
       ),
       bytes,
+      total_bytes,
+      sha256,
+      artifact_errors,
       truncated,
       cleanup_verified: !stopped && observed.signal === null,
     });

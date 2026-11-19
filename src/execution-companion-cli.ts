@@ -35,6 +35,7 @@ async function main() {
   const app = createRuntime({
     ...process.env,
     EMBEDDING_PROVIDER: 'none',
+    EXECUTION_ARTIFACTS_DIRECTORY: values.artifacts,
     ...(values.sqlite ? { STORAGE_ADAPTER: 'sqlite', SQLITE_PATH: values.sqlite } : {}),
   });
   const capacity = new HostCapacity(values.capacity);

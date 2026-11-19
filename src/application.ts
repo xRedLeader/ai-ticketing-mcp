@@ -41,6 +41,12 @@ import { inspectMemory } from './memory.js';
 import { serializeSuccessEnvelope } from './envelope.js';
 import { countReferenceTokens, queryExcerpt } from './tokens.js';
 import { CachedEmbeddings } from './query-embeddings.js';
+import {
+  artifactIdentity,
+  ExecutionArtifacts,
+  packArtifactRange,
+  unavailableArtifact,
+} from './execution-artifacts.js';
 
 export interface ApplicationOptions {
   storage: StorageAdapter;
@@ -52,6 +58,7 @@ export interface ApplicationOptions {
   github?: GitHubConfiguration & { provider: GitHubProvider };
   webhook?: WebhookTarget;
   executionRecipes?: readonly ExecutionRecipeRegistration[];
+  executionArtifacts?: { directory: string; ttl_ms?: number };
 }
 const LEASE_MS = 600_000;
 const webhookEvents = new Set([
@@ -90,6 +97,7 @@ export class Application {
   private readonly github?: GitHubConfiguration & { provider: GitHubProvider };
   private readonly webhook?: WebhookTarget;
   private readonly executionRecipes = new Map<string, ExecutionRecipeRegistration>();
+  private readonly executionArtifacts?: ExecutionArtifacts;
   readonly metrics = {
     requests: 0,
     errors: 0,
@@ -127,6 +135,11 @@ export class Application {
     this.now = options.now ?? (() => new Date());
     this.countTokens = options.countReferenceTokens ?? countReferenceTokens;
     this.referenceTokenMetrics = options.referenceTokenMetrics === true;
+    if (options.executionArtifacts)
+      this.executionArtifacts = new ExecutionArtifacts(
+        options.executionArtifacts.directory,
+        options.executionArtifacts.ttl_ms,
+      );
     if (options.webhook) {
       ensure(
         options.storage.leaseDeliveries &&
@@ -2183,7 +2196,54 @@ export class Application {
       blockers,
     };
   }
+  private async readArtifact(
+    reader: Reader,
+    projectId: string,
+    artifactId: string,
+    offset: number,
+    length: number,
+  ) {
+    const identity = artifactIdentity.exec(artifactId);
+    ensure(identity, 'INVALID_REFERENCE', 'Artifact identity is invalid.');
+    const run = await reader.get('execution_jobs', identity[1]!);
+    ensure(run && run.project_id === projectId, 'NOT_FOUND', 'Execution artifact not found.');
+    const attempt = await reader.get('execution_attempts', identity[2]!);
+    ensure(
+      attempt &&
+        attempt.project_id === projectId &&
+        attempt.run_id === run.id &&
+        run.artifacts.includes(artifactId),
+      'INVALID_REFERENCE',
+      'Artifact is not published by this execution attempt.',
+    );
+    return this.executionArtifacts
+      ? this.executionArtifacts.read(
+          artifactId,
+          {
+            run_id: run.id,
+            attempt_id: attempt.id,
+            process_token: attempt.process_token,
+            recipe_fingerprint: run.recipe_fingerprint,
+          },
+          offset,
+          length,
+          this.now().getTime(),
+        )
+      : unavailableArtifact(artifactId, offset, length, 'not_configured');
+  }
   private async read(actorId: string, operation: Operation, input: any): Promise<unknown> {
+    if (operation === 'artifact_read')
+      return this.storage.readSnapshot(async (reader) => {
+        await this.access(reader, await this.actor(actorId, reader), input.project_id);
+        const artifact = await this.readArtifact(
+          reader,
+          input.project_id,
+          input.artifact_id,
+          input.offset,
+          input.length,
+        );
+        return packArtifactRange(artifact, input.max_tokens, (value) => this.responseTokens(value));
+      });
     if (operation === 'run_get')
       return this.storage.readSnapshot(async (reader) => {
         await this.access(reader, await this.actor(actorId, reader), input.project_id);
@@ -2207,10 +2267,34 @@ export class Application {
           'Execution checkpoint or continuation is missing.',
         );
         const recovery = await this.executionReconciliation(reader, run);
-        return {
+        const output = await Promise.all(
+          run.artifacts
+            .filter((id) => artifactIdentity.test(id))
+            .map((id) => this.readArtifact(reader, input.project_id, id, 0, 0)),
+        );
+        const stderr = output.find((artifact) => artifact.artifact_id.endsWith(':stderr'));
+        const response = {
           run,
           continuation,
-          checkpoint,
+          checkpoint: checkpoint as Note | null,
+          output,
+          failure_location:
+            run.status === 'failed' && stderr
+              ? {
+                  tool: 'artifact_read',
+                  arguments: {
+                    project_id: input.project_id,
+                    artifact_id: stderr.artifact_id,
+                    offset: 0,
+                    length: Math.min(stderr.size_bytes ?? 4096, 4096),
+                  },
+                }
+              : null,
+          omitted: [] as {
+            section: string;
+            retrieve_with: string;
+            arguments: Record<string, string | number>;
+          }[],
           stale: !(await this.executionAuthority(reader, run)),
           reconciliation: {
             state: recovery.state,
@@ -2218,6 +2302,62 @@ export class Application {
             attempt_id: recovery.attempt?.id ?? null,
           },
         };
+        const tokens = () => this.responseTokens(this.result('run_get', response));
+        if (Buffer.byteLength(JSON.stringify(checkpoint)) > input.max_tokens || tokens() > input.max_tokens) {
+          response.checkpoint = null;
+          response.omitted.push({
+            section: 'checkpoint',
+            retrieve_with: 'checkpoint_get',
+            arguments: { project_id: input.project_id, checkpoint_id: run.checkpoint_id },
+          });
+        }
+        if (tokens() > input.max_tokens && response.output.length) {
+          response.output = [];
+          response.omitted.push({
+            section: 'output',
+            retrieve_with: 'artifact_read',
+            arguments: {
+              project_id: input.project_id,
+              artifact_id: stderr?.artifact_id ?? output[0]!.artifact_id,
+              length: 0,
+            },
+          });
+        }
+        if (tokens() > input.max_tokens) {
+          const compact = {
+            ...response,
+            run: {
+              id: run.id,
+              project_id: run.project_id,
+              status: run.status,
+              exit_code: run.exit_code,
+              signal: run.signal,
+              error_code: run.error_code,
+              artifacts: [],
+            },
+            continuation: {
+              id: continuation.id,
+              status: continuation.status,
+              failure_reason: continuation.failure_reason,
+            },
+            output: [],
+            checkpoint: null,
+            omitted: [
+              {
+                section: 'run_details',
+                retrieve_with: 'run_get',
+                arguments: { project_id: input.project_id, run_id: run.id, max_tokens: 32768 },
+              },
+            ],
+          };
+          ensure(
+            this.responseTokens(this.result('run_get', compact)) <= input.max_tokens,
+            'RESPONSE_BUDGET_TOO_SMALL',
+            'Execution status metadata exceeds the response budget. Increase max_tokens.',
+          );
+          return compact;
+        }
+        return response;
       });
     if (operation === 'ticket_context') {
       const snapshot = await this.storage.readSnapshot(async (reader) => {

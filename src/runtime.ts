@@ -66,6 +66,14 @@ export function createRuntime(env: NodeJS.ProcessEnv = process.env) {
       ? loadExecutionRecipes(env.EXECUTION_RECIPES_FILE).metadata()
       : [],
     referenceTokenMetrics: env.REFERENCE_TOKEN_METRICS === 'true',
+    ...(env.EXECUTION_ARTIFACTS_DIRECTORY
+      ? {
+          executionArtifacts: {
+            directory: env.EXECUTION_ARTIFACTS_DIRECTORY,
+            ...(env.EXECUTION_ARTIFACT_TTL_MS ? { ttl_ms: Number(env.EXECUTION_ARTIFACT_TTL_MS) } : {}),
+          },
+        }
+      : {}),
     ...(env.TICKETING_GITHUB_REPOSITORY
       ? {
           github: {

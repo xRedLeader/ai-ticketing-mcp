@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { artifactResultSchema } from './execution-artifacts.js';
 import type { Operation } from './schemas.js';
 const id = z.string(),
   timestamp = z.string(),
@@ -327,6 +328,7 @@ const search = z.object({
   index_consistency: z.literal('eventual'),
 });
 export const resultSchemas: Record<Operation, z.ZodType> = {
+  artifact_read: artifactResultSchema,
   run_submit: z.object({
     run_id: id,
     project_id: id,
@@ -339,9 +341,26 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
     retrieval,
   }),
   run_get: z.object({
-    run: executionJob,
-    continuation,
-    checkpoint: note,
+    run: z.union([
+      executionJob,
+      executionJob.pick({
+        id: true,
+        project_id: true,
+        status: true,
+        exit_code: true,
+        signal: true,
+        error_code: true,
+        artifacts: true,
+      }),
+    ]),
+    continuation: z.union([
+      continuation,
+      continuation.pick({ id: true, status: true, failure_reason: true }),
+    ]),
+    checkpoint: note.nullable(),
+    output: z.array(artifactResultSchema),
+    failure_location: retrieval.nullable(),
+    omitted: z.array(omission),
     stale: z.boolean(),
     reconciliation: z.object({
       state: z.enum(['queued', 'running', 'completed', 'unresolved']),
