@@ -105,9 +105,64 @@ export function registerExecutionRecoveryContractTests(
       view,
       claim,
       ticket,
+      createTicket: f.ticket,
+      claimTicket: f.claim,
       outcome,
     };
   }
+  check('settles recipes that exceed fixed host limits and continues processing the queue', async (f) => {
+    f.capacity.configureHost('limited', { cpu_millis: 100, script_timeout_ms: 2000 });
+    const recipe = f.config.recipes[0]!;
+    const recipes = new ExecutionRecipeRegistry({
+      ...f.config,
+      recipes: [
+        recipe,
+        { ...recipe, id: 'oversized', timeout_ms: 2000, resources: { cpu_millis: 101 } },
+        { ...recipe, id: 'fits', timeout_ms: 2000, argv: ['-e', ''] },
+      ],
+    });
+    const app = createApplication({
+      storage: f.storage,
+      search: f.search,
+      executionRecipes: recipes.metadata(),
+      now: () => f.clock.now,
+    });
+    const submit = async (recipeId: string) => {
+      f.clock.now = new Date(f.clock.now.getTime() + 1);
+      const ticket = await f.createTicket();
+      const claim = await f.claimTicket(ticket.id);
+      const receipt = (await app.execute(f.worker.id, 'run_submit', {
+        project_id: f.project.id,
+        ticket_id: ticket.id,
+        claim_token: claim.claim.token,
+        idempotency_key: randomUUID(),
+        recipe_id: recipeId,
+        checkpoint: { progress: 'Await capacity admission.' },
+        completion_condition: { kind: 'exit_code', exit_code: 0 },
+      })) as { run_id: string };
+      return receipt.run_id;
+    };
+    const oversized = await submit('oversized');
+    const fits = await submit('fits');
+    const companion = new ExecutionCompanion({ ...f.options, application: app, recipes, host_id: 'limited' });
+    for (const id of [f.runId, oversized]) {
+      assert.equal(await companion.runOnce(), true);
+      const run = await f.storage.get('execution_jobs', id);
+      assert.equal(run?.status, 'failed');
+      assert.equal(run.error_code, 'NOT_STARTED');
+      const [attempt] = await f.storage.find('execution_attempts', { where: { run_id: id } });
+      const proof = JSON.parse(
+        await readFile(join(f.options.artifacts_directory, id, attempt!.id, 'never-started.json'), 'utf8'),
+      );
+      assert.equal(proof.spawned, false);
+      assert.equal(proof.capacity, null);
+    }
+    assert.equal(f.capacity.inspect('limited').entries.length, 0);
+    assert.equal(existsSync(f.marker), false);
+    assert.equal(await companion.runOnce(), true);
+    assert.equal((await f.storage.get('execution_jobs', fits))?.status, 'succeeded');
+    assert.equal(f.capacity.inspect('limited').occupied.script, 0);
+  });
   check(
     'leases one controller across projects and fences expired ownership and stale process credentials',
     async (f) => {
