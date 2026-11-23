@@ -39,7 +39,7 @@ The registry file is bounded to 1 MiB; each normalized recipe and its private su
 
 An optional top-level `pipelines` array registers a finite verification pass as one ordinary execution recipe ID. `run_submit` selects that ID; the built-in runner executes every eligible step without model calls or individual MCP turns. The existing supervisor owns the runner and its foreground step children, and the existing attempt, continuation, cancellation, recovery and capacity fences still apply. A pipeline never retries a step.
 
-Each step references a registered native-executable recipe. Register an additional Git recipe with empty `argv` and its `cwd` set to the repository root, then add the pipeline to the same registry:
+Each step references a registered native-executable recipe whose `cwd` is the pinned repository root. Register an additional Git recipe with empty `argv` and the same `cwd`, then add the pipeline to the same registry:
 
 ```json
 {

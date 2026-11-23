@@ -190,6 +190,11 @@ export function pinVerificationPipeline(
     );
     seen.add(step.id);
     const recipe = command(step.recipe_id);
+    ensure(
+      recipe.cwd === git.cwd,
+      'INVALID_CONFIG',
+      'Pipeline step cwd must match the pinned repository root.',
+    );
     const files = step.toolchain_files.map((path) => {
       ensure(isAbsolute(path), 'INVALID_CONFIG', 'Toolchain files must be absolute.');
       const resolved = realpathSync(path);
