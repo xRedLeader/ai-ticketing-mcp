@@ -363,14 +363,10 @@ const json = new Set([
 ]);
 const booleans = new Set(['system_admin', 'blocking', 'archived', 'paused', 'deadline_fired']);
 function encode(key: string, value: unknown): SQLInputValue {
-  if (value === undefined) return key === 'work_kind' ? 'delivery' : key === 'spike_ids' ? '[]' : null;
+  if (value === undefined) return null;
   if (json.has(key))
     return value === null &&
-      ((key === 'work_kind' && value === 'delivery') ||
-        (key === 'spike_ids' && value === '[]') ||
-        key === 'execution_hints' ||
-        key === 'requirements_snapshot' ||
-        key === 'github_pull_request')
+      (key === 'execution_hints' || key === 'requirements_snapshot' || key === 'github_pull_request')
       ? null
       : JSON.stringify(value);
   if (value === null) return null;
@@ -566,8 +562,10 @@ function repository(db: DatabaseSync): Transaction {
     },
     async put<K extends Table>(table: K, value: Tables[K]) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
-      const keys = columns[table];
       const record = value as unknown as Record<string, unknown>;
+      const keys = columns[table].filter(
+        (key) => (key !== 'work_kind' && key !== 'spike_ids') || record[key] !== undefined,
+      );
       ensure(
         typeof record.id === 'string' && record.id.length > 0,
         'INVALID_REFERENCE',

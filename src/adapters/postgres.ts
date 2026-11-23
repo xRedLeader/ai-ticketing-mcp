@@ -549,13 +549,11 @@ function repository(db: Executor): Transaction {
     },
     async put<K extends Table>(table: K, value: Tables[K]) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
-      const keys = columns[table]!;
       const record = value as unknown as Record<string, unknown>;
-      const values = keys.map((key) => {
-        const value =
-          record[key] ?? (key === 'work_kind' ? 'delivery' : key === 'spike_ids' ? [] : record[key]);
-        return jsonColumns.has(key) ? JSON.stringify(value) : value;
-      });
+      const keys = columns[table]!.filter(
+        (key) => (key !== 'work_kind' && key !== 'spike_ids') || record[key] !== undefined,
+      );
+      const values = keys.map((key) => (jsonColumns.has(key) ? JSON.stringify(record[key]) : record[key]));
       const names = keys.map((key) => field(table, key));
       const conflict =
         table === 'idea_tickets' ||

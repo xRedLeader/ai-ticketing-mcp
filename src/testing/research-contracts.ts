@@ -307,6 +307,23 @@ export function registerResearchContractTests(name: string, factory: () => Promi
     assert.equal((await f.get(spike.id)).budget.first_claimed_at, f.clock.now.toISOString());
   });
 
+  it(`${name} research: legacy ticket updates preserve research classification`, async (t) => {
+    const f = await setup(t),
+      spike = await f.schedule();
+    const legacy = { ...(await f.storage.get('tickets', spike.id))! };
+    delete legacy.work_kind;
+    await f.storage.transaction(f.project.id, (tx) =>
+      tx.put('tickets', { ...legacy, title: 'Legacy metadata update' }),
+    );
+    assert.equal((await f.storage.get('tickets', spike.id))?.work_kind, 'research');
+    assert.deepEqual(await f.call(f.worker.id, 'work_next'), { tickets: [] });
+    await assert.rejects(
+      f.call(f.worker.id, 'work_claim', { ticket_id: spike.id, include_context: false }),
+      hasCode('NOT_CLAIMABLE'),
+    );
+    await f.claim(spike.id);
+  });
+
   it(`${name} research: budget fences every script and direct-agent new admission while permitting settlement`, async (t) => {
     const f = await setup(t);
     if (!f.storage.executionRuns) {
