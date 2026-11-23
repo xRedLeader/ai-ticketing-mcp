@@ -285,8 +285,9 @@ export function registerClientCapabilityContracts(name: string, factory: () => P
         });
       const stale = await f.claim(staleTicket.id),
         valid = await f.claim(validTicket.id);
-      f.queue(staleTicket, stale, 'stale');
-      f.queue(validTicket, valid, 'valid');
+      const createdAt = Date.now();
+      f.queue(staleTicket, stale, 'stale', { created_at: createdAt - 1 });
+      f.queue(validTicket, valid, 'valid', { created_at: createdAt });
       f.config.clients.find((client) => client.id === 'alpha')!.expires_at = new Date(
         Date.now() - 1,
       ).toISOString();
