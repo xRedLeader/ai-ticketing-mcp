@@ -15,6 +15,9 @@ export function artifactPinSql(
       ...(tables.includes('ideas')
         ? [['ideas', "title || problem || proposal || why || COALESCE(rationale,'')"]]
         : []),
+      ...(tables.includes('milestones')
+        ? [['milestones', 'name || outcome || CAST(exit_criteria AS TEXT)']]
+        : []),
       ['tickets', 'title || description || CAST(labels AS TEXT) || CAST(capabilities AS TEXT)'],
       ['criteria', 'text'],
       ['notes', 'body || CAST(metadata AS TEXT)'],

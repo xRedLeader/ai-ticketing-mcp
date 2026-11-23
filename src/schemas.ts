@@ -98,6 +98,40 @@ export const schemas = {
       })
       .strict(),
   ]),
+  milestone_create: z
+    .object({
+      ...project,
+      ...mutation,
+      name: text.max(200),
+      outcome: text.max(16000),
+      exit_criteria: criteria,
+    })
+    .strict(),
+  milestone_update: z
+    .object({
+      ...project,
+      ...mutation,
+      ...revision,
+      milestone_id: id,
+      name: text.max(200).optional(),
+      outcome: text.max(16000).optional(),
+      exit_criteria: criteria.optional(),
+    })
+    .strict(),
+  milestone_complete: z
+    .object({
+      ...project,
+      ...mutation,
+      ...revision,
+      milestone_id: id,
+      confirm_exit_criteria: z.literal(true),
+    })
+    .strict(),
+  ticket_milestone_set: z
+    .object({ ...ticket, ...mutation, milestone_id: id.nullable(), expected_milestone_id: id.nullable() })
+    .strict(),
+  milestone_list: z.object({ ...project, ...page }).strict(),
+  milestone_get: z.object({ ...project, ...page, milestone_id: id }).strict(),
   run_submit: z
     .object({
       ...ticket,
@@ -421,6 +455,8 @@ export type Input<K extends Operation> = z.infer<(typeof schemas)[K]>;
 export const readOperations = new Set<Operation>([
   'idea_list',
   'idea_get',
+  'milestone_list',
+  'milestone_get',
   'run_get',
   'run_wait',
   'artifact_read',
@@ -445,6 +481,16 @@ export const descriptions: Record<Operation, string> = {
   idea_get: 'Read a project idea, its disposition and source links to delivery tickets.',
   idea_triage:
     'Park, decline or promote an idea with rationale and revision protection. Promotion atomically creates delivery tickets and provenance; retry with the same idempotency key.',
+  milestone_create:
+    'Create a project milestone with outcome and exit criteria. Contributor or admin required.',
+  milestone_update: 'Edit a milestone with revision protection; edits reopen completion.',
+  milestone_complete:
+    'Explicitly confirm exit criteria after all member tickets have current accepted requirements.',
+  ticket_milestone_set:
+    'Attach, move or detach one same-project ticket. Supply its current milestone ID, or null, as expected_milestone_id. Does not change scheduling or dependencies.',
+  milestone_list: 'Page compact milestone summaries with live ticket status counts and accepted progress.',
+  milestone_get:
+    'Read outcome, exit criteria, live progress and a page of compact member tickets. Follow has_more.',
   run_timeline:
     'Explain one authorized run, its immutable observation timeline, current ownership and next safe wake/action. Paginate by after_sequence; max_tokens bounds the complete result. Full profile only; no transcripts or credentials.',
   run_submit: 'Checkpoint and queue an operator-registered recipe under a live claim.',

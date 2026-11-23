@@ -520,7 +520,31 @@ export interface WebhookTarget {
   readonly fingerprint: string;
   send(delivery: OutboundDelivery): Promise<{ error_code: string } | undefined>;
 }
+export interface Milestone {
+  id: string;
+  project_id: string;
+  name: string;
+  outcome: string;
+  exit_criteria: string[];
+  revision: number;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  completed_by: string | null;
+}
+export interface MilestoneMembership {
+  id: string;
+  project_id: string;
+  milestone_id: string;
+}
+export interface MilestoneProgress {
+  total: number;
+  accepted: number;
+  status_counts: Record<Ticket['status'], number>;
+}
 export interface Tables {
+  milestones: Milestone;
+  milestone_memberships: MilestoneMembership;
   artifact_retirements: ArtifactRetirement;
   execution_admissions: ExecutionAdmission;
   execution_cancellations: ExecutionCancellation;
@@ -561,6 +585,8 @@ export interface Query<T> {
   offset?: number;
 }
 export interface Reader {
+  /** Aggregate only the selected milestone, including acceptance of current requirements. */
+  milestoneProgress?(projectId: string, milestoneId: string): Promise<MilestoneProgress>;
   unansweredQuestions(
     projectId: string,
     ticketId: string,
@@ -597,6 +623,7 @@ export interface Transaction extends Reader {
 export interface StorageAdapter extends Reader {
   /** Optional proposal intake; ticket reads remain compatible without these tables. */
   readonly ideaIntake?: true;
+  readonly milestones?: true;
   readonly artifactRetention?: true;
   readonly wakeDecisions?: true;
   readonly executionRuns?: true;

@@ -65,6 +65,15 @@ import {
 import { ClientCapabilities } from './client-capabilities.js';
 import { pipelineIdentityError, type VerificationPipeline } from './verification-pipeline.js';
 import { inspectVerificationCache } from './execution-cache.js';
+import {
+  createMilestone,
+  updateMilestone,
+  completeMilestone,
+  setTicketMilestone,
+  listMilestones,
+  readMilestone,
+  reopenTicketMilestone,
+} from './milestones.js';
 
 export interface ApplicationOptions {
   storage: StorageAdapter;
@@ -83,6 +92,8 @@ export interface ApplicationOptions {
 const LEASE_MS = 600_000;
 const resumeChangeTypes = ['ticket.updated', 'ticket.invalidated', 'ticket.transitioned', 'ticket.linked'];
 const artifactPinWriters = new Set<Operation>([
+  'milestone_create',
+  'milestone_update',
   'project_create',
   'project_update',
   'tickets_create',
@@ -2805,6 +2816,14 @@ export class Application {
       const current = id === root.id ? root : await this.ticket(tx, project.id, id);
       current.requirements_revision++;
       current.approved_submission_id = null;
+      if (this.storage.milestones) {
+        const milestone = await reopenTicketMilestone(tx, current, this.timestamp());
+        if (milestone)
+          await this.event(tx, project, actor, 'milestone.reopened', milestone.id, {
+            ticket_id: current.id,
+            revision: milestone.revision,
+          });
+      }
       if (['done', 'in_review', 'in_progress'].includes(current.status)) current.status = 'ready';
       await tx.remove('claims', current.id);
       await this.touch(tx, current);
@@ -2907,6 +2926,47 @@ export class Application {
     if (operation === 'ticket_review') roles.splice(0, roles.length, 'verifier', 'admin');
     if (operation === 'ticket_note' || operation === 'knowledge_write') roles.push('verifier');
     return this.scoped(actorId, operation, input, roles, async (tx, project, actor) => {
+      if (
+        ['milestone_create', 'milestone_update', 'milestone_complete', 'ticket_milestone_set'].includes(
+          operation,
+        )
+      ) {
+        ensure(
+          this.storage.milestones && tx.milestoneProgress,
+          'UNSUPPORTED_MILESTONES',
+          'Storage does not support milestones.',
+        );
+        const result =
+          operation === 'milestone_create'
+            ? await createMilestone(tx, input, this.timestamp())
+            : operation === 'milestone_update'
+              ? await updateMilestone(tx, input, this.timestamp())
+              : operation === 'milestone_complete'
+                ? await completeMilestone(tx, input, actor.id, this.timestamp())
+                : await setTicketMilestone(
+                    tx,
+                    await this.ticket(tx, project.id, input.ticket_id),
+                    input,
+                    this.timestamp(),
+                  );
+        const eventType = {
+          milestone_create: 'milestone.created',
+          milestone_update: 'milestone.updated',
+          milestone_complete: 'milestone.completed',
+          ticket_milestone_set: 'ticket.milestone_changed',
+        }[
+          operation as 'milestone_create' | 'milestone_update' | 'milestone_complete' | 'ticket_milestone_set'
+        ];
+        await this.event(
+          tx,
+          project,
+          actor,
+          eventType,
+          'ticket_id' in result ? result.ticket_id : result.id,
+          result,
+        );
+        return result;
+      }
       switch (operation) {
         case 'idea_create': {
           const data = input as Input<'idea_create'>;
@@ -4079,6 +4139,16 @@ export class Application {
     viewerProfile?: McpProfile,
     bindContext = false,
   ): Promise<unknown> {
+    if (operation === 'milestone_list' || operation === 'milestone_get')
+      return this.storage.readSnapshot(async (reader) => {
+        await this.access(reader, await this.actor(actorId, reader), input.project_id);
+        ensure(
+          this.storage.milestones && reader.milestoneProgress,
+          'UNSUPPORTED_MILESTONES',
+          'Storage does not support milestones.',
+        );
+        return operation === 'milestone_list' ? listMilestones(reader, input) : readMilestone(reader, input);
+      });
     if (operation === 'run_wait') {
       const deadline = performance.now() + input.timeout_ms;
       for (;;) {
@@ -4406,6 +4476,12 @@ export class Application {
         return {
           ...(await this.details(this.storage, project, ticket, actor)),
           ...(source ? { source_idea: source } : {}),
+          ...(this.storage.milestones
+            ? {
+                milestone_id:
+                  (await this.storage.get('milestone_memberships', ticket.id))?.milestone_id ?? null,
+              }
+            : {}),
         };
       }
       case 'ticket_history': {

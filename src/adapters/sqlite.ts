@@ -26,6 +26,7 @@ import {
 } from '../contracts.js';
 import { MAX_INDEX_JOB_ATTEMPTS } from './index-job-policy.js';
 import { artifactPinSql } from './artifact-pins.js';
+import { milestoneProgress, milestoneProgressSql } from './milestones.js';
 
 const knowledgeColumns = [
   'id',
@@ -61,6 +62,19 @@ const columns: Record<Table, string[]> = {
     'updated_at',
   ],
   idea_tickets: ['id', 'project_id', 'idea_id', 'idea_revision', 'ticket_id'],
+  milestones: [
+    'id',
+    'project_id',
+    'name',
+    'outcome',
+    'exit_criteria',
+    'revision',
+    'created_at',
+    'updated_at',
+    'completed_at',
+    'completed_by',
+  ],
+  milestone_memberships: ['id', 'project_id', 'milestone_id'],
   claim_handoffs: [
     'id',
     'project_id',
@@ -307,6 +321,7 @@ const columns: Record<Table, string[]> = {
   ],
 };
 const json = new Set([
+  'exit_criteria',
   'condition',
   'observed',
   'pending',
@@ -394,15 +409,18 @@ function repository(db: DatabaseSync): Transaction {
       // The caller's BEGIN IMMEDIATE already serializes reference writes and physical reads.
     },
     async artifactPinned(query) {
+      const tables = db
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('ideas','milestones')")
+        .all()
+        .map((row) => String(row.name));
       const values: string[] = [];
-      const ideas = db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='ideas'").get();
       const sql = artifactPinSql(
         query,
         (value) => {
           values.push(value);
           return '?';
         },
-        ideas ? ['ideas'] : [],
+        tables,
       );
       return (db.prepare(sql).get(...values) as { pinned: number }).pinned === 1;
     },
@@ -441,6 +459,9 @@ function repository(db: DatabaseSync): Transaction {
             previous.locked_until,
           ).changes === 1
       );
+    },
+    async milestoneProgress(projectId, milestoneId) {
+      return milestoneProgress(db.prepare(milestoneProgressSql('?', '?')).get(projectId, milestoneId)!);
     },
     async get<K extends Table>(table: K, id: string) {
       return (await this.find(table, { where: { id } as Query<Tables[K]>['where'], limit: 1 }))[0] ?? null;
@@ -686,6 +707,11 @@ class Handle {
 }
 class SqliteStorage extends Handle implements StorageAdapter {
   readonly ideaIntake = true as const;
+  readonly milestones = true as const;
+  milestoneProgress(projectId: string, milestoneId: string) {
+    this.open();
+    return repository(this.db).milestoneProgress!(projectId, milestoneId);
+  }
   readonly artifactRetention = true as const;
   readonly wakeDecisions = true;
   readonly executionRuns = true as const;
@@ -738,8 +764,8 @@ class SqliteStorage extends Handle implements StorageAdapter {
       try {
         db.exec('BEGIN');
         db.prepare('SELECT name FROM sqlite_schema LIMIT 1').get();
-        const { get, find, unansweredQuestions, workCandidates } = repository(db);
-        const result = await work({ get, find, unansweredQuestions, workCandidates });
+        const { get, find, unansweredQuestions, workCandidates, milestoneProgress } = repository(db);
+        const result = await work({ get, find, unansweredQuestions, workCandidates, milestoneProgress });
         db.exec('COMMIT');
         return result;
       } finally {

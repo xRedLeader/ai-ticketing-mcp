@@ -83,6 +83,8 @@ Projects and tickets accept optional `execution_hints` with `model` and `effort`
 
 Optional [registered client capabilities](docs/client-capabilities.md) enforce supported model/effort pairs, operating systems, tools and execution environments before matching and admission. Operator records bind support to authorized identities/projects and expire; requests can pin `client_id`, `operating_system` and `environment` through the same hints. Existing claims remain compatible when registration is not configured.
 
+[Milestones](docs/mcp.md#milestones) group same-project tickets by an intended outcome and exit criteria. Planner tools manage optional membership, page compact progress, and explicitly confirm completion after current member requirements are accepted. Grouping does not affect claims, scheduling or dependencies.
+
 ## Extending the system
 
 ```ts

@@ -23,6 +23,7 @@ import {
 } from '../contracts.js';
 import { MAX_INDEX_JOB_ATTEMPTS } from './index-job-policy.js';
 import { artifactPinSql } from './artifact-pins.js';
+import { milestoneProgress, milestoneProgressSql } from './milestones.js';
 
 const knowledgeColumns = [
   'id',
@@ -58,6 +59,19 @@ const columns: Record<Table, string[]> = {
     'updated_at',
   ],
   idea_tickets: ['id', 'project_id', 'idea_id', 'idea_revision', 'ticket_id'],
+  milestones: [
+    'id',
+    'project_id',
+    'name',
+    'outcome',
+    'exit_criteria',
+    'revision',
+    'created_at',
+    'updated_at',
+    'completed_at',
+    'completed_by',
+  ],
+  milestone_memberships: ['id', 'project_id', 'milestone_id'],
   claim_handoffs: [
     'id',
     'project_id',
@@ -304,6 +318,7 @@ const columns: Record<Table, string[]> = {
   ],
 };
 const jsonColumns = new Set([
+  'exit_criteria',
   'condition',
   'observed',
   'pending',
@@ -361,21 +376,31 @@ function repository(db: Executor): Transaction {
     return `"${key}"`;
   };
   return {
+    async milestoneProgress(projectId, milestoneId) {
+      return milestoneProgress(
+        (await db.query(milestoneProgressSql('$1', '$2'), [projectId, milestoneId])).rows[0],
+      );
+    },
     async lockArtifactReferences(exclusive = false) {
       await db.query(
         `SELECT ${exclusive ? 'pg_advisory_xact_lock' : 'pg_advisory_xact_lock_shared'}(71402912)`,
       );
     },
     async artifactPinned(query) {
+      const installed = (
+        await db.query(
+          "SELECT to_regclass('ideas') IS NOT NULL AS ideas, to_regclass('milestones') IS NOT NULL AS milestones",
+        )
+      ).rows[0];
+      const tables = ['ideas', 'milestones'].filter((table) => installed[table]);
       const values: string[] = [];
-      const ideas = (await db.query("SELECT to_regclass('ideas') IS NOT NULL AS present")).rows[0].present;
       const sql = artifactPinSql(
         query,
         (value) => {
           values.push(value);
           return `$${values.length}`;
         },
-        ideas ? ['ideas'] : [],
+        tables,
       );
       return (await db.query(sql, values)).rows[0].pinned === true;
     },
@@ -565,6 +590,10 @@ function repository(db: Executor): Transaction {
 
 export class PostgresStorage implements StorageAdapter {
   readonly ideaIntake = true as const;
+  readonly milestones = true as const;
+  milestoneProgress(projectId: string, milestoneId: string) {
+    return this.reader.milestoneProgress!(projectId, milestoneId);
+  }
   readonly artifactRetention = true as const;
   readonly wakeDecisions = true;
   readonly executionRuns = true as const;
@@ -626,8 +655,8 @@ export class PostgresStorage implements StorageAdapter {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
-      const { get, find, unansweredQuestions, workCandidates } = repository(client);
-      const result = await work({ get, find, unansweredQuestions, workCandidates });
+      const { get, find, unansweredQuestions, workCandidates, milestoneProgress } = repository(client);
+      const result = await work({ get, find, unansweredQuestions, workCandidates, milestoneProgress });
       await client.query('COMMIT');
       return result;
     } catch (error) {

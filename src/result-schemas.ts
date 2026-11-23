@@ -456,11 +456,64 @@ const executionView = z.object({
     cancellation: executionCancellation.nullable().optional(),
   }),
 });
+const milestoneReceipt = z.object({
+  id,
+  project_id: id,
+  revision: z.number().int().positive(),
+  completed_at: timestamp.nullable(),
+  completed_by: id.nullable(),
+});
+const milestoneProgress = z.object({
+  total: z.number().int().nonnegative(),
+  accepted: z.number().int().nonnegative(),
+  status_counts: z.object({
+    backlog: z.number().int().nonnegative(),
+    ready: z.number().int().nonnegative(),
+    in_progress: z.number().int().nonnegative(),
+    in_review: z.number().int().nonnegative(),
+    done: z.number().int().nonnegative(),
+    cancelled: z.number().int().nonnegative(),
+  }),
+});
+const milestoneSummary = milestoneReceipt.extend({
+  name: z.string(),
+  status: z.enum(['open', 'completed']),
+  progress: milestoneProgress,
+});
 export const resultSchemas: Record<Operation, z.ZodType> = {
   idea_create: ideaReceipt,
   idea_list: z.object({ ideas: z.array(ideaSummary) }),
   idea_get: z.object({ idea, tickets: z.array(ideaTicket) }),
   idea_triage: z.object({ idea: ideaReceipt, tickets: z.array(ideaTicket) }),
+  milestone_create: milestoneReceipt,
+  milestone_update: milestoneReceipt,
+  milestone_complete: milestoneReceipt,
+  ticket_milestone_set: z.object({ ticket_id: id, milestone_id: id.nullable() }),
+  milestone_list: z.object({
+    items: z.array(milestoneSummary),
+    has_more: z.boolean(),
+    next_offset: z.number().int().nonnegative(),
+  }),
+  milestone_get: z.object({
+    milestone: milestoneSummary.extend({
+      outcome: z.string(),
+      exit_criteria: z.array(z.string()),
+      created_at: timestamp,
+      updated_at: timestamp,
+    }),
+    members: z.array(
+      z.object({
+        id,
+        key: z.string(),
+        title: z.string(),
+        status: ticket.shape.status,
+        requirements_revision: z.number().int().positive(),
+        accepted: z.boolean(),
+      }),
+    ),
+    has_more: z.boolean(),
+    next_offset: z.number().int().nonnegative(),
+  }),
   run_wait: executionView,
   run_cancel: z.object({
     run_id: id,
@@ -670,6 +723,7 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
   ticket_update: ticketReceipt,
   ticket_transition: ticketReceipt,
   ticket_get: z.object({
+    milestone_id: id.nullable().optional(),
     ticket,
     source_idea: ideaTicket.optional(),
     effective_execution_hints: executionHints.optional(),
