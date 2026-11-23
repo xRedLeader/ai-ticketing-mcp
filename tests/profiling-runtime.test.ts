@@ -12,6 +12,16 @@ import { DomainError } from '../src/contracts.js';
 import { createHttpServer } from '../src/http.js';
 import { createProfileRecorder } from '../src/profiling.js';
 
+it('lists the researcher profile in CLI help without initializing a runtime', async () => {
+  const { stdout, stderr } = await promisify(execFile)(
+    process.execPath,
+    ['--import', 'tsx', 'src/cli.ts', 'help'],
+    { env: { ...process.env, STORAGE_ADAPTER: 'invalid-not-needed-for-help' }, windowsHide: true },
+  );
+  assert.match(stdout, /stdio \[--profile NAME\].*\bresearcher\b/);
+  assert.equal(stderr, '');
+});
+
 async function records(directory: string) {
   const files = (await readdir(directory)).filter((name) => /^events-\d+\.jsonl$/.test(name)).sort();
   return (await Promise.all(files.map((name) => readFile(join(directory, name), 'utf8'))))
