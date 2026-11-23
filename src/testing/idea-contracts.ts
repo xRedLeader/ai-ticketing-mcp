@@ -291,6 +291,10 @@ export function registerIdeaContractTests(name: string, factory: () => Promise<C
 
   it(`${name} ideas: every stored proposal field pins native artifact references`, async (t) => {
     const f = await setup(t);
+    if (!f.storage.artifactRetention) {
+      t.skip('Storage does not advertise artifact retention.');
+      return;
+    }
     for (const field of ['title', 'problem', 'proposal', 'why', 'rationale']) {
       const run = randomUUID(),
         attempt = randomUUID();
