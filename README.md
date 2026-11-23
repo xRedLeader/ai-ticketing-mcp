@@ -7,6 +7,7 @@ Headless ticketing built for agents: find useful work, claim it safely, recover 
 ## What agents get
 
 - Structured tickets with acceptance criteria, priorities, capabilities, parents, and blocking dependencies.
+- Project idea intake and triage, with atomic promotion into delivery tickets and source provenance.
 - Atomic ten-minute claims, heartbeat renewal, stale-worker fencing, and retry-safe mutations.
 - Optional [GitHub CI evidence](docs/mcp.md#github-evidence), [durable signed notifications](docs/operations.md#durable-signed-notifications), and [deterministic unblocking scheduling](docs/mcp.md#scheduling).
 - Durable checkpoints, blocking questions, decisions, and artifact references.

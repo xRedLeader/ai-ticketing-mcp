@@ -12,13 +12,13 @@ The default profile is `worker`. Select `stdio --profile worker|executor|planner
 
 Every profile includes `project_list`, `project_get`, `ticket_list`, `ticket_context`, `ticket_get`, `ticket_history`, and `checkpoint_get`. Worker, planner, reviewer and full also include `search`, `knowledge_get`, and `changes_since`.
 
-| Profile               | Additional tools                                                                                                                 | Prompts            |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
-| `worker` (16 tools)   | `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`, `ticket_note`, `ticket_submit`                              | execution, handoff |
-| `executor` (16 tools) | `work_claim`, `work_release`, `ticket_note`, `ticket_submit`, `run_submit`, `run_wait`, `run_get`, `run_cancel`, `artifact_read` | execution, handoff |
-| `planner` (17 tools)  | `tickets_create`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_note`, `knowledge_write`, `ticket_github_refresh` | planning           |
-| `reviewer` (14 tools) | `ticket_review`, `ticket_note`, `ticket_github_refresh`, `artifact_read`                                                         | verification       |
-| `full` (36 tools)     | All tools below, including project administration, `work_next`, and `run_timeline`                                               | all four           |
+| Profile               | Additional tools                                                                                                                                                                        | Prompts            |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| `worker` (16 tools)   | `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`, `ticket_note`, `ticket_submit`                                                                                     | execution, handoff |
+| `executor` (16 tools) | `work_claim`, `work_release`, `ticket_note`, `ticket_submit`, `run_submit`, `run_wait`, `run_get`, `run_cancel`, `artifact_read`                                                        | execution, handoff |
+| `planner` (21 tools)  | `idea_create`, `idea_list`, `idea_get`, `idea_triage`, `tickets_create`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_note`, `knowledge_write`, `ticket_github_refresh` | planning           |
+| `reviewer` (14 tools) | `ticket_review`, `ticket_note`, `ticket_github_refresh`, `artifact_read`                                                                                                                | verification       |
+| `full` (40 tools)     | All tools below, including project administration, `work_next`, and `run_timeline`                                                                                                      | all four           |
 
 Profiles are not an access-control boundary. They select tool exposure; every operation retains its OAuth scope and project-role checks. Resources remain independently authorized and available in every profile. Guides and prompts follow the selected profile; the tool surface works without either.
 
@@ -33,12 +33,19 @@ Use the [execution companion](execution-companion.md) to configure registered sc
 | Group                      | Tools                                                                                                                |
 | -------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | Projects                   | `project_list`, `project_get`, `project_create`, `project_update`, `member_set`                                      |
+| Ideas                      | `idea_create`, `idea_list`, `idea_get`, `idea_triage`                                                                |
 | Tickets                    | `tickets_create`, `ticket_list`, `ticket_get`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_history` |
 | Coordination               | `work_next`, `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`                                     |
 | Registered execution       | `run_submit`, `run_wait`, `run_get`, `run_cancel`, `artifact_read`, `run_timeline`                                   |
 | Collaboration and evidence | `ticket_note`, `ticket_submit`, `ticket_review`                                                                      |
 | Retrieval                  | `ticket_context`, `search`, `knowledge_get`, `knowledge_write`, `checkpoint_get`                                     |
 | Changes                    | `changes_since`                                                                                                      |
+
+`idea_create` captures `title`, `problem`, `proposal` (the possible improvement), and `why`. Contributors and admins can submit and triage; all project members can read. Planner and full profiles expose idea tools without changing these permissions. Ideas are separate from delivery tickets and never enter `work_next` or `work_claim`.
+
+`idea_list` pages all dispositions, optionally filtering `status` (`submitted`, `parked`, `declined`, `promoted`); `idea_get` returns the full record and delivery links. `idea_triage` requires `idea_id`, `expected_revision`, `rationale`, and `action` (`park`, `decline`, `promote`). Promotion additionally requires 1-50 `tickets` using the `tickets_create` fields and acceptance criteria. Backlog is the default; explicitly use `ready` for claimable work. Promotion commits the decision, tickets, criteria, immutable provenance, events and receipt atomically. Identical retries with the same key return the original result, current authorization is rechecked, and stale revisions fail. Promoted ideas are terminal; parked and declined ideas can be reconsidered with their latest revision. Earlier decisions and rationale remain in `changes_since` events.
+
+Mutation receipts contain idea IDs, disposition and revision; promotion also returns source links with delivery ticket IDs. Fetch full prose through `idea_get`. Each promoted ticket's `ticket_get.source_idea` points back to the exact idea revision that produced it. Ideas are discoverable through their dedicated list/get tools rather than the ticket search index. Native execution artifact citations in proposal fields and rationale retain their logs; new citations to already-retired logs are rejected.
 
 `tickets_create` accepts 1–50 tickets atomically, defaulting to backlog. Use `ready` to queue execution. Each ticket needs 1–50 criteria. Priority 1 is highest; 5 is lowest. Default work selection orders by priority, creation time, then identifier, and respects declared capabilities, labels, assignment, blockers, and active claims.
 

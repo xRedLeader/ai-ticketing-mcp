@@ -80,6 +80,30 @@ const ticket = z.object({
   updated_at: timestamp,
 });
 const criterion = z.object({ id, project_id: id, ticket_id: id, text: z.string(), position: z.number() });
+const idea = z.object({
+  id,
+  project_id: id,
+  title: z.string(),
+  problem: z.string(),
+  proposal: z.string(),
+  why: z.string(),
+  status: z.enum(['submitted', 'parked', 'declined', 'promoted']),
+  revision: z.number().int().positive(),
+  created_by: id,
+  decided_by: id.nullable(),
+  rationale: z.string().nullable(),
+  created_at: timestamp,
+  updated_at: timestamp,
+});
+const ideaTicket = z.object({
+  id,
+  project_id: id,
+  idea_id: id,
+  idea_revision: z.number().int().positive(),
+  ticket_id: id,
+});
+const ideaReceipt = idea.pick({ id: true, project_id: true, status: true, revision: true });
+const ideaSummary = idea.omit({ problem: true, proposal: true, why: true, rationale: true });
 const link = z.object({
   id,
   project_id: id,
@@ -433,6 +457,10 @@ const executionView = z.object({
   }),
 });
 export const resultSchemas: Record<Operation, z.ZodType> = {
+  idea_create: ideaReceipt,
+  idea_list: z.object({ ideas: z.array(ideaSummary) }),
+  idea_get: z.object({ idea, tickets: z.array(ideaTicket) }),
+  idea_triage: z.object({ idea: ideaReceipt, tickets: z.array(ideaTicket) }),
   run_wait: executionView,
   run_cancel: z.object({
     run_id: id,
@@ -643,6 +671,7 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
   ticket_transition: ticketReceipt,
   ticket_get: z.object({
     ticket,
+    source_idea: ideaTicket.optional(),
     effective_execution_hints: executionHints.optional(),
     github_evidence: githubEvidenceSchema.optional(),
     criteria: z.array(criterion),

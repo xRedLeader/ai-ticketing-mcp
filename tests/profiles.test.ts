@@ -51,6 +51,10 @@ const expected = {
   ],
   planner: [
     ...shared,
+    'idea_create',
+    'idea_list',
+    'idea_get',
+    'idea_triage',
     'tickets_create',
     'ticket_update',
     'ticket_transition',

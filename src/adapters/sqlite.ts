@@ -45,6 +45,22 @@ const knowledgeColumns = [
   'updated_at',
 ];
 const columns: Record<Table, string[]> = {
+  ideas: [
+    'id',
+    'project_id',
+    'title',
+    'problem',
+    'proposal',
+    'why',
+    'status',
+    'revision',
+    'created_by',
+    'decided_by',
+    'rationale',
+    'created_at',
+    'updated_at',
+  ],
+  idea_tickets: ['id', 'project_id', 'idea_id', 'idea_revision', 'ticket_id'],
   claim_handoffs: [
     'id',
     'project_id',
@@ -379,10 +395,15 @@ function repository(db: DatabaseSync): Transaction {
     },
     async artifactPinned(query) {
       const values: string[] = [];
-      const sql = artifactPinSql(query, (value) => {
-        values.push(value);
-        return '?';
-      });
+      const ideas = db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='ideas'").get();
+      const sql = artifactPinSql(
+        query,
+        (value) => {
+          values.push(value);
+          return '?';
+        },
+        ideas ? ['ideas'] : [],
+      );
       return (db.prepare(sql).get(...values) as { pinned: number }).pinned === 1;
     },
     async lockExecutionController() {
@@ -509,6 +530,7 @@ function repository(db: DatabaseSync): Transaction {
         'A record ID is required.',
       );
       const conflict =
+        table === 'idea_tickets' ||
         table === 'claim_handoffs' ||
         table === 'artifact_retirements' ||
         table === 'github_evidence' ||
@@ -663,6 +685,7 @@ class Handle {
   }
 }
 class SqliteStorage extends Handle implements StorageAdapter {
+  readonly ideaIntake = true as const;
   readonly artifactRetention = true as const;
   readonly wakeDecisions = true;
   readonly executionRuns = true as const;

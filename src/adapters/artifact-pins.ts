@@ -1,13 +1,20 @@
 import type { ArtifactPinQuery } from '../contracts.js';
 
 /** Plain-text citations are intentionally conservative; historical evidence/memory also pins. */
-export function artifactPinSql(query: ArtifactPinQuery, bind: (value: string) => string) {
+export function artifactPinSql(
+  query: ArtifactPinQuery,
+  bind: (value: string) => string,
+  tables: readonly string[] = [],
+) {
   const contains = (expression: string, ids = [query.run_id, query.attempt_id]) =>
     ids.map((id) => `LOWER(${expression}) LIKE ${bind(`%${id}%`)}`).join(' OR ');
   const checks = [
     `EXISTS(SELECT 1 FROM tickets WHERE id=${bind(query.ticket_id)} AND status NOT IN ('done','cancelled'))`,
     ...[
       ['projects', 'instructions'],
+      ...(tables.includes('ideas')
+        ? [['ideas', "title || problem || proposal || why || COALESCE(rationale,'')"]]
+        : []),
       ['tickets', 'title || description || CAST(labels AS TEXT) || CAST(capabilities AS TEXT)'],
       ['criteria', 'text'],
       ['notes', 'body || CAST(metadata AS TEXT)'],

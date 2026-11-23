@@ -42,6 +42,22 @@ const knowledgeColumns = [
   'updated_at',
 ];
 const columns: Record<Table, string[]> = {
+  ideas: [
+    'id',
+    'project_id',
+    'title',
+    'problem',
+    'proposal',
+    'why',
+    'status',
+    'revision',
+    'created_by',
+    'decided_by',
+    'rationale',
+    'created_at',
+    'updated_at',
+  ],
+  idea_tickets: ['id', 'project_id', 'idea_id', 'idea_revision', 'ticket_id'],
   claim_handoffs: [
     'id',
     'project_id',
@@ -352,10 +368,15 @@ function repository(db: Executor): Transaction {
     },
     async artifactPinned(query) {
       const values: string[] = [];
-      const sql = artifactPinSql(query, (value) => {
-        values.push(value);
-        return `$${values.length}`;
-      });
+      const ideas = (await db.query("SELECT to_regclass('ideas') IS NOT NULL AS present")).rows[0].present;
+      const sql = artifactPinSql(
+        query,
+        (value) => {
+          values.push(value);
+          return `$${values.length}`;
+        },
+        ideas ? ['ideas'] : [],
+      );
       return (await db.query(sql, values)).rows[0].pinned === true;
     },
     async lockExecutionController() {
@@ -489,6 +510,7 @@ function repository(db: Executor): Transaction {
       const values = keys.map((key) => (jsonColumns.has(key) ? JSON.stringify(record[key]) : record[key]));
       const names = keys.map((key) => field(table, key));
       const conflict =
+        table === 'idea_tickets' ||
         table === 'claim_handoffs' ||
         table === 'artifact_retirements' ||
         table === 'github_evidence' ||
@@ -542,6 +564,7 @@ function repository(db: Executor): Transaction {
 }
 
 export class PostgresStorage implements StorageAdapter {
+  readonly ideaIntake = true as const;
   readonly artifactRetention = true as const;
   readonly wakeDecisions = true;
   readonly executionRuns = true as const;

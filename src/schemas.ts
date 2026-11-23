@@ -50,6 +50,10 @@ const ticketFields = {
   parent_id: ref.nullable().default(null),
   criteria,
 };
+const deliveryTicket = z
+  .object({ ...ticketFields, status: z.enum(['backlog', 'ready']).default('backlog') })
+  .strict();
+const ideaStatus = z.enum(['submitted', 'parked', 'declined', 'promoted']);
 const evidence = z
   .object({
     criterion_id: id,
@@ -59,6 +63,41 @@ const evidence = z
   })
   .strict();
 export const schemas = {
+  idea_create: z
+    .object({
+      ...project,
+      ...mutation,
+      title: text.max(300),
+      problem: text.max(16000),
+      proposal: text.max(16000),
+      why: text.max(16000),
+    })
+    .strict(),
+  idea_list: z.object({ ...project, ...page, status: ideaStatus.optional() }).strict(),
+  idea_get: z.object({ ...project, idea_id: id }).strict(),
+  idea_triage: z.discriminatedUnion('action', [
+    z
+      .object({
+        ...project,
+        ...mutation,
+        ...revision,
+        idea_id: id,
+        action: z.enum(['park', 'decline']),
+        rationale: text.max(4000),
+      })
+      .strict(),
+    z
+      .object({
+        ...project,
+        ...mutation,
+        ...revision,
+        idea_id: id,
+        action: z.literal('promote'),
+        rationale: text.max(4000),
+        tickets: z.array(deliveryTicket).min(1).max(50),
+      })
+      .strict(),
+  ]),
   run_submit: z
     .object({
       ...ticket,
@@ -141,12 +180,7 @@ export const schemas = {
     .object({
       ...project,
       ...mutation,
-      tickets: z
-        .array(
-          z.object({ ...ticketFields, status: z.enum(['backlog', 'ready']).default('backlog') }).strict(),
-        )
-        .min(1)
-        .max(50),
+      tickets: z.array(deliveryTicket).min(1).max(50),
     })
     .strict(),
   ticket_get: z.object(ticket).strict(),
@@ -385,6 +419,8 @@ export const schemas = {
 export type Operation = keyof typeof schemas;
 export type Input<K extends Operation> = z.infer<(typeof schemas)[K]>;
 export const readOperations = new Set<Operation>([
+  'idea_list',
+  'idea_get',
   'run_get',
   'run_wait',
   'artifact_read',
@@ -403,6 +439,12 @@ export const readOperations = new Set<Operation>([
   'changes_since',
 ]);
 export const descriptions: Record<Operation, string> = {
+  idea_create:
+    'Capture a project proposal with its problem, possible improvement and value. Ideas are never claimable.',
+  idea_list: 'List project ideas, including parked, declined and promoted dispositions.',
+  idea_get: 'Read a project idea, its disposition and source links to delivery tickets.',
+  idea_triage:
+    'Park, decline or promote an idea with rationale and revision protection. Promotion atomically creates delivery tickets and provenance; retry with the same idempotency key.',
   run_timeline:
     'Explain one authorized run, its immutable observation timeline, current ownership and next safe wake/action. Paginate by after_sequence; max_tokens bounds the complete result. Full profile only; no transcripts or credentials.',
   run_submit: 'Checkpoint and queue an operator-registered recipe under a live claim.',

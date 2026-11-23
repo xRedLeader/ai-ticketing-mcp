@@ -75,6 +75,28 @@ export interface Criterion {
   text: string;
   position: number;
 }
+export interface Idea {
+  id: string;
+  project_id: string;
+  title: string;
+  problem: string;
+  proposal: string;
+  why: string;
+  status: 'submitted' | 'parked' | 'declined' | 'promoted';
+  revision: number;
+  created_by: string;
+  decided_by: string | null;
+  rationale: string | null;
+  created_at: string;
+  updated_at: string;
+}
+export interface IdeaTicket {
+  id: string;
+  project_id: string;
+  idea_id: string;
+  idea_revision: number;
+  ticket_id: string;
+}
 export interface Link {
   id: string;
   project_id: string;
@@ -514,6 +536,8 @@ export interface Tables {
   projects: Project;
   members: Member;
   tickets: Ticket;
+  ideas: Idea;
+  idea_tickets: IdeaTicket;
   criteria: Criterion;
   links: Link;
   notes: Note;
@@ -571,6 +595,8 @@ export interface Transaction extends Reader {
   remove<K extends Table>(table: K, id: string): Promise<void>;
 }
 export interface StorageAdapter extends Reader {
+  /** Optional proposal intake; ticket reads remain compatible without these tables. */
+  readonly ideaIntake?: true;
   readonly artifactRetention?: true;
   readonly wakeDecisions?: true;
   readonly executionRuns?: true;

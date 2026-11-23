@@ -8,6 +8,7 @@ import {
   type Actor,
   type Project,
   type Ticket,
+  type Idea,
   type Reader,
   type Transaction,
   type StorageAdapter,
@@ -85,6 +86,8 @@ const artifactPinWriters = new Set<Operation>([
   'project_create',
   'project_update',
   'tickets_create',
+  'idea_create',
+  'idea_triage',
   'ticket_update',
   'ticket_transition',
   'ticket_note',
@@ -265,6 +268,11 @@ export class Application {
     if (ticket.github_pull_request === null) delete ticket.github_pull_request;
     if (!ticket.execution_hints || !Object.keys(ticket.execution_hints).length) delete ticket.execution_hints;
     return ticket;
+  }
+  private async idea(reader: Reader, projectId: string, id: string) {
+    const idea = await reader.get('ideas', id);
+    ensure(idea && idea.project_id === projectId, 'NOT_FOUND', 'Idea not found in project.');
+    return idea;
   }
   private executionHints(project: Project, ticket: Ticket): ExecutionHints | undefined {
     const hints = { ...project.execution_hints, ...ticket.execution_hints };
@@ -2867,6 +2875,8 @@ export class Application {
     this.metrics.requests++;
     try {
       ensure(Object.hasOwn(schemas, operation), 'UNKNOWN_OPERATION', 'Unknown operation.');
+      if (operation.startsWith('idea_'))
+        ensure(this.storage.ideaIntake, 'UNSUPPORTED_IDEAS', 'Storage does not support idea intake.');
       const result = schemas[operation].safeParse(raw);
       if (!result.success)
         throw new DomainError('INVALID_INPUT', 'Input does not match the operation schema.', {
@@ -2898,6 +2908,65 @@ export class Application {
     if (operation === 'ticket_note' || operation === 'knowledge_write') roles.push('verifier');
     return this.scoped(actorId, operation, input, roles, async (tx, project, actor) => {
       switch (operation) {
+        case 'idea_create': {
+          const data = input as Input<'idea_create'>;
+          const idea: Idea = {
+            id: randomUUID(),
+            project_id: project.id,
+            title: data.title,
+            problem: data.problem,
+            proposal: data.proposal,
+            why: data.why,
+            status: 'submitted',
+            revision: 1,
+            created_by: actor.id,
+            decided_by: null,
+            rationale: null,
+            created_at: this.timestamp(),
+            updated_at: this.timestamp(),
+          };
+          await tx.put('ideas', idea);
+          await this.event(tx, project, actor, 'idea.created', idea.id);
+          return idea;
+        }
+        case 'idea_triage': {
+          const data = input as Input<'idea_triage'>;
+          const idea = await this.idea(tx, project.id, data.idea_id);
+          this.version(idea, data.expected_revision);
+          ensure(
+            idea.status !== 'promoted',
+            'INVALID_STATE',
+            'A promoted idea already has delivery tickets.',
+          );
+          idea.status =
+            data.action === 'promote' ? 'promoted' : data.action === 'park' ? 'parked' : 'declined';
+          idea.revision++;
+          idea.decided_by = actor.id;
+          idea.rationale = data.rationale;
+          idea.updated_at = this.timestamp();
+          await tx.put('ideas', idea);
+          const tickets = [];
+          if (data.action === 'promote') {
+            for (const ticket of await this.createTickets(tx, project, actor, data.tickets)) {
+              const link = {
+                id: `${idea.id}:${ticket.id}`,
+                project_id: project.id,
+                idea_id: idea.id,
+                idea_revision: idea.revision,
+                ticket_id: ticket.id,
+              };
+              await tx.put('idea_tickets', link);
+              tickets.push(link);
+            }
+          }
+          await this.event(tx, project, actor, 'idea.triaged', idea.id, {
+            status: idea.status,
+            rationale: idea.rationale,
+            revision: idea.revision,
+            ticket_ids: tickets.map((ticket) => ticket.ticket_id),
+          });
+          return { idea, tickets };
+        }
         case 'run_cancel': {
           ensure(
             this.storage.executionRuns && tx.compareExecutionRun && tx.lockExecutionController,
@@ -2985,44 +3054,10 @@ export class Application {
           await this.event(tx, project, actor, 'member.updated', input.actor_id, { role: input.role });
           return member;
         }
-        case 'tickets_create': {
-          const created = [];
-          for (const item of (input as Input<'tickets_create'>).tickets) {
-            if (item.assignee_id)
-              await this.access(tx, await this.actor(item.assignee_id, tx), project.id, [
-                'contributor',
-                'admin',
-              ]);
-            const parent = item.parent_id ? await this.ticket(tx, project.id, item.parent_id) : null;
-            const ticket: Ticket = {
-              id: randomUUID(),
-              project_id: project.id,
-              key: `${project.key}-${++project.ticket_seq}`,
-              title: item.title,
-              description: item.description,
-              ...(item.execution_hints ? { execution_hints: item.execution_hints } : {}),
-              status: item.status,
-              priority: item.priority,
-              labels: item.labels,
-              capabilities: item.capabilities,
-              assignee_id: item.assignee_id,
-              parent_id: parent?.id ?? null,
-              revision: 1,
-              requirements_revision: 1,
-              created_by: actor.id,
-              approved_submission_id: null,
-              created_at: this.timestamp(),
-              updated_at: this.timestamp(),
-            };
-            await tx.put('tickets', ticket);
-            await this.replaceCriteria(tx, ticket, item.criteria);
-            await this.queue(tx, ticket, 'ticket');
-            await this.event(tx, project, actor, 'ticket.created', ticket.id, { key: ticket.key });
-            if (parent) await this.invalidate(tx, project, actor, parent, 'A child ticket was added.');
-            created.push(ticket);
-          }
-          return { tickets: created };
-        }
+        case 'tickets_create':
+          return {
+            tickets: await this.createTickets(tx, project, actor, (input as Input<'tickets_create'>).tickets),
+          };
         case 'ticket_link':
           return this.link(tx, project, actor, input);
         case 'knowledge_write': {
@@ -3345,6 +3380,46 @@ export class Application {
           return this.mutateTicket(tx, project, actor, operation, input);
       }
     });
+  }
+  private async createTickets(
+    tx: Transaction,
+    project: Project,
+    actor: Actor,
+    items: Input<'tickets_create'>['tickets'],
+  ) {
+    const created: Ticket[] = [];
+    for (const item of items) {
+      if (item.assignee_id)
+        await this.access(tx, await this.actor(item.assignee_id, tx), project.id, ['contributor', 'admin']);
+      const parent = item.parent_id ? await this.ticket(tx, project.id, item.parent_id) : null;
+      const ticket: Ticket = {
+        id: randomUUID(),
+        project_id: project.id,
+        key: `${project.key}-${++project.ticket_seq}`,
+        title: item.title,
+        description: item.description,
+        ...(item.execution_hints ? { execution_hints: item.execution_hints } : {}),
+        status: item.status,
+        priority: item.priority,
+        labels: item.labels,
+        capabilities: item.capabilities,
+        assignee_id: item.assignee_id,
+        parent_id: parent?.id ?? null,
+        revision: 1,
+        requirements_revision: 1,
+        created_by: actor.id,
+        approved_submission_id: null,
+        created_at: this.timestamp(),
+        updated_at: this.timestamp(),
+      };
+      await tx.put('tickets', ticket);
+      await this.replaceCriteria(tx, ticket, item.criteria);
+      await this.queue(tx, ticket, 'ticket');
+      await this.event(tx, project, actor, 'ticket.created', ticket.id, { key: ticket.key });
+      if (parent) await this.invalidate(tx, project, actor, parent, 'A child ticket was added.');
+      created.push(ticket);
+    }
+    return created;
   }
   private async replaceCriteria(tx: Transaction, ticket: Ticket, texts: string[]) {
     for (const previous of await tx.find('criteria', {
@@ -4293,13 +4368,46 @@ export class Application {
             offset: input.offset,
           }),
         };
-      case 'ticket_get':
-        return this.details(
-          this.storage,
-          project,
-          await this.ticket(this.storage, project.id, input.ticket_id),
-          actor,
-        );
+      case 'idea_list':
+        return this.storage.readSnapshot(async (reader) => {
+          await this.access(reader, await this.actor(actorId, reader), project.id);
+          return {
+            ideas: await reader.find('ideas', {
+              where: { project_id: project.id, ...(input.status ? { status: input.status } : {}) },
+              order: [
+                { field: 'created_at', direction: 'desc' },
+                { field: 'id', direction: 'asc' },
+              ],
+              limit: input.limit,
+              offset: input.offset,
+            }),
+          };
+        });
+      case 'idea_get':
+        return this.storage.readSnapshot(async (reader) => {
+          await this.access(reader, await this.actor(actorId, reader), project.id);
+          return {
+            idea: await this.idea(reader, project.id, input.idea_id),
+            tickets: await reader.find('idea_tickets', {
+              where: { project_id: project.id, idea_id: input.idea_id },
+              order: [{ field: 'ticket_id', direction: 'asc' }],
+              limit: 50,
+            }),
+          };
+        });
+      case 'ticket_get': {
+        const ticket = await this.ticket(this.storage, project.id, input.ticket_id);
+        const [source] = this.storage.ideaIntake
+          ? await this.storage.find('idea_tickets', {
+              where: { project_id: project.id, ticket_id: ticket.id },
+              limit: 1,
+            })
+          : [];
+        return {
+          ...(await this.details(this.storage, project, ticket, actor)),
+          ...(source ? { source_idea: source } : {}),
+        };
+      }
       case 'ticket_history': {
         if (['checkpoints', 'executions', 'changes'].includes(input.kind))
           return this.storage.readSnapshot(async (reader) => {
