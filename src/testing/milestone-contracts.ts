@@ -10,10 +10,16 @@ import { fixture, hasCode, testEmbeddings, type ContractAdapters } from './contr
 
 export function registerMilestoneContractTests(name: string, factory: () => Promise<ContractAdapters>) {
   describe(`${name} milestones`, () => {
-    const check = (title: string, work: (f: Awaited<ReturnType<typeof setup>>) => Promise<void>) =>
-      it(title, async () => {
+    const check = (
+      title: string,
+      work: (f: Awaited<ReturnType<typeof setup>>) => Promise<void>,
+      requiresArtifactRetention = false,
+    ) =>
+      it(title, async (t) => {
         const adapters = await factory();
         try {
+          if (requiresArtifactRetention && !adapters.storage.artifactRetention)
+            return t.skip('Adapter does not advertise artifact retention.');
           await adapters.storage.migrate();
           await adapters.search.configure(testEmbeddings.profile);
           await work(await setup(adapters));
@@ -305,23 +311,30 @@ export function registerMilestoneContractTests(name: string, factory: () => Prom
       );
     });
 
-    check('pins artifact citations held in milestone outcome and criteria', async (f) => {
-      const created = await f.create();
-      const milestone = (await f.storage.get('milestones', created.id))!;
-      const query = {
-        run_id: randomUUID(),
-        attempt_id: randomUUID(),
-        ticket_id: randomUUID(),
-        checkpoint_id: randomUUID(),
-      };
-      await f.storage.transaction(f.project.id, async (tx) => {
-        assert.equal(await tx.artifactPinned!(query), false);
-        await tx.put('milestones', { ...milestone, outcome: `Inspect run ${query.run_id}` });
-        assert.equal(await tx.artifactPinned!(query), true);
-        await tx.put('milestones', { ...milestone, exit_criteria: [`Inspect attempt ${query.attempt_id}`] });
-        assert.equal(await tx.artifactPinned!(query), true);
-      });
-    });
+    check(
+      'pins artifact citations held in milestone outcome and criteria',
+      async (f) => {
+        const created = await f.create();
+        const milestone = (await f.storage.get('milestones', created.id))!;
+        const query = {
+          run_id: randomUUID(),
+          attempt_id: randomUUID(),
+          ticket_id: randomUUID(),
+          checkpoint_id: randomUUID(),
+        };
+        await f.storage.transaction(f.project.id, async (tx) => {
+          assert.equal(await tx.artifactPinned!(query), false);
+          await tx.put('milestones', { ...milestone, outcome: `Inspect run ${query.run_id}` });
+          assert.equal(await tx.artifactPinned!(query), true);
+          await tx.put('milestones', {
+            ...milestone,
+            exit_criteria: [`Inspect attempt ${query.attempt_id}`],
+          });
+          assert.equal(await tx.artifactPinned!(query), true);
+        });
+      },
+      true,
+    );
 
     check('aggregates beyond default storage pages and pages compact milestone members', async (f) => {
       const template = await f.ticket({ description: 'PRIVATE_LONG_REQUIREMENTS' });

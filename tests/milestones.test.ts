@@ -14,9 +14,18 @@ it('keeps artifact pin SQL compatible with absent optional milestone tables', ()
   assert.ok(!artifactPinSql(query, () => '?', ['injected_table']).includes('injected_table'));
 });
 
-registerMilestoneContractTests('SQLite', async () => {
+async function sqliteAdapters(artifactRetention = true) {
   const directory = await mkdtemp(join(tmpdir(), 'ticketing-milestones-'));
   const adapters = createSqliteAdapters(join(directory, 'tickets.sqlite'));
+  if (!artifactRetention) {
+    Object.defineProperty(adapters.storage, 'artifactRetention', { value: undefined });
+    const transaction = adapters.storage.transaction.bind(adapters.storage);
+    adapters.storage.transaction = (scope, work) =>
+      transaction(scope, (tx) => {
+        delete tx.artifactPinned;
+        return work(tx);
+      });
+  }
   return {
     ...adapters,
     async dispose() {
@@ -27,4 +36,7 @@ registerMilestoneContractTests('SQLite', async () => {
       await rm(directory, { recursive: true });
     },
   };
-});
+}
+
+registerMilestoneContractTests('SQLite', () => sqliteAdapters());
+registerMilestoneContractTests('SQLite without artifact retention', () => sqliteAdapters(false));
