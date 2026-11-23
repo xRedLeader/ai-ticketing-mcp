@@ -170,37 +170,33 @@ export class ExecutionArtifacts {
           Number.isSafeInteger(total) && total >= file.size ? total : result.truncated ? null : file.size;
         result.omitted_bytes = result.total_bytes === null ? null : result.total_bytes - file.size;
         const capturedHash = metadata.sha256?.[name];
-        if (typeof capturedHash === 'string' && /^[a-f0-9]{64}$/.test(capturedHash)) {
-          ensure(
-            name === 'result' || metadata.bytes?.[name] === file.size,
-            'INVALID_ARTIFACT',
-            'Artifact capture size changed.',
-          );
-          result.sha256 = capturedHash;
-        } else {
-          // Legacy immutable logs have no capture hash; hash at most the old 16 MiB capture limit.
-          const digest = createHash('sha256'),
-            buffer = Buffer.alloc(MAX_ARTIFACT_RANGE_BYTES);
-          let position = 0;
-          while (position < file.size) {
-            const read = readSync(
-              file.fd,
-              buffer,
-              0,
-              Math.min(buffer.length, file.size - position),
-              position,
-            );
-            ensure(read > 0, 'INVALID_ARTIFACT', 'Artifact changed during read.');
-            digest.update(buffer.subarray(0, read));
-            position += read;
-          }
-          result.sha256 = digest.digest('hex');
-        }
-        const bytes = Buffer.alloc(Math.min(length, Math.max(0, file.size - offset)));
         ensure(
-          readSync(file.fd, bytes, 0, bytes.length, offset) === bytes.length,
+          capturedHash === undefined || name === 'result' || metadata.bytes?.[name] === file.size,
           'INVALID_ARTIFACT',
-          'Artifact range changed during read.',
+          'Artifact capture size changed.',
+        );
+        const bytes = Buffer.alloc(Math.min(length, Math.max(0, file.size - offset)));
+        const rangeEnd = offset + bytes.length;
+        const digest = createHash('sha256');
+        const buffer = Buffer.alloc(Math.min(MAX_ARTIFACT_RANGE_BYTES, file.size));
+        // Copy the returned range from the same chunks used to verify the capture.
+        let position = 0;
+        while (position < file.size) {
+          const read = readSync(file.fd, buffer, 0, Math.min(buffer.length, file.size - position), position);
+          ensure(read > 0, 'INVALID_ARTIFACT', 'Artifact changed during read.');
+          const end = position + read;
+          const from = Math.max(position, offset);
+          const to = Math.min(end, rangeEnd);
+          digest.update(buffer.subarray(0, read));
+          if (from < to) buffer.copy(bytes, from - offset, from - position, to - position);
+          position = end;
+        }
+        result.sha256 = digest.digest('hex');
+        ensure(
+          fstatSync(file.fd).size === file.size &&
+            (capturedHash === undefined || capturedHash === result.sha256),
+          'INVALID_ARTIFACT',
+          'Artifact does not match its capture.',
         );
         result.range = {
           offset,
