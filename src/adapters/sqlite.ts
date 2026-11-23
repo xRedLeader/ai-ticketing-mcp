@@ -46,6 +46,19 @@ const knowledgeColumns = [
   'updated_at',
 ];
 const columns: Record<Table, string[]> = {
+  research_spikes: [
+    'id',
+    'project_id',
+    'idea_id',
+    'question',
+    'time_budget_ms',
+    'first_claimed_at',
+    'findings',
+    'evidence',
+    'recommendation',
+    'completed_at',
+    'completed_by',
+  ],
   ideas: [
     'id',
     'project_id',
@@ -61,7 +74,6 @@ const columns: Record<Table, string[]> = {
     'created_at',
     'updated_at',
   ],
-  idea_tickets: ['id', 'project_id', 'idea_id', 'idea_revision', 'ticket_id'],
   milestones: [
     'id',
     'project_id',
@@ -75,6 +87,7 @@ const columns: Record<Table, string[]> = {
     'completed_by',
   ],
   milestone_memberships: ['id', 'project_id', 'milestone_id'],
+  idea_tickets: ['id', 'project_id', 'idea_id', 'idea_revision', 'ticket_id', 'spike_ids'],
   claim_handoffs: [
     'id',
     'project_id',
@@ -203,6 +216,7 @@ const columns: Record<Table, string[]> = {
   ],
   members: ['id', 'project_id', 'actor_id', 'role'],
   tickets: [
+    'work_kind',
     'id',
     'project_id',
     'key',
@@ -322,6 +336,7 @@ const columns: Record<Table, string[]> = {
 };
 const json = new Set([
   'exit_criteria',
+  'spike_ids',
   'condition',
   'observed',
   'pending',
@@ -348,10 +363,14 @@ const json = new Set([
 ]);
 const booleans = new Set(['system_admin', 'blocking', 'archived', 'paused', 'deadline_fired']);
 function encode(key: string, value: unknown): SQLInputValue {
-  if (value === undefined) return null;
+  if (value === undefined) return key === 'work_kind' ? 'delivery' : key === 'spike_ids' ? '[]' : null;
   if (json.has(key))
     return value === null &&
-      (key === 'execution_hints' || key === 'requirements_snapshot' || key === 'github_pull_request')
+      ((key === 'work_kind' && value === 'delivery') ||
+        (key === 'spike_ids' && value === '[]') ||
+        key === 'execution_hints' ||
+        key === 'requirements_snapshot' ||
+        key === 'github_pull_request')
       ? null
       : JSON.stringify(value);
   if (value === null) return null;
@@ -361,11 +380,13 @@ function encode(key: string, value: unknown): SQLInputValue {
 function decode(row: Record<string, unknown>) {
   return Object.fromEntries(
     Object.entries(row).flatMap(([key, value]) =>
-      (key === 'execution_hints' ||
+      (key === 'work_kind' && value === 'delivery') ||
+      (key === 'spike_ids' && value === '[]') ||
+      ((key === 'execution_hints' ||
         key === 'execution' ||
         key === 'github_pull_request' ||
         key === 'scheduling_policy') &&
-      value === null
+        value === null)
         ? []
         : [
             [
@@ -410,7 +431,9 @@ function repository(db: DatabaseSync): Transaction {
     },
     async artifactPinned(query) {
       const tables = db
-        .prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('ideas','milestones')")
+        .prepare(
+          "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('ideas','milestones','research_spikes')",
+        )
         .all()
         .map((row) => String(row.name));
       const values: string[] = [];
@@ -527,7 +550,7 @@ function repository(db: DatabaseSync): Transaction {
           : 't.priority,t.created_at,t.id';
       return db
         .prepare(
-          `SELECT t.* FROM tickets t WHERE t.project_id=? AND t.status IN ('ready','in_progress') AND (t.assignee_id IS NULL OR t.assignee_id=?) AND NOT EXISTS(SELECT 1 FROM json_each(t.capabilities) c WHERE c.value NOT IN (SELECT value FROM json_each(?))) AND NOT EXISTS(SELECT 1 FROM json_each(?) l WHERE l.value NOT IN (SELECT value FROM json_each(t.labels))) AND NOT EXISTS(SELECT 1 FROM claims c WHERE c.ticket_id=t.id AND c.expires_at>?) AND NOT EXISTS(SELECT 1 FROM links l JOIN tickets p ON p.id=l.source_id WHERE l.project_id=t.project_id AND l.target_id=t.id AND l.kind='blocks' AND p.status<>'done') AND NOT EXISTS(SELECT 1 FROM notes q WHERE q.project_id=t.project_id AND q.ticket_id=t.id AND q.kind='question' AND q.blocking=1 AND NOT EXISTS(SELECT 1 FROM notes a WHERE a.project_id=q.project_id AND a.ticket_id=q.ticket_id AND a.answer_to=q.id AND a.kind='answer')) ORDER BY ${order} LIMIT ? OFFSET ?`,
+          `SELECT t.* FROM tickets t WHERE t.project_id=? AND t.work_kind='delivery' AND t.status IN ('ready','in_progress') AND (t.assignee_id IS NULL OR t.assignee_id=?) AND NOT EXISTS(SELECT 1 FROM json_each(t.capabilities) c WHERE c.value NOT IN (SELECT value FROM json_each(?))) AND NOT EXISTS(SELECT 1 FROM json_each(?) l WHERE l.value NOT IN (SELECT value FROM json_each(t.labels))) AND NOT EXISTS(SELECT 1 FROM claims c WHERE c.ticket_id=t.id AND c.expires_at>?) AND NOT EXISTS(SELECT 1 FROM links l JOIN tickets p ON p.id=l.source_id WHERE l.project_id=t.project_id AND l.target_id=t.id AND l.kind='blocks' AND p.status<>'done') AND NOT EXISTS(SELECT 1 FROM notes q WHERE q.project_id=t.project_id AND q.ticket_id=t.id AND q.kind='question' AND q.blocking=1 AND NOT EXISTS(SELECT 1 FROM notes a WHERE a.project_id=q.project_id AND a.ticket_id=q.ticket_id AND a.answer_to=q.id AND a.kind='answer')) ORDER BY ${order} LIMIT ? OFFSET ?`,
         )
         .all(
           projectId,
@@ -706,6 +729,7 @@ class Handle {
   }
 }
 class SqliteStorage extends Handle implements StorageAdapter {
+  readonly researchSpikes = true as const;
   readonly ideaIntake = true as const;
   readonly milestones = true as const;
   milestoneProgress(projectId: string, milestoneId: string) {

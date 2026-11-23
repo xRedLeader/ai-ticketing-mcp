@@ -101,6 +101,7 @@ const ideaTicket = z.object({
   idea_id: id,
   idea_revision: z.number().int().positive(),
   ticket_id: id,
+  spike_ids: z.array(id).optional(),
 });
 const ideaReceipt = idea.pick({ id: true, project_id: true, status: true, revision: true });
 const ideaSummary = idea.omit({ problem: true, proposal: true, why: true, rationale: true });
@@ -481,6 +482,70 @@ const milestoneSummary = milestoneReceipt.extend({
   progress: milestoneProgress,
 });
 export const resultSchemas: Record<Operation, z.ZodType> = {
+  spike_schedule: z.object({
+    id,
+    project_id: id,
+    idea_id: id,
+    revision: z.number(),
+    time_budget_ms: z.number(),
+  }),
+  spike_list: z.object({
+    spikes: z.array(
+      z.object({
+        id,
+        project_id: id,
+        idea_id: id,
+        revision: z.number(),
+        assignee_id: id.nullable(),
+        status: z.enum(['scheduled', 'active', 'completed']),
+        budget: z.object({
+          time_budget_ms: z.number(),
+          first_claimed_at: timestamp.nullable(),
+          deadline: timestamp.nullable(),
+          exhausted: z.boolean(),
+        }),
+      }),
+    ),
+  }),
+  spike_get: z.object({
+    spike: z.object({
+      id,
+      project_id: id,
+      idea_id: id,
+      question: z.string(),
+      time_budget_ms: z.number(),
+      first_claimed_at: timestamp.nullable(),
+      findings: z.string().nullable(),
+      evidence: z.array(z.string()),
+      recommendation: z.enum(['promote', 'park', 'decline']).nullable(),
+      completed_at: timestamp.nullable(),
+      completed_by: id.nullable(),
+    }),
+    ticket: ticketReceipt,
+    claim: visibleClaim,
+    budget: z.object({
+      time_budget_ms: z.number(),
+      first_claimed_at: timestamp.nullable(),
+      deadline: timestamp.nullable(),
+      exhausted: z.boolean(),
+    }),
+  }),
+  spike_claim: z.object({
+    ticket: ticketReceipt,
+    claim,
+    context: context.optional(),
+    context_omitted: z.enum(['requested', 'legacy_receipt']).optional(),
+    context_ref: retrieval.optional(),
+  }),
+  spike_complete: z.object({
+    id,
+    project_id: id,
+    idea_id: id,
+    completed_at: timestamp,
+    completed_by: id,
+    revision: z.number(),
+    recommendation: z.enum(['promote', 'park', 'decline']),
+  }),
   idea_create: ideaReceipt,
   idea_list: z.object({ ideas: z.array(ideaSummary) }),
   idea_get: z.object({ idea, tickets: z.array(ideaTicket) }),

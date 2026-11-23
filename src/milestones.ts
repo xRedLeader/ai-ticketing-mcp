@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { ensure, type Milestone, type Reader, type Ticket, type Transaction } from './contracts.js';
 import type { Input } from './schemas.js';
+import { deliveryOnly } from './research.js';
 
 export async function getMilestone(reader: Reader, projectId: string, id: string) {
   const milestone = await reader.get('milestones', id);
@@ -110,6 +111,7 @@ export async function setTicketMilestone(
   input: Input<'ticket_milestone_set'>,
   now: string,
 ) {
+  deliveryOnly(ticket);
   const current = await tx.get('milestone_memberships', ticket.id);
   ensure(
     (current?.milestone_id ?? null) === input.expected_milestone_id,

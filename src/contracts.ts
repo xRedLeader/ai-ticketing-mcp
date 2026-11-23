@@ -48,6 +48,7 @@ export interface Member {
   role: Role;
 }
 export interface Ticket {
+  work_kind?: 'delivery' | 'research';
   id: string;
   project_id: string;
   key: string;
@@ -96,6 +97,20 @@ export interface IdeaTicket {
   idea_id: string;
   idea_revision: number;
   ticket_id: string;
+  spike_ids?: string[];
+}
+export interface ResearchSpike {
+  id: string;
+  project_id: string;
+  idea_id: string;
+  question: string;
+  time_budget_ms: number;
+  first_claimed_at: string | null;
+  findings: string | null;
+  evidence: string[];
+  recommendation: 'promote' | 'park' | 'decline' | null;
+  completed_at: string | null;
+  completed_by: string | null;
 }
 export interface Link {
   id: string;
@@ -562,6 +577,7 @@ export interface Tables {
   tickets: Ticket;
   ideas: Idea;
   idea_tickets: IdeaTicket;
+  research_spikes: ResearchSpike;
   criteria: Criterion;
   links: Link;
   notes: Note;
@@ -624,6 +640,7 @@ export interface StorageAdapter extends Reader {
   /** Optional proposal intake; ticket reads remain compatible without these tables. */
   readonly ideaIntake?: true;
   readonly milestones?: true;
+  readonly researchSpikes?: true;
   readonly artifactRetention?: true;
   readonly wakeDecisions?: true;
   readonly executionRuns?: true;

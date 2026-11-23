@@ -43,6 +43,19 @@ const knowledgeColumns = [
   'updated_at',
 ];
 const columns: Record<Table, string[]> = {
+  research_spikes: [
+    'id',
+    'project_id',
+    'idea_id',
+    'question',
+    'time_budget_ms',
+    'first_claimed_at',
+    'findings',
+    'evidence',
+    'recommendation',
+    'completed_at',
+    'completed_by',
+  ],
   ideas: [
     'id',
     'project_id',
@@ -58,7 +71,6 @@ const columns: Record<Table, string[]> = {
     'created_at',
     'updated_at',
   ],
-  idea_tickets: ['id', 'project_id', 'idea_id', 'idea_revision', 'ticket_id'],
   milestones: [
     'id',
     'project_id',
@@ -72,6 +84,7 @@ const columns: Record<Table, string[]> = {
     'completed_by',
   ],
   milestone_memberships: ['id', 'project_id', 'milestone_id'],
+  idea_tickets: ['id', 'project_id', 'idea_id', 'idea_revision', 'ticket_id', 'spike_ids'],
   claim_handoffs: [
     'id',
     'project_id',
@@ -229,6 +242,7 @@ const columns: Record<Table, string[]> = {
   ],
   members: ['id', 'project_id', 'actor_id', 'role'],
   tickets: [
+    'work_kind',
     'id',
     'project_id',
     'key',
@@ -319,6 +333,7 @@ const columns: Record<Table, string[]> = {
 };
 const jsonColumns = new Set([
   'exit_criteria',
+  'spike_ids',
   'condition',
   'observed',
   'pending',
@@ -347,8 +362,12 @@ function decode(row: Record<string, unknown>) {
     Object.entries(row)
       .filter(
         ([key, value]) =>
-          !['execution_hints', 'execution', 'github_pull_request', 'scheduling_policy'].includes(key) ||
-          value !== null,
+          !(
+            (key === 'work_kind' && value === 'delivery') ||
+            (key === 'spike_ids' && Array.isArray(value) && !value.length)
+          ) &&
+          (!['execution_hints', 'execution', 'github_pull_request', 'scheduling_policy'].includes(key) ||
+            value !== null),
       )
       .map(([key, value]) => [
         key,
@@ -389,10 +408,10 @@ function repository(db: Executor): Transaction {
     async artifactPinned(query) {
       const installed = (
         await db.query(
-          "SELECT to_regclass('ideas') IS NOT NULL AS ideas, to_regclass('milestones') IS NOT NULL AS milestones",
+          "SELECT to_regclass('ideas') IS NOT NULL AS ideas, to_regclass('milestones') IS NOT NULL AS milestones, to_regclass('research_spikes') IS NOT NULL AS research_spikes",
         )
       ).rows[0];
-      const tables = ['ideas', 'milestones'].filter((table) => installed[table]);
+      const tables = ['ideas', 'milestones', 'research_spikes'].filter((table) => installed[table]);
       const values: string[] = [];
       const sql = artifactPinSql(
         query,
@@ -479,7 +498,7 @@ function repository(db: Executor): Transaction {
           ? `t.priority,CASE WHEN t.created_at<=($5::timestamptz-interval '24 hours') THEN 0 ELSE 1 END,CASE WHEN t.created_at<=($5::timestamptz-interval '24 hours') THEN 0 ELSE (SELECT count(*) FROM links outgoing JOIN tickets dependent ON dependent.id=outgoing.target_id AND dependent.project_id=t.project_id WHERE outgoing.project_id=t.project_id AND outgoing.source_id=t.id AND outgoing.kind='blocks' AND dependent.status NOT IN ('done','cancelled')) END DESC,t.created_at,t.id`
           : 't.priority,t.created_at,t.id';
       const result = await db.query(
-        `SELECT t.* FROM tickets t WHERE t.project_id=$1 AND t.status IN ('ready','in_progress') AND (t.assignee_id IS NULL OR t.assignee_id=$2) AND t.capabilities <@ $3::text[] AND t.labels @> $4::text[] AND NOT EXISTS(SELECT 1 FROM claims c WHERE c.ticket_id=t.id AND c.expires_at>$5) AND NOT EXISTS(SELECT 1 FROM links l JOIN tickets prerequisite ON prerequisite.id=l.source_id WHERE l.target_id=t.id AND l.kind='blocks' AND prerequisite.status<>'done') AND NOT EXISTS(SELECT 1 FROM notes q WHERE q.ticket_id=t.id AND q.kind='question' AND q.blocking AND NOT EXISTS(SELECT 1 FROM notes a WHERE a.answer_to=q.id AND a.kind='answer')) ORDER BY ${order} LIMIT $6 OFFSET $7`,
+        `SELECT t.* FROM tickets t WHERE t.project_id=$1 AND t.work_kind='delivery' AND t.status IN ('ready','in_progress') AND (t.assignee_id IS NULL OR t.assignee_id=$2) AND t.capabilities <@ $3::text[] AND t.labels @> $4::text[] AND NOT EXISTS(SELECT 1 FROM claims c WHERE c.ticket_id=t.id AND c.expires_at>$5) AND NOT EXISTS(SELECT 1 FROM links l JOIN tickets prerequisite ON prerequisite.id=l.source_id WHERE l.target_id=t.id AND l.kind='blocks' AND prerequisite.status<>'done') AND NOT EXISTS(SELECT 1 FROM notes q WHERE q.ticket_id=t.id AND q.kind='question' AND q.blocking AND NOT EXISTS(SELECT 1 FROM notes a WHERE a.answer_to=q.id AND a.kind='answer')) ORDER BY ${order} LIMIT $6 OFFSET $7`,
         [projectId, actorId, capabilities, labels, now, limit, offset],
       );
       return result.rows.map(decode) as unknown as Tables['tickets'][];
@@ -532,7 +551,11 @@ function repository(db: Executor): Transaction {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
       const keys = columns[table]!;
       const record = value as unknown as Record<string, unknown>;
-      const values = keys.map((key) => (jsonColumns.has(key) ? JSON.stringify(record[key]) : record[key]));
+      const values = keys.map((key) => {
+        const value =
+          record[key] ?? (key === 'work_kind' ? 'delivery' : key === 'spike_ids' ? [] : record[key]);
+        return jsonColumns.has(key) ? JSON.stringify(value) : value;
+      });
       const names = keys.map((key) => field(table, key));
       const conflict =
         table === 'idea_tickets' ||
@@ -589,6 +612,7 @@ function repository(db: Executor): Transaction {
 }
 
 export class PostgresStorage implements StorageAdapter {
+  readonly researchSpikes = true as const;
   readonly ideaIntake = true as const;
   readonly milestones = true as const;
   milestoneProgress(projectId: string, milestoneId: string) {

@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 export { registerWakeContractTests } from './wake-contracts.js';
 export { registerHandoffContractTests } from './handoff-contracts.js';
 export { registerIdeaContractTests } from './idea-contracts.js';
+export { registerResearchContractTests } from './research-contracts.js';
 export { registerMilestoneContractTests } from './milestone-contracts.js';
 import assert from 'node:assert/strict';
 import { randomUUID, createHash } from 'node:crypto';

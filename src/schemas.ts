@@ -63,6 +63,45 @@ const evidence = z
   })
   .strict();
 export const schemas = {
+  spike_schedule: z
+    .object({
+      ...project,
+      ...mutation,
+      idea_id: id,
+      question: text.max(16000),
+      time_budget_ms: z.int().min(1).max(604800000),
+      assignee_id: id.nullable().default(null),
+      execution_hints: executionHintsSchema.optional(),
+    })
+    .strict(),
+  spike_list: z.object({ ...project, ...page, idea_id: id.optional() }).strict(),
+  spike_get: z.object({ ...project, spike_id: id }).strict(),
+  spike_claim: z
+    .object({
+      ...project,
+      ...mutation,
+      spike_id: id,
+      client_id: clientId.optional(),
+      handoff_checkpoint_id: id.optional(),
+      include_context: z.boolean().default(true),
+      max_tokens: maxTokens.default(4096),
+    })
+    .strict()
+    .refine((value) => !value.handoff_checkpoint_id || value.include_context, {
+      message: 'Handoff acknowledgment requires complete context.',
+    }),
+  spike_complete: z
+    .object({
+      ...project,
+      ...mutation,
+      ...revision,
+      spike_id: id,
+      claim_token: id,
+      findings: text.max(16000),
+      evidence: z.array(text.max(2000)).min(1).max(50),
+      recommendation: z.enum(['promote', 'park', 'decline']),
+    })
+    .strict(),
   idea_create: z
     .object({
       ...project,
@@ -95,6 +134,7 @@ export const schemas = {
         action: z.literal('promote'),
         rationale: text.max(4000),
         tickets: z.array(deliveryTicket).min(1).max(50),
+        spike_ids: z.array(id).max(50).optional(),
       })
       .strict(),
   ]),
@@ -453,6 +493,8 @@ export const schemas = {
 export type Operation = keyof typeof schemas;
 export type Input<K extends Operation> = z.infer<(typeof schemas)[K]>;
 export const readOperations = new Set<Operation>([
+  'spike_list',
+  'spike_get',
   'idea_list',
   'idea_get',
   'milestone_list',
@@ -475,6 +517,15 @@ export const readOperations = new Set<Operation>([
   'changes_since',
 ]);
 export const descriptions: Record<Operation, string> = {
+  spike_schedule:
+    'Schedule a separate research spike from an idea with a question and elapsed time budget, starting on first claim.',
+  spike_list:
+    'Discover project research separately from delivery work, including completed findings and budget exhaustion.',
+  spike_get: 'Read the research question, durable findings, evidence, recommendation and elapsed budget.',
+  spike_claim:
+    'Claim or resume research separately from delivery work. Reclaims never reset the first-claim deadline.',
+  spike_complete:
+    'Record findings, evidence and a promote/park/decline recommendation with the current research claim. Results remain allowed after budget exhaustion; idea triage stays separate.',
   idea_create:
     'Capture a project proposal with its problem, possible improvement and value. Ideas are never claimable.',
   idea_list: 'List project ideas, including parked, declined and promoted dispositions.',
