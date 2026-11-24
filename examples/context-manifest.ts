@@ -121,13 +121,57 @@ export function createContextManifest(client: Client) {
           const operation = omission.retrieve_with as 'checkpoint_get' | 'ticket_history';
           let args: Arguments = schemas[operation].parse(omission.arguments);
           for (;;) {
-            const data = resultSchemas[operation].parse(await call(operation, args));
+            let data = resultSchemas[operation].parse(await call(operation, args));
             ensure(
               (data as { authorization_binding?: string }).authorization_binding ===
                 context.authorization_binding,
               'CONTEXT_CHANGED',
               'Required context was read under different authorization.',
             );
+            if (operation === 'ticket_history') {
+              const first = resultSchemas.ticket_history.parse(data);
+              if (first.next_evidence_offset !== undefined) {
+                const submission = first.items[0];
+                ensure(
+                  first.items.length === 1 && submission && 'evidence' in submission,
+                  'INVALID_RESPONSE',
+                  'Expected one partial submission.',
+                );
+                let next: number | undefined = first.next_evidence_offset;
+                while (next !== undefined) {
+                  ensure(
+                    next === submission.evidence.length && next <= 50,
+                    'INVALID_RESPONSE',
+                    'Submission evidence did not advance.',
+                  );
+                  const page = resultSchemas.ticket_history.parse(
+                    await call(operation, {
+                      ...args,
+                      offset: 0,
+                      item_id: submission.id,
+                      evidence_offset: next,
+                    }),
+                  );
+                  const item = page.items[0];
+                  ensure(
+                    page.authorization_binding === context.authorization_binding &&
+                      page.items.length === 1 &&
+                      item &&
+                      'evidence' in item &&
+                      item.id === submission.id &&
+                      item.requirements_revision === submission.requirements_revision &&
+                      item.evidence.length > 0 &&
+                      submission.evidence.length + item.evidence.length <= 50,
+                    'INVALID_RESPONSE',
+                    'Submission identity, authorization or evidence changed.',
+                  );
+                  submission.evidence.push(...item.evidence);
+                  next = page.next_evidence_offset;
+                }
+                delete first.next_evidence_offset;
+                data = first;
+              }
+            }
             if (operation === 'checkpoint_get') {
               const checkpoint = data as Note;
               ensure(

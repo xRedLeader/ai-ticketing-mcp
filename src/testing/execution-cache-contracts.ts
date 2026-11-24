@@ -656,6 +656,8 @@ export function registerExecutionCacheContractTests(name: string, factory: () =>
     });
     const pinned = await f.storage.transaction(f.project.id, (tx) =>
       tx.artifactPinned!({
+        project_id: f.project.id,
+        artifact_id: f.references[0]!,
         run_id: f.source.id,
         attempt_id: f.attempt.id,
         ticket_id: ticket.id,

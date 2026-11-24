@@ -287,6 +287,7 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
     async (f) => {
       await f.finish();
       const other = await fixture({ storage: f.storage, search: f.search }, 'self');
+      await f.call(f.admin.id, 'member_set', { actor_id: other.worker.id, role: 'reader' });
       const otherTicket = await other.ticket();
       const otherClaim = await other.claim(otherTicket.id);
       let release!: () => void, entered!: () => void;
@@ -337,11 +338,17 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
       assert.equal((await reading).status, 'expired');
     },
   );
-  check('protects exact citations from another project', async (f) => {
+  check('protects only exact cross-project citations made with source access', async (f) => {
     await f.finish();
     const other = await fixture({ storage: f.storage, search: f.search }, 'self');
     const ticket = await other.ticket();
-    await other.call(other.worker.id, 'ticket_note', { ticket_id: ticket.id, body: f.refs[0] });
+    const note = (body: string) => other.call(other.worker.id, 'ticket_note', { ticket_id: ticket.id, body });
+    await note(f.refs[0]!);
+    assert.equal((await f.read()).status, 'expired');
+    await f.call(f.admin.id, 'member_set', { actor_id: other.worker.id, role: 'reader' });
+    await note(f.refs[0]!.split(':')[1]!);
+    assert.equal((await f.read()).status, 'expired');
+    await note(f.refs[0]!);
     await assert.rejects(f.retire(), hasCode('ARTIFACT_PINNED'));
   });
   check('pins structured memory fact values in immutable historical revisions', async (f) => {

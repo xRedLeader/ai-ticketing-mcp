@@ -806,6 +806,7 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
     items: z.array(z.union([note, submission, review, githubEvidenceSchema, executionResumeSchema, change])),
     has_more: z.boolean().optional(),
     next_offset: z.number().optional(),
+    next_evidence_offset: z.int().positive().optional(),
   }),
   ticket_link: z.object({
     source_id: id,

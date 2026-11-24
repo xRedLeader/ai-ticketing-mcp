@@ -6,24 +6,48 @@ import { HttpEmbeddings, type EmbeddingConfig } from '../src/adapters/embeddings
 it('identifies effective endpoints and explicit shared embedding spaces', () => {
   const config: EmbeddingConfig = {
     provider: 'openai',
-    url: 'http://LOCALHOST:80/v1/',
+    url: 'https://EMBEDDINGS.EXAMPLE:443/v1/',
     model: 'test',
     dimensions: 3,
   };
   const id = (overrides: Partial<EmbeddingConfig> = {}) =>
     new HttpEmbeddings({ ...config, ...overrides }).profile.id;
-  assert.equal(id(), id({ url: 'http://localhost/v1#unused' }));
+  assert.equal(id(), id({ url: 'https://embeddings.example/v1#unused' }));
   assert.equal(id(), id({ apiKey: 'different-test-key' }));
   for (const overrides of [
-    { url: 'http://localhost:1234/v1' },
+    { url: 'https://embeddings.example:1234/v1' },
     { model: 'other' },
     { dimensions: 4 },
     { revision: '2' },
   ])
     assert.notEqual(id(), id(overrides));
-  assert.equal(id({ spaceId: 'local-model' }), id({ url: 'http://alias:1234/v1', spaceId: 'local-model' }));
+  assert.equal(
+    id({ spaceId: 'local-model' }),
+    id({ url: 'https://alias.example/v1', spaceId: 'local-model' }),
+  );
   assert.notEqual(id({ spaceId: 'local-model' }), id({ spaceId: 'different-model' }));
   assert.throws(() => id({ spaceId: ' ' }), { code: 'INVALID_CONFIG' });
+});
+
+it('allows only explicit local HTTP exceptions and refuses to follow embedding redirects', async (t) => {
+  const local = { provider: 'ollama', model: 'test', dimensions: 3, url: 'http://ollama:11434' } as const;
+  for (const config of [
+    local,
+    { ...local, provider: 'openai' as const, allowLocalOllamaHttp: true },
+    { ...local, apiKey: 'fixture', allowLocalOllamaHttp: true },
+    { ...local, url: 'http://embeddings.example', allowLocalOllamaHttp: true },
+  ])
+    assert.throws(() => new HttpEmbeddings(config), { code: 'INVALID_CONFIG' });
+  assert.ok(new HttpEmbeddings({ ...local, allowLocalOllamaHttp: true }));
+  const request = t.mock.method(globalThis, 'fetch', async (_url: URL, options: RequestInit) => {
+    assert.equal(options.redirect, 'error');
+    return new Response(null, { status: 307 });
+  });
+  await assert.rejects(
+    new HttpEmbeddings({ ...local, url: 'https://embeddings.example' }).embed('fixture', 'query'),
+    { code: 'EMBEDDING_UNAVAILABLE' },
+  );
+  assert.equal(request.mock.callCount(), 1);
 });
 
 it('copies and freezes effective configuration and profile before requests', async () => {

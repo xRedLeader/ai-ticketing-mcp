@@ -10,7 +10,12 @@ export interface Principal {
   actorId: string;
   scopes: Set<string>;
 }
-export function createMcpServer(app: Application, principal: Principal, profile: McpProfile = 'worker') {
+export function createMcpServer(
+  app: Application,
+  principal: Principal,
+  profile: McpProfile = 'worker',
+  http?: { signal: AbortSignal; beginRunWait: () => () => void },
+) {
   profile = parseMcpProfile(profile);
   const workflows: Record<McpProfile, string> = {
     researcher:
@@ -53,6 +58,7 @@ export function createMcpServer(app: Application, principal: Principal, profile:
       },
       async (input: unknown, context: ServerContext) => {
         app.recordReferenceTokens?.('request', JSON.stringify({ operation, input }));
+        let endWait: (() => void) | undefined;
         try {
           requireRead();
           if (!readOperations.has(operation))
@@ -61,12 +67,17 @@ export function createMcpServer(app: Application, principal: Principal, profile:
               'INSUFFICIENT_SCOPE',
               'ticketing:write scope is required.',
             );
+          if (operation === 'run_wait' && http) {
+            http.signal.throwIfAborted();
+            endWait = http.beginRunWait();
+          }
           const result = await app.execute(
             principal.actorId,
             operation,
             input,
             profile,
             context.mcpReq._meta?.['ticketing/context-manifest'] === true,
+            operation === 'run_wait' ? http?.signal : undefined,
           );
           const text = serializeSuccessEnvelope(result);
           app.recordReferenceTokens?.('result', text);
@@ -94,6 +105,8 @@ export function createMcpServer(app: Application, principal: Principal, profile:
             structuredContent,
             content: [{ type: 'text' as const, text }],
           };
+        } finally {
+          endWait?.();
         }
       },
     );

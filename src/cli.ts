@@ -43,10 +43,10 @@ async function input() {
   );
 }
 async function capture(env: NodeJS.ProcessEnv) {
-  const enabled = env.MCP_PROFILE_CAPTURE ?? 'true';
+  const enabled = env.MCP_PROFILE_CAPTURE ?? 'false';
   ensure(['true', 'false'].includes(enabled), 'INVALID_CONFIG', 'MCP_PROFILE_CAPTURE must be true or false.');
   if (enabled === 'false') return undefined;
-  const { createProfileRecorder } = await import('./profiling.js');
+  const { createManagedProfileRecorder } = await import('./profiling.js');
   const number = (key: string) => {
     if (env[key] === undefined) return undefined;
     const value = Number(env[key]);
@@ -55,17 +55,25 @@ async function capture(env: NodeJS.ProcessEnv) {
   };
   const directory = env.MCP_PROFILE_DIRECTORY ?? '.local/token-profiles';
   ensure(directory.trim().length > 0, 'INVALID_CONFIG', 'MCP_PROFILE_DIRECTORY requires a directory.');
-  const recorder = await createProfileRecorder({
+  const options = {
     directory,
     maxFileBytes: number('MCP_PROFILE_MAX_FILE_BYTES'),
     maxFiles: number('MCP_PROFILE_MAX_FILES'),
     maxQueueBytes: number('MCP_PROFILE_MAX_QUEUE_BYTES'),
-  });
+  };
+  const maxRetainedBytes = number('MCP_PROFILE_MAX_RETAINED_BYTES') ?? 512 * 1024 * 1024;
+  const recorder = await createManagedProfileRecorder(options, maxRetainedBytes).catch(() => undefined);
   try {
     write(
       2,
-      JSON.stringify({ event: 'mcp_profile_capture', directory: recorder.runDirectory, raw_payloads: true }) +
-        '\n',
+      JSON.stringify(
+        recorder
+          ? { event: 'mcp_profile_capture', directory: recorder.runDirectory, raw_payloads: true }
+          : {
+              event: 'mcp_profile_capture_unavailable',
+              message: 'Check the capture directory, quota, or admission lock.',
+            },
+      ) + '\n',
       () => {},
     );
   } catch {}
@@ -74,7 +82,7 @@ async function capture(env: NodeJS.ProcessEnv) {
 async function main() {
   if (command === 'help') {
     process.stdout.write(
-      `ai-ticketing commands:\n  migrate                 Apply migrations and prepare the configured search profile\n  actor --issuer --subject --name --kind [--admin]   Register an identity (trusted operator)\n  call --actor ID --operation NAME --input-file FILE   Execute as a trusted local operator\n  call --url URL --token-env ACCESS_TOKEN --operation NAME --input-file FILE   Authenticated remote call\n  serve                   Serve authenticated HTTP MCP\n  stdio [--profile NAME]  Local MCP; worker (default), executor, planner, reviewer, researcher, full (actor required outside SQLite)\n  worker [--once]          Process durable indexing and configured webhook deliveries\n  reindex --actor ID --project ID   Rebuild project search indexes\n  inspect --actor ID --project ID   Inspect project and queue metrics\n  profile-report --input DIR --output FILE   Analyze captured MCP traffic offline\n\nUse --sqlite PATH for local storage; SQLite stdio initializes its agent and indexing automatically.\nUse --input JSON instead of --input-file for short inputs. Secrets belong in environment variables.\nMCP capture is on by default; set MCP_PROFILE_CAPTURE=false to opt out. Raw payloads stay local without model-visible output.\n`,
+      `ai-ticketing commands:\n  migrate                 Apply migrations and prepare the configured search profile\n  actor --issuer --subject --name --kind [--admin]   Register an identity (trusted operator)\n  call --actor ID --operation NAME --input-file FILE   Execute as a trusted local operator\n  call --url URL --token-env ACCESS_TOKEN --operation NAME --input-file FILE   Authenticated remote call\n  serve                   Serve authenticated HTTP MCP\n  stdio [--profile NAME]  Local MCP; worker (default), executor, planner, reviewer, researcher, full (actor required outside SQLite)\n  worker [--once]          Process durable indexing and configured webhook deliveries\n  reindex --actor ID --project ID   Rebuild project search indexes\n  inspect --actor ID --project ID   Inspect project and queue metrics\n  profile-report --input DIR --output FILE   Analyze captured MCP traffic offline\n\nUse --sqlite PATH for local storage; SQLite stdio initializes its agent and indexing automatically.\nUse --input JSON instead of --input-file for short inputs. Secrets belong in environment variables.\nSet MCP_PROFILE_CAPTURE=true to opt in to sensitive local diagnostic capture. Raw payloads stay local without model-visible output.\n`,
     );
     return;
   }

@@ -146,8 +146,9 @@ export async function scanReviews({
     const latest = () => execute('ticket_history', { ...ticketInput, kind: 'submissions', limit: 1 });
     const {
       items: [submission],
+      next_evidence_offset: nextEvidence,
     } = await latest();
-    if (!submission || submission.actor_id === reviewerId) continue;
+    if (!submission || nextEvidence !== undefined || submission.actor_id === reviewerId) continue;
     if (
       submission.evidence.some(({ references }) =>
         references.some((reference) => reference.startsWith('execution:')),

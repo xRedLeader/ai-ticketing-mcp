@@ -173,7 +173,7 @@ it('captures HTTP discovery, tools, prompts and resources without changing any M
   }
 });
 
-it('defaults stdio capture on, preserves explicit opt-out, and flushes without stdout pollution', async () => {
+it('defaults stdio capture off and flushes opt-in captures without stdout pollution', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'ticketing-profile-runtime-'));
   const captures = join(directory, 'captures');
   try {
@@ -190,7 +190,7 @@ process.stderr.write = () => { throw new Error('fixture broken stderr stream'); 
 `,
     );
     const results: unknown[] = [];
-    for (const enabled of ['false', 'unset', 'true', 'broken-stderr']) {
+    for (const enabled of ['false', 'unset', 'true', 'broken-stderr', 'quota']) {
       const env = Object.fromEntries(
         Object.entries(process.env).filter(
           ([key, value]) =>
@@ -203,8 +203,9 @@ process.stderr.write = () => { throw new Error('fixture broken stderr stream'); 
         EMBEDDING_PROVIDER: 'none',
         MCP_PROFILE_DIRECTORY: captures,
       });
-      if (enabled === 'false' || enabled === 'true') env.MCP_PROFILE_CAPTURE = enabled;
+      if (enabled !== 'unset') env.MCP_PROFILE_CAPTURE = enabled === 'false' ? 'false' : 'true';
       if (enabled === 'false') env.MCP_PROFILE_MAX_FILE_BYTES = 'ignored-while-disabled';
+      if (enabled === 'quota') env.MCP_PROFILE_MAX_RETAINED_BYTES = '140000000';
       const client = new Client({ name: 'stdio-capture-parity', version: '1.0.0' });
       const transport = new StdioClientTransport({
         command: process.execPath,
@@ -229,11 +230,12 @@ process.stderr.write = () => { throw new Error('fixture broken stderr stream'); 
       } finally {
         await client.close();
       }
-      if (enabled === 'false') await assert.rejects(readdir(captures), { code: 'ENOENT' });
+      if (enabled === 'false' || enabled === 'unset')
+        await assert.rejects(readdir(captures), { code: 'ENOENT' });
     }
     for (const result of results.slice(1)) assert.deepEqual(results[0], result);
     const runs = await readdir(captures);
-    assert.equal(runs.length, 3);
+    assert.equal(runs.length, 2);
     for (const run of runs) {
       const events = await records(join(captures, run));
       assert.ok(

@@ -7,6 +7,7 @@ export interface EmbeddingConfig {
   model: string;
   dimensions: number;
   apiKey?: string;
+  allowLocalOllamaHttp?: boolean;
   timeoutMs?: number;
   /** Interactive searches fall back to full text quickly instead of waiting for document-sized timeouts. */
   queryTimeoutMs?: number;
@@ -18,11 +19,20 @@ export class HttpEmbeddings implements EmbeddingProvider {
   readonly profile: EmbeddingProfile;
   private readonly config: Readonly<EmbeddingConfig>;
   constructor(config: EmbeddingConfig) {
-    const url = new URL(config.url);
+    const url = URL.parse(config.url);
+    const loopback = /^http:\/\/(?:127\.0\.0\.1|\[::1\])(?::[0-9]+)?(?:\/|$)/.test(config.url);
+    const bundledOllama =
+      config.provider === 'ollama' &&
+      !config.apiKey &&
+      config.allowLocalOllamaHttp === true &&
+      /^http:\/\/ollama:11434\/?$/.test(config.url);
     ensure(
-      ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password,
+      url &&
+        !url.username &&
+        !url.password &&
+        (url.protocol === 'https:' || (url.protocol === 'http:' && (loopback || bundledOllama))),
       'INVALID_CONFIG',
-      'Embedding URL must be HTTP(S) without embedded credentials.',
+      'Embedding URLs require HTTPS outside literal loopback or the bundled keyless Ollama service.',
     );
     ensure(
       Number.isInteger(config.dimensions) && config.dimensions >= 1 && config.dimensions <= 2000,
@@ -80,6 +90,7 @@ export class HttpEmbeddings implements EmbeddingProvider {
         url.pathname.replace(/\/$/, '') + (this.config.provider === 'ollama' ? '/api/embed' : '/embeddings');
       const response = await fetch(url, {
         method: 'POST',
+        redirect: 'error',
         headers: {
           'Content-Type': 'application/json',
           ...(this.config.apiKey ? { Authorization: `Bearer ${this.config.apiKey}` } : {}),

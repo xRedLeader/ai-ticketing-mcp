@@ -317,6 +317,8 @@ export function registerMilestoneContractTests(name: string, factory: () => Prom
         const created = await f.create();
         const milestone = (await f.storage.get('milestones', created.id))!;
         const query = {
+          project_id: f.project.id,
+          artifact_id: 'fixture-artifact',
           run_id: randomUUID(),
           attempt_id: randomUUID(),
           ticket_id: randomUUID(),

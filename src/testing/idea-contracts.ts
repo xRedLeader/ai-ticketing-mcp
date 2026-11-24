@@ -312,6 +312,8 @@ export function registerIdeaContractTests(name: string, factory: () => Promise<C
       assert.equal(
         await f.storage.transaction(f.project.id, (tx) =>
           tx.artifactPinned!({
+            project_id: f.project.id,
+            artifact_id: reference,
             run_id: run,
             attempt_id: attempt,
             ticket_id: randomUUID(),

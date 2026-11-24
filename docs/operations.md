@@ -36,7 +36,7 @@ The database, `-wal`, and `-shm` files contain trusted local state, including cl
 
 Writes enqueue durable indexing jobs in the same storage transaction. The worker updates text first, then generates vectors. Provider failures leave text available and retry with exponential delay, capped at one hour. Worker leases expire after five minutes. Completion checks the job token and source revision, preventing a superseded job from deleting new work.
 
-Set `EMBEDDING_PROVIDER=ollama` for `/api/embed`, or `openai` for a provider's `/v1/embeddings`-compatible endpoint. Configure the model, URL, dimensions, and optional API key. Hosted mode requires explicit URL/model/dimensions; vector dimensions must be 1–2000 for the supplied HNSW adapter.
+Set `EMBEDDING_PROVIDER=ollama` for `/api/embed`, or `openai` for a provider's `/v1/embeddings`-compatible endpoint. Configure the model, URL, dimensions, and optional API key. Remote endpoints require HTTPS and requests reject redirects. Literal loopback and Compose's explicitly enabled, keyless Ollama service can use HTTP. Hosted mode requires explicit URL/model/dimensions. Vector dimensions must be 1–2000 for the supplied HNSW adapter.
 
 Only one embedding profile is active per process. Its identity covers provider, effective endpoint (or explicit shared-space ID), model, dimensions, revision, and chunking. Endpoint identity changes existing profile IDs: run `migrate` with schema-owner privileges, restart app/worker with matching configuration, then `reindex --actor ADMIN_ID --project PROJECT_ID` before expecting semantic readiness. Reindex also prepares the profile and needs migration credentials. Old indexes/vectors remain for operator-managed rollback; generations never mix. Nullable input hashes alone do not trigger a full backfill.
 
@@ -76,7 +76,7 @@ Built-in adapters also expose `webhook_pending` (all unsent rows, including old 
 
 ## MCP profiling
 
-Raw MCP capture is enabled by default for CLI stdio and HTTP server processes. For development, configure a private local directory in the server environment and restart the server:
+Raw MCP capture is opt-in for CLI stdio and HTTP server processes. For development, configure a private local directory in the server environment and restart the server:
 
 ```env
 MCP_PROFILE_CAPTURE=true
@@ -84,7 +84,7 @@ MCP_PROFILE_DIRECTORY=.local/token-profiles
 REFERENCE_TOKEN_METRICS=false
 ```
 
-An unset `MCP_PROFILE_CAPTURE` defaults to `true`. Set `MCP_PROFILE_CAPTURE=false` to opt out; this creates no capture directory or files. Only literal `true` and `false` are accepted. Existing `.env` settings are preserved by `scripts/setup.mjs`, so an existing explicit `false` remains opted out. Capture records requests, responses and notifications behind the MCP transport for both stdio and HTTP: initialization, discovery, tool calls, prompts, resources and protocol error responses. It adds no tools, prompts, response fields or model-visible logging. Tokenization happens in the offline report command; the existing context-budget checks still run normally. `REFERENCE_TOKEN_METRICS` remains an independent switch for immediate aggregate counting.
+An unset `MCP_PROFILE_CAPTURE` defaults to `false` and creates no capture directory or files. Only literal `true` and `false` are accepted. Existing local settings are preserved by `scripts/setup.mjs`. Capture records requests, responses and notifications behind the MCP transport for both stdio and HTTP. Tokenization happens in the offline report command. `REFERENCE_TOKEN_METRICS` independently controls aggregate token counting.
 
 Each server process creates a unique run directory under `MCP_PROFILE_DIRECTORY` and prints its location to stderr. Numbered `events-*.jsonl` files store the parsed JSON-RPC messages as serialized JSON strings, with sequence numbers, connection IDs, timestamps, transport and profile. Each HTTP POST gets its own connection ID, so repeated numeric request IDs from different clients cannot collide. Outgoing snapshots have separate send outcomes; a snapshot alone does not prove successful delivery. Authorization headers, environment variables and SDK connection extras are never captured. Requests rejected before the authenticated HTTP MCP transport, and malformed input that the transport cannot parse, have no captured raw body. Existing HTTP status logs and transport diagnostics cover those boundaries without retaining credentials from headers.
 
@@ -106,11 +106,12 @@ Capture performs JSON serialization and asynchronous file I/O, so it has host CP
 MCP_PROFILE_MAX_FILE_BYTES=8388608
 MCP_PROFILE_MAX_FILES=8
 MCP_PROFILE_MAX_QUEUE_BYTES=16777216
+MCP_PROFILE_MAX_RETAINED_BYTES=536870912
 ```
 
 Oversized records, full queues, write failures and rotated-out segments are recorded as losses. Sequence gaps, pending sends, unmatched messages and an unclosed run keep an incomplete capture from looking complete. Capture failures do not turn a successful ticket operation into a failure; inspect `run.json` status/counters and content-free stderr diagnostics before trusting totals. HTTP `/metrics` also exports `ai_ticketing_profile_*` numeric counters. Rotation bounds one run, not the number of runs across restarts. Archive or remove closed run directories according to your retention policy; there is no cross-process cleanup service. Analyze closed runs for reproducible totals. Metadata and sequence checks detect inconsistent captures; analysis-time hashes are fingerprints, not authenticated evidence against deliberate edits.
 
-Compose passes these settings to the app, defaults capture to `true`, and retains runs in the `token_profiles` volume at `/app/.local/token-profiles`. Set `MCP_PROFILE_CAPTURE=false` in `.env` to opt out, then recreate the app container to apply it. The image prepares the directory for the unprivileged `node` user. Analyze inside the container with `node dist/cli.js profile-report` or copy a closed run locally. Capture is for MCP server traffic; direct trusted `call --actor`, indexing workers and provider-side requests do not pass through the recorder.
+Compose retains opted-in runs in the `token_profiles` volume at `/app/.local/token-profiles`. Production requires a separate `PRODUCTION_MCP_PROFILE_CAPTURE=true` opt-in. An older `.env` setting for local capture cannot enable it in production. Each CLI process reserves its maximum on-disk capture size. When the directory quota is full, the service starts without a new recorder and logs `mcp_profile_capture_unavailable`. Archive or remove individual closed captures according to your retention policy. If setup was interrupted and left `.capture-admission`, verify no process is initializing capture before removing that empty lock directory. Existing dumps remain sensitive. Analyze with `node dist/cli.js profile-report` or copy a closed run to a private local directory.
 
 Library consumers can create a recorder with `createProfileRecorder`, supply it as `HttpConfig.profiler`, or wrap a stdio transport before `createMcpServer(...).connect(...)`. The caller owns `recorder.close()` after transports stop. `analyzeProfile(runDirectory)` provides the same offline analysis as the CLI.
 
