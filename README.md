@@ -64,6 +64,8 @@ The [client context manifest example](docs/client-context-manifest.md) reuses ex
 
 The [local repository context companion](docs/repository-context.md) retrieves revision-bound changed paths and bounded symbol, caller and test candidates from a verified owned worktree, with explicit tracked-text fallback and complete-path follow-up.
 
+The [local validation selection companion](docs/validation-selection.md) narrows checks only for explicitly mapped standalone test changes with exact source identities and required prerequisite closure; uncertain cases run the full suite, and protected CI and independent acceptance remain required.
+
 Use a [claim handoff](docs/claim-handoff.md) to transfer a durable checkpoint and exact workspace/artifact identities. The source owns publication until the named recipient acknowledges with its own new claim token.
 
 Ticket references accept a UUID or readable key such as `CORE-42`. Project references use UUIDs. Full [tool and workflow behavior](docs/mcp.md) is documented separately.
