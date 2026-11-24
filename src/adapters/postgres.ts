@@ -239,6 +239,7 @@ const columns: Record<Table, string[]> = {
     'event_seq',
     'created_at',
     'scheduling_policy',
+    'reviewer_actor_id',
   ],
   members: ['id', 'project_id', 'actor_id', 'role'],
   tickets: [
@@ -366,7 +367,13 @@ function decode(row: Record<string, unknown>) {
             (key === 'work_kind' && value === 'delivery') ||
             (key === 'spike_ids' && Array.isArray(value) && !value.length)
           ) &&
-          (!['execution_hints', 'execution', 'github_pull_request', 'scheduling_policy'].includes(key) ||
+          (![
+            'execution_hints',
+            'execution',
+            'github_pull_request',
+            'scheduling_policy',
+            'reviewer_actor_id',
+          ].includes(key) ||
             value !== null),
       )
       .map(([key, value]) => [

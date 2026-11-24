@@ -226,6 +226,7 @@ export const schemas = {
       name: text.max(200),
       instructions: z.string().max(16000).default(''),
       policy: z.enum(['self', 'independent', 'human']).default('independent'),
+      reviewer_actor_id: id.optional().describe('Registered reviewer for independent review.'),
       scheduling_policy: schedulingPolicy.optional(),
       execution_hints: executionHintsSchema.optional(),
     })
@@ -238,6 +239,7 @@ export const schemas = {
       name: text.max(200).optional(),
       instructions: z.string().max(16000).optional(),
       policy: z.enum(['self', 'independent', 'human']).optional(),
+      reviewer_actor_id: id.optional().describe('Project verifier or admin for independent review.'),
       scheduling_policy: schedulingPolicy.nullable().optional(),
       execution_hints: executionHintsSchema.optional(),
     })

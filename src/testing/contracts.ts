@@ -144,6 +144,41 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
           await adapters.dispose?.();
         }
       });
+    check(
+      'persists optional independent reviewer assignment and clears it when access is revoked',
+      async (f) => {
+        assert.equal(f.project.reviewer_actor_id, undefined);
+        const create = (reviewerId: string) =>
+          f.app.execute(f.admin.id, 'project_create', {
+            key: 'T' + randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase(),
+            name: 'Automatic independent review',
+            reviewer_actor_id: reviewerId,
+            idempotency_key: randomUUID(),
+          }) as Promise<Project>;
+        await assert.rejects(create(randomUUID()), hasCode('UNAUTHENTICATED'));
+        const project = await create(f.other.id);
+        assert.equal(project.reviewer_actor_id, f.other.id);
+        const read = () =>
+          f.app.execute(f.admin.id, 'project_get', { project_id: project.id }) as Promise<{
+            project: Project;
+            members: { actor_id: string; role: string }[];
+          }>;
+        assert.equal(
+          (await read()).members.find((member) => member.actor_id === f.other.id)?.role,
+          'verifier',
+        );
+        assert.equal((await read()).project.reviewer_actor_id, f.other.id);
+        await f.app.execute(f.admin.id, 'member_set', {
+          project_id: project.id,
+          actor_id: f.other.id,
+          role: 'none',
+          idempotency_key: randomUUID(),
+        });
+        const current = (await read()).project;
+        assert.equal(current.reviewer_actor_id, undefined);
+        assert.equal(current.revision, project.revision + 1);
+      },
+    );
     check('queues ticket indexing only for requirements changes and explicit rebuilds', async (f) => {
       const ticket = await f.ticket();
       const id = `ticket:${ticket.id}`;
