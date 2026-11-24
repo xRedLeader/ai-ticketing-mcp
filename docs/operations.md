@@ -64,6 +64,8 @@ Each active review renews a 30-second lease every five seconds. After an interru
 
 The packet includes the first 16 KiB of each of the first eight unique referenced text attachments under `evidenceRoot` and marks truncated attachments. Packets over 512 KiB and submissions that cite native execution artifacts stay available for manual review. Reviewers can use `artifact_read` to verify the complete bytes and hashes.
 
+The dispatcher defaults to `"reviewPacketFormat": "full"`. Set `"reviewPacketFormat": "compact"` in its local configuration to share repeated hexadecimal chunks inside complete JSON attachments. The single request carries a dictionary and ordered parts that reconstruct the original attachment text exactly. The dispatcher uses the full representation whenever the candidate fails to reduce both UTF-8 input bytes and reference tokens. See the [review benchmark](review-benchmark.md).
+
 ## Health and metrics
 
 - `/healthz`: process liveness.

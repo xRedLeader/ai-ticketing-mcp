@@ -36,6 +36,8 @@
     "commit:check": "node scripts/check-commits.mjs",
     "benchmark": "tsx scripts/benchmark.ts",
     "benchmark:protocol": "tsx scripts/protocol-benchmark.ts",
+    "benchmark:review": "node scripts/review-benchmark.mjs",
+    "benchmark:review:live": "node scripts/review-benchmark-live.mjs",
     "benchmark:claims": "tsx scripts/claim-benchmark.ts",
     "profile:report": "tsx src/cli.ts profile-report",
     "walkthrough": "tsx scripts/walkthrough.ts",
