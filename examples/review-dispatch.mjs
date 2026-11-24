@@ -6,6 +6,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
+import { buildReviewInput } from './review-packet.mjs';
+
+export { buildReviewInput } from './review-packet.mjs';
 
 const uuid = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 const maxAttempts = 3;
@@ -339,16 +342,7 @@ async function readEvidence({ evidenceRoot, workspace }, submission) {
 
 export async function modelReview(config, { detail, submission }, request = fetch) {
   const attachments = await readEvidence(config, submission);
-  const { title, description } = detail.ticket;
-  const input = JSON.stringify({
-    title,
-    description,
-    criteria: detail.criteria,
-    blockers: detail.blockers,
-    summary: submission.summary,
-    evidence: submission.evidence,
-    attachments,
-  });
+  const input = buildReviewInput({ detail, submission, attachments }, config.reviewPacketFormat);
   if (Buffer.byteLength(input) > 512 * 1024) throw new Error('Review packet requires manual review.');
   const response = await request('https://api.openai.com/v1/responses', {
     method: 'POST',
@@ -390,6 +384,8 @@ async function main() {
   const { values } = parseArgs({ options: { config: { type: 'string' }, once: { type: 'boolean' } } });
   if (!values.config) throw new Error('Pass --config with the local dispatcher JSON file.');
   const config = JSON.parse(await readFile(values.config, 'utf8'));
+  if (config.reviewPacketFormat !== undefined && !['full', 'compact'].includes(config.reviewPacketFormat))
+    throw new Error('reviewPacketFormat must be full or compact.');
   for (const key of ['runtime', 'workspace', 'sqlite', 'ledger', 'evidenceRoot']) {
     if (typeof config[key] !== 'string' || !isAbsolute(config[key]))
       throw new Error(`${key} must be an absolute local path.`);
