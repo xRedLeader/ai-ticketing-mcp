@@ -732,6 +732,18 @@ it('refuses passing evidence when source or a declared toolchain changes during 
   }
 });
 
+it('rejects a pipeline step whose working directory is outside the pinned checkout', async () => {
+  const f = await fixture(['']);
+  try {
+    const other = join(f.directory, 'other');
+    await mkdir(other);
+    f.config.recipes[1]!.cwd = other;
+    assert.throws(f.registry, { code: 'INVALID_CONFIG', message: /pinned repository root/ });
+  } finally {
+    await f.dispose();
+  }
+});
+
 it('rejects cycles, unknown recipes, source mismatch and arbitrary pipeline commands', async () => {
   const f = await fixture(['']);
   try {

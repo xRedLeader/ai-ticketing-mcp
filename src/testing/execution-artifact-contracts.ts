@@ -99,6 +99,8 @@ export function registerExecutionArtifactContracts(name: string, factory: () => 
     assert.equal(exact.sha256, createHash('sha256').update(f.content).digest('hex'));
     assert.equal(exact.range.complete, true);
     assert.equal(exact.omitted_bytes, 500);
+    const acrossChunks = await f.read({ offset: 65530, length: 16 });
+    assert.deepEqual(Buffer.from(acrossChunks.range.data, 'base64'), f.content.subarray(65530, 65546));
     const bounded = await f.read({ offset: 0, length: 65536, max_tokens: 512 });
     assert.ok(countReferenceTokens(serializeSuccessEnvelope(bounded)) <= 512);
     assert.equal(bounded.range.unavailable_reason, 'response_budget');
@@ -134,6 +136,15 @@ export function registerExecutionArtifactContracts(name: string, factory: () => 
     })) as any;
     assert.equal(compact.run.exit_code, 7);
     assert.ok(countReferenceTokens(serializeSuccessEnvelope(compact)) <= 512);
+  });
+  check('rejects same-length changes to captured logs and results', async (f) => {
+    const changed = Buffer.from(f.content);
+    changed[changed.length - 1] = changed.at(-1)! ^ 1;
+    await writeFile(join(f.path, 'stdout.log'), changed);
+    await assert.rejects(f.read({ offset: 0, length: 1 }), hasCode('INVALID_ARTIFACT'));
+    await assert.rejects(f.read({ length: 0 }), hasCode('INVALID_ARTIFACT'));
+    await writeFile(join(f.path, 'outcome.json'), JSON.stringify({ exit_code: 0 }));
+    await assert.rejects(f.read({ artifact_id: f.refs[2] }), hasCode('INVALID_ARTIFACT'));
   });
 
   check('limits independent reviewer artifact recovery to the current submitted evidence', async (f) => {

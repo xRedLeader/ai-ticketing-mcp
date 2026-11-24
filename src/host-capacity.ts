@@ -15,6 +15,7 @@ const id = z.string().trim().min(1).max(256);
 const count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const positive = count.positive();
 const timestamp = count;
+export const HOST_CAPACITY_LIMIT = 'HOST_CAPACITY_LIMIT';
 const resources = z.strictObject({ cpu_millis: count.default(0), memory_bytes: count.default(0) });
 const hostSchema = z.strictObject({
   agent_slots: positive.default(2),
@@ -204,14 +205,22 @@ class CapacityLedger extends UsageBudget {
         );
       }
       const timeout =
-        admission?.allowance.runtime_ms ??
-        positive.max(host.config.script_timeout_ms).parse(rawTimeout ?? host.config.script_timeout_ms);
+        admission?.allowance.runtime_ms ?? positive.parse(rawTimeout ?? host.config.script_timeout_ms);
+      ensure(
+        admission || timeout <= host.config.script_timeout_ms,
+        'INVALID_INPUT',
+        'Script timeout exceeds the host limit.',
+        {
+          reason: HOST_CAPACITY_LIMIT,
+        },
+      );
       ensure(
         (['cpu_millis', 'memory_bytes'] as const).every(
           (field) => host.config[field] === null || request.resources[field] <= host.config[field]!,
         ),
         'INVALID_INPUT',
         'Request can never fit configured host resources.',
+        { reason: HOST_CAPACITY_LIMIT },
       );
       ensure(
         !host.entries.some(
