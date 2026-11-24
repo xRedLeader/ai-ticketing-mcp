@@ -54,6 +54,16 @@ The worker runs indexing and delivery loops independently. Configured stdio also
 
 The SHA256 fingerprint of the canonical URL binds queued rows to their original destination. Changing the URL leaves old rows pending; it never forwards them to the new URL. Restoring the old URL resumes those deliveries. Retain `changes_since` polling as the recovery source: notifications are hints, and claim expiry itself does not emit an event. PostgreSQL migration 011 and SQLite migration 003 preserve existing data and history. Delivery rows are retained after success; include them in backups.
 
+## Automatic local independent review
+
+`node examples/review-dispatch.mjs --config PATH` checks one project's `in_review` queue every five seconds, including submissions already waiting at startup. Use Node 24+, a signed-in Codex CLI, and a built SQLite ticketing runtime that exposes `reviewer_actor_id`. Set that field on the project to the registered agent with verifier access. The private JSON configuration has absolute paths `runtime` (the built `runtime.js`), `sqlite` (the live store), `ledger` (a separate local SQLite file), `workspace` (the checkout), and `evidenceRoot` (the directory containing submitted evidence), plus `projectId` and `reviewerId` UUIDs. The dispatcher checks the Codex version at startup and resolves the current Windows desktop installation or PATH again when launching each review. Set an absolute `codex` path only to pin a specific installation. Run under the desktop account that can read the submitted artifacts. `--once` runs one pass.
+
+The dispatcher starts Astra in read-only mode and records its validated decision through `ticket_review` as the configured reviewer. Independent self-review is skipped. Reassignment, a new submission, and changed requirements are checked before recording a decision. Keep the same ledger across restarts so the dispatcher can replay a saved decision without relaunching Astra. Stop older dispatcher processes before upgrading the ledger. An older `started` entry without a lease is eligible for recovery on the next scan.
+
+Each active review renews a 30-second lease every five seconds. After an interruption, the first scan after expiry can retry the current submission. A previous attempt loses permission to save its decision when its lease expires. An orphaned Codex process may still finish and consume usage. Interrupted attempts and transient pre-launch failures share the three-attempt limit. The dispatcher logs `review_failed` with `REVIEW_INTERRUPTED` when the final attempt expires. At that point the ticket remains available for manual review. Older failed entries still get one recovery attempt if their submission is current. A new submission gets its own attempt.
+
+The prompt includes the first 16 KiB of each of the first eight unique referenced text attachments under `evidenceRoot`. Include a compact evidence receipt if the criteria require details beyond those limits. The prompt marks truncated attachments so Astra can report insufficient evidence. Submissions that cite native execution artifacts stay available for a reviewer using `artifact_read` to verify the complete bytes and hashes.
+
 ## Health and metrics
 
 - `/healthz`: process liveness.
