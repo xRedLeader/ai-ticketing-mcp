@@ -37,6 +37,7 @@ jobs:
       - name: Verify production HTTPS and fresh Keycloak realm import
         run: npm run test:https
       - run: npm run benchmark:protocol
+      - run: npm run benchmark:review
       - run: npm run benchmark:claims
       - uses: actions/upload-artifact@v4
         with:
