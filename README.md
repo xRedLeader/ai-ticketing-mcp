@@ -7,6 +7,8 @@ Headless ticketing built for agents: find useful work, claim it safely, recover 
 ## What agents get
 
 - Structured tickets with acceptance criteria, priorities, capabilities, parents, and blocking dependencies.
+- Opt-in trusted-host [parallel branch dispatch and verified joins](docs/branch-dispatch.md), with durable ownership and existing host capacity limits.
+- Optional local [integration preparation](docs/integration-companion.md) against the current target, with preserved conflicts and fresh candidate verification.
 - Project idea intake and triage, with atomic promotion into delivery tickets and source provenance.
 - [Time-boxed research](docs/research.md) with separate claims, durable findings and evidence-linked delivery decisions.
 - Atomic ten-minute claims, heartbeat renewal, stale-worker fencing, and retry-safe mutations.
@@ -61,6 +63,10 @@ Use a fresh `idempotency_key` for each logical mutation, reusing it only for an 
 Use `stdio --profile executor` or `/mcp?profile=executor` for registered script execution with bounded waits and exact artifact evidence. Connect with `stdio --profile planner` or `/mcp?profile=reviewer`; OAuth tokens still target `/mcp`. Profiles select tools without changing permissions. Lists and mutation receipts are compact; fetch full current state through `ticket_get` or `project_get`. Existing clients should review the [changed defaults](docs/mcp.md#changed-defaults). The [SDK maintenance example](examples/claim-maintenance.ts) renews ownership independently every two minutes and catches up change pages between model turns, retaining keys across identical retries.
 
 The [client context manifest example](docs/client-context-manifest.md) reuses exact locally retained requirements, required checkpoint history and artifact bytes after authorized revalidation. Fresh clients and reconnects perform complete reads.
+
+The [local repository context companion](docs/repository-context.md) retrieves revision-bound changed paths and bounded symbol, caller and test candidates from a verified owned worktree, with explicit tracked-text fallback and complete-path follow-up.
+
+The [local validation selection companion](docs/validation-selection.md) narrows checks only for explicitly mapped standalone test changes with exact source identities and required prerequisite closure; uncertain cases run the full suite, and protected CI and independent acceptance remain required.
 
 Use a [claim handoff](docs/claim-handoff.md) to transfer a durable checkpoint and exact workspace/artifact identities. The source owns publication until the named recipient acknowledges with its own new claim token.
 

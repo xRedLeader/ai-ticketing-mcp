@@ -1,7 +1,8 @@
-import { spawn } from 'node:child_process';
+import { fork, spawn } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
   durableExecutionFile,
@@ -12,6 +13,7 @@ import {
   fileSha256,
   pipelineIdentityError,
   recoveryFailureSchema,
+  verificationRunnerPath,
   type SourceIdentity,
   type VerificationPipeline,
 } from './verification-pipeline.js';
@@ -361,6 +363,67 @@ export async function runVerificationPipeline(
   return report;
 }
 
+/** Local callers own a separate runner group on Linux, just as the execution supervisor does. */
+export async function runLocalVerificationPipeline(
+  pipeline: VerificationPipeline,
+  deadlineAt = Date.now() + pipeline.timeout_ms,
+  reportPath?: string,
+): Promise<VerificationReport> {
+  if (process.platform !== 'linux') return runVerificationPipeline(pipeline, deadlineAt, reportPath);
+  const runner = verificationRunnerPath();
+  const child = fork(runner, [], {
+    cwd: pipeline.source.command.cwd,
+    env: {},
+    execArgv: runner.endsWith('.ts')
+      ? ['--import', pathToFileURL(createRequire(import.meta.url).resolve('tsx')).href]
+      : [],
+    detached: true,
+    stdio: ['pipe', 'inherit', 'inherit', 'ipc'],
+  });
+  return new Promise((resolve, reject) => {
+    let finishing = false;
+    let identity: ReturnType<typeof executionProcessIdentity>;
+    const finish = async (report?: VerificationReport) => {
+      if (finishing) return;
+      finishing = true;
+      clearTimeout(watchdog);
+      const stopped = identity ? await terminateExecutionProcessTree(identity).catch(() => false) : false;
+      if (child.connected) child.disconnect();
+      if (!stopped) child.unref();
+      if (!report) {
+        reject(new Error('Local verification runner exited or exceeded its deadline without a report.'));
+        return;
+      }
+      report.cleanup_verified = stopped;
+      if (!stopped) {
+        report.status = 'failed';
+        report.error_code ??= 'TERMINATION_UNCONFIRMED';
+      }
+      resolve(report);
+    };
+    const watchdog = setTimeout(
+      () => void finish(),
+      Math.max(0, Math.min(30 * 60_000, deadlineAt - Date.now())) + 15_000,
+    );
+    child.once('spawn', () => {
+      identity = executionProcessIdentity(child.pid!);
+      if (!identity) {
+        // No command input was sent, so this child cannot have started a verification step.
+        child.stdin!.end();
+        void finish();
+        return;
+      }
+      child.stdin!.end(
+        JSON.stringify({ pipeline, report_path: reportPath, deadline_at: deadlineAt, local: true }),
+      );
+    });
+    child.stdin!.on('error', () => void finish());
+    child.once('error', () => void finish());
+    child.once('exit', () => void finish());
+    child.once('message', (message) => void finish(message as VerificationReport));
+  });
+}
+
 async function main() {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -374,9 +437,23 @@ async function main() {
     report_path: string;
     deadline_at: number;
     identity: ExecutionManifest;
+    local?: boolean;
   };
+  if (input.local) {
+    if (!process.connected) return;
+    process.once('disconnect', () => {
+      // The local parent detached this runner as a process-group leader before sending work.
+      process.kill(-process.pid, 'SIGKILL');
+    });
+  }
   const deadline = performance.now() + Math.max(0, input.deadline_at - Date.now());
   const report = await runVerificationPipeline(input.pipeline, input.deadline_at, input.report_path);
+  if (input.local) {
+    // Keep the group leader alive until its parent verifies that the whole group stopped.
+    setInterval(() => {}, 1000);
+    process.send!(report);
+    return;
+  }
   const expired = new Error('Pipeline publication deadline exceeded.');
   try {
     durableExecutionFile(input.report_path, report, () => {

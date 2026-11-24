@@ -97,12 +97,19 @@ const compareId = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
 /** Trusted local host boundary; all dispatchers for a physical host must share this SQLite file. */
 class CapacityLedger extends UsageBudget {
+  readonly identity: string;
   constructor(
     path: string,
     private readonly clients?: ClientCapabilities,
   ) {
     super(path);
     this.db.exec('CREATE TABLE IF NOT EXISTS host_capacity (id TEXT PRIMARY KEY, state TEXT NOT NULL)');
+    this.db.exec(
+      'CREATE TABLE IF NOT EXISTS host_capacity_identity (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL)',
+    );
+    this.db.prepare('INSERT OR IGNORE INTO host_capacity_identity(id,value) VALUES(1,?)').run(randomUUID());
+    this.identity = this.db.prepare('SELECT value FROM host_capacity_identity WHERE id=1').get()!
+      .value as string;
   }
 
   configureHost(hostId: string, input: HostCapacityLimits = {}) {
@@ -711,6 +718,9 @@ export class HostCapacity {
   private readonly ledger: CapacityLedger;
   constructor(path: string, clients?: ClientCapabilities) {
     this.ledger = new CapacityLedger(path, clients);
+  }
+  get identity() {
+    return this.ledger.identity;
   }
   close() {
     this.ledger.close();

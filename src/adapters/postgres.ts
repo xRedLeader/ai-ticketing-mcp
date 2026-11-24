@@ -43,6 +43,17 @@ const knowledgeColumns = [
   'updated_at',
 ];
 const columns: Record<Table, string[]> = {
+  branch_dispatches: [
+    'id',
+    'project_id',
+    'actor_id',
+    'claim_token',
+    'requirements_revision',
+    'capacity_id',
+    'budget_run_id',
+    'host_id',
+    'dispatch',
+  ],
   research_spikes: [
     'id',
     'project_id',
@@ -333,6 +344,7 @@ const columns: Record<Table, string[]> = {
   ],
 };
 const jsonColumns = new Set([
+  'dispatch',
   'exit_criteria',
   'spike_ids',
   'condition',
@@ -586,6 +598,11 @@ function repository(db: Executor): Transaction {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
       ensure(table !== 'claim_handoffs', 'IMMUTABLE_HANDOFF', 'Handoff generation fences cannot be deleted.');
       ensure(
+        table !== 'branch_dispatches',
+        'IMMUTABLE_BRANCH_DISPATCH',
+        'Branch admission fences cannot be deleted.',
+      );
+      ensure(
         table !== 'wake_conditions',
         'IMMUTABLE_WAKE',
         'Durable wake cursors and consumption fences cannot be deleted.',
@@ -626,6 +643,7 @@ export class PostgresStorage implements StorageAdapter {
   readonly artifactRetention = true as const;
   readonly wakeDecisions = true;
   readonly executionRuns = true as const;
+  readonly branchDispatches = true as const;
   readonly executionLaunchStorage;
   readonly schedulingPolicies = Object.freeze(['priority_age', 'unblocking'] as const);
   readonly pool: pg.Pool;
