@@ -47,8 +47,12 @@ it('adds PostgreSQL execution storage without changing existing checkpoints, cla
       'CREATE TABLE schema_migrations(name text PRIMARY KEY,applied_at timestamptz NOT NULL DEFAULT now())',
     );
     const directory = new URL('../../migrations/', import.meta.url);
+    // The current adapter writes the independent reviewer column while seeding the pre-execution fixture.
     for (const name of (await readdir(directory))
-      .filter((name) => name.endsWith('.sql') && name < '014_execution_runs.sql')
+      .filter(
+        (name) =>
+          name.endsWith('.sql') && (name < '014_execution_runs.sql' || name === '016_project_reviewer.sql'),
+      )
       .sort()) {
       await storage.pool.query(await readFile(new URL(name, directory), 'utf8'));
       await storage.pool.query('INSERT INTO schema_migrations(name) VALUES($1)', [name]);

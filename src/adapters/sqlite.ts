@@ -224,6 +224,7 @@ const columns: Record<Table, string[]> = {
     'created_at',
     'execution_hints',
     'scheduling_policy',
+    'reviewer_actor_id',
   ],
   members: ['id', 'project_id', 'actor_id', 'role'],
   tickets: [
@@ -393,7 +394,8 @@ function decode(row: Record<string, unknown>) {
       ((key === 'execution_hints' ||
         key === 'execution' ||
         key === 'github_pull_request' ||
-        key === 'scheduling_policy') &&
+        key === 'scheduling_policy' ||
+        key === 'reviewer_actor_id') &&
         value === null)
         ? []
         : [

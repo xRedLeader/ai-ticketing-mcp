@@ -62,6 +62,8 @@ Requirement edits revoke claims and invalidate affected reviews, completed depen
 
 ## Independent review
 
+Set `reviewer_actor_id` on an independent project to opt into a designated reviewer. `project_create` grants the selected registered identity verifier access unless it already owns the project. For `project_update`, grant the identity verifier or admin access first. Revoking that access clears the assignment. The local dispatcher requires an assigned agent with verifier or admin access. [Dispatcher setup](operations.md#automatic-local-independent-review)
+
 Native artifact references in the exact selected submission require the reviewer's own complete byte and hash reads even when requirements and evidence were retrieved directly through `ticket_get` and `ticket_history`. The assessment validators derive those required reads from the submission itself, and reject passing claims contradicted by the actual native result or its pipeline steps and cleanup state.
 
 Reviewer-profile `ticket_context` prioritizes current submission evidence, exact GitHub observations, previous reviews, and unanswered questions. It excludes worker checkpoints and execution preferences. Current requirement identities remain mandatory; `review_blockers` keeps failed, missing, or stale evidence visible even when payloads exceed the response budget. Recover every `required_before:review` omission through its supplied arguments, including all history pages. A `not_modified` response alone does not deliver requirements or evidence to a fresh reviewer.
