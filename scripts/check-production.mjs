@@ -11,6 +11,21 @@ export function checkProductionConfig(env, compose, realm) {
   const fail = (condition, message) => {
     if (!condition) errors.push(message);
   };
+  const passwordFields = [
+    'DB_PASSWORD',
+    'APP_DB_PASSWORD',
+    'KEYCLOAK_DB_PASSWORD',
+    'KEYCLOAK_ADMIN_PASSWORD',
+  ];
+  for (const name of passwordFields) {
+    const value = env[name];
+    fail(
+      typeof value === 'string' && value.length >= 32 && value.length <= 256 && !/\s/.test(value),
+      `${name}: set a private generated password (32–256 characters without whitespace).`,
+    );
+    if (value && passwordFields.some((other) => other !== name && env[other] === value))
+      errors.push(`${name}: use a distinct password for each service role.`);
+  }
   fail(
     env.NODE_TLS_REJECT_UNAUTHORIZED !== '0',
     'NODE_TLS_REJECT_UNAUTHORIZED: unset this value to keep TLS verification enabled.',
@@ -50,8 +65,8 @@ export function checkProductionConfig(env, compose, realm) {
     'ALLOWED_ORIGIN_HOSTS: use explicit trusted DNS hostnames including TICKETING_DOMAIN; no wildcard, URL or port.',
   );
   fail(
-    env.OAUTH_JWKS_URL === 'http://keycloak:8080/realms/ticketing/protocol/openid-connect/certs',
-    'OAUTH_JWKS_URL: use the private bundled Keycloak JWKS endpoint for this deployment.',
+    env.OAUTH_JWKS_URL === `${env.OAUTH_ISSUER}/protocol/openid-connect/certs`,
+    'OAUTH_JWKS_URL: use the public HTTPS Keycloak signing key URL.',
   );
   if (arguments.length >= 3 && (!realm || typeof realm !== 'object' || Array.isArray(realm))) {
     errors.push('Keycloak realm: supply a JSON realm object, then export current realm again.');
@@ -141,6 +156,7 @@ export function checkProductionConfig(env, compose, realm) {
       OAUTH_AUDIENCE: env.OAUTH_AUDIENCE,
       ALLOWED_ORIGIN_HOSTS: env.ALLOWED_ORIGIN_HOSTS,
       OAUTH_JWKS_URL: env.OAUTH_JWKS_URL,
+      OAUTH_ALLOW_LOCAL_KEYCLOAK_JWKS: 'false',
     };
     fail(
       Object.entries(expected).every(([key, value]) => services.app?.environment?.[key] === value),

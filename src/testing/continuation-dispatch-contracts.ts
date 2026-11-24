@@ -91,11 +91,16 @@ export function registerContinuationDispatchContractTests(
     let capacity = new HostCapacity(capacityFile, clients);
     capacity.configureHost('host', { agent_slots: 1 });
     const allowance = { provider_tokens: 100, runtime_ms: 60_000, cost_usd_micros: null };
+    const sibling = await f.ticket();
+    capacity.configureHost('sibling-host', { agent_slots: 1 });
     const budgetRun = randomUUID();
     capacity.createRun({
       run_id: budgetRun,
       project_id: f.project.id,
-      work: [{ ticket_id: ticket.id, requirements_revision: ticket.requirements_revision }],
+      work: [ticket, sibling].map((work) => ({
+        ticket_id: work.id,
+        requirements_revision: work.requirements_revision,
+      })),
       limits: { max_attempts: 5, max_provider_tokens: 1000, max_runtime_ms: 600_000 },
     });
     capacity.enqueue('host', {
@@ -178,6 +183,26 @@ export function registerContinuationDispatchContractTests(
       ...f,
       app,
       ticket,
+      admitSibling() {
+        capacity.enqueue('sibling-host', {
+          queue_id: 'sibling',
+          run_id: budgetRun,
+          kind: 'agent',
+          created_at: Date.now(),
+          execution: { ...claimed.claim.execution, requirements_revision: sibling.requirements_revision },
+          admission: {
+            attempt_id: 'sibling',
+            actor_id: f.worker.id,
+            ticket_id: sibling.id,
+            requirements_revision: sibling.requirements_revision,
+            provider: 'fake',
+            model: 'fake-model',
+            role: 'worker',
+            allowance,
+          },
+        });
+        assert.ok(capacity.claimNext('sibling-host', 'sibling-worker').admitted);
+      },
       artifacts,
       capacity: () => capacity,
       request,
@@ -447,8 +472,8 @@ export function registerContinuationDispatchContractTests(
     },
   );
 
-  for (const boundary of ['crash', 'artifact_changed'] as const)
-    check(`never relaunches when ${boundary} occurs after committed intent`, async (f) => {
+  for (const boundary of ['crash', 'artifact_changed', 'sibling_admitted'] as const)
+    check(`handles ${boundary} after committed intent`, async (f) => {
       await f.settleScript();
       await f.register();
       f.exitPredecessor();
@@ -459,56 +484,60 @@ export function registerContinuationDispatchContractTests(
         if (!injected && (result as any)?.state === 'starting') {
           injected = true;
           if (boundary === 'crash') throw new Error('Simulated disconnect after committed intent.');
-          const path = join(f.artifacts, 'outcome.json');
-          await writeFile(path, (await readFile(path, 'utf8')).replace('"exit_code":0', '"exit_code":1'));
+          if (boundary === 'sibling_admitted') f.admitSibling();
+          else {
+            const path = join(f.artifacts, 'outcome.json');
+            await writeFile(path, (await readFile(path, 'utf8')).replace('"exit_code":0', '"exit_code":1'));
+          }
         }
         return result;
       };
       try {
         if (boundary === 'crash')
           await assert.rejects(f.dispatcher().runOnce(f.request), /Simulated disconnect/);
-        else assert.equal((await f.dispatcher().runOnce(f.request)).code, 'INVALID_ARTIFACT');
+        else {
+          const result = await f.dispatcher().runOnce(f.request);
+          if (boundary === 'artifact_changed') {
+            assert.equal(result.state, 'completed');
+            assert.equal(result.code, 'INVALID_ARTIFACT');
+            assert.ok('fence' in result);
+            assert.ok(await f.app.finishWakeDecision(f.admin.id, f.project.id, result.fence));
+          } else assert.equal(result.state, 'running');
+        }
       } finally {
         f.storage.transaction = transaction;
       }
-      const active = (await f.get()).active!;
-      assert.equal(active.dispatch!.state, boundary === 'crash' ? 'starting' : 'needs_attention');
-      assert.equal(f.calls(), 0);
-      assert.equal(f.capacity().inspect('host').occupied.agent, 1);
-      assert.equal((await f.restart().runOnce(f.request)).state, active.dispatch!.state);
-      assert.equal(f.calls(), 0);
-      assert.equal((await f.get()).generation, active.generation);
+      const state = boundary === 'crash' ? 'starting' : boundary === 'sibling_admitted' ? 'running' : null;
+      assert.equal((await f.get()).active?.dispatch?.state ?? null, state);
+      const expectedCalls = boundary === 'sibling_admitted' ? 1 : 0;
+      assert.equal(f.capacity().inspect('host').occupied.agent, boundary === 'artifact_changed' ? 0 : 1);
+      assert.equal((await f.restart().runOnce(f.request)).state, state ?? 'waiting');
+      assert.equal(f.calls(), expectedCalls);
     });
 
   for (const legacy of [false, true])
     check(
-      `retains exact admission when post-claim accounting throws${legacy ? ' and repairs legacy null attention' : ''}`,
+      `retains exact admission when the capacity call loses its receipt${legacy ? ' and repairs legacy null attention' : ''}`,
       async (f) => {
         await f.settleScript();
         await f.register();
         f.exitPredecessor();
         const capacity = f.capacity(),
-          report = capacity.report.bind(capacity);
+          claimNext = capacity.claimNext.bind(capacity);
         let injected = false;
-        capacity.report = (run) => {
-          if (
-            !injected &&
-            capacity
-              .inspect('host')
-              .entries.some(
-                (entry) => entry.state === 'running' && entry.queue_id.startsWith('continuation:'),
-              )
-          ) {
+        capacity.claimNext = (...args) => {
+          const result = claimNext(...args);
+          if (!injected && result.admitted) {
             injected = true;
-            throw new Error('Injected accounting failure after committed admission.');
+            throw new Error('Injected loss of the committed admission receipt.');
           }
-          return report(run);
+          return result;
         };
         try {
           const failed = await f.dispatcher().runOnce(f.request);
           assert.equal(failed.code, 'ADMISSION_UNCERTAIN');
         } finally {
-          capacity.report = report;
+          capacity.claimNext = claimNext;
         }
         let active = (await f.get()).active!;
         const invocation = active.dispatch!.invocation!;
@@ -537,7 +566,7 @@ export function registerContinuationDispatchContractTests(
           f.app.finishWakeDecision(f.admin.id, f.project.id, fence),
           hasCode('WAKE_PENDING'),
         );
-        const charged = report(f.request.budget_run_id).budget_charged_or_reserved;
+        const charged = capacity.report(f.request.budget_run_id).budget_charged_or_reserved;
         assert.equal(charged.attempts, 2);
         assert.equal((await f.restart().runOnce(f.request)).code, 'ADMISSION_UNCERTAIN');
         active = (await f.get()).active!;

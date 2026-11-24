@@ -58,8 +58,7 @@ export function createHttpServer(app: Application, config: HttpConfig) {
   let active = 0;
   const server = createServer(async (req, res) => {
     const start = performance.now();
-    const requestUrl = new URL(req.url ?? '/', url);
-    const path = requestUrl.pathname;
+    let path = '';
     res.on('finish', () =>
       process.stderr.write(
         JSON.stringify({
@@ -88,6 +87,9 @@ export function createHttpServer(app: Application, config: HttpConfig) {
     }
     active++;
     try {
+      const requestUrl = URL.parse(req.url ?? '/', url);
+      ensure(requestUrl, 'INVALID_INPUT', 'Invalid HTTP request target.');
+      path = requestUrl.pathname;
       if (req.method === 'GET' && path === '/healthz') {
         json(res, 200, { status: 'ok' });
         return;

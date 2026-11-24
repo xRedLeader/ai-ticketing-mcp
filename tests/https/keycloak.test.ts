@@ -1,7 +1,7 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -25,9 +25,13 @@ it(
       PUBLIC_URL: 'https://tickets.acme.org',
       OAUTH_ISSUER: `${login}/realms/ticketing`,
       OAUTH_AUDIENCE: audience,
-      OAUTH_JWKS_URL: 'http://keycloak:8080/realms/ticketing/protocol/openid-connect/certs',
+      OAUTH_JWKS_URL: `${login}/realms/ticketing/protocol/openid-connect/certs`,
       ALLOWED_ORIGIN_HOSTS: 'tickets.acme.org',
       KEYCLOAK_PUBLIC_URL: login,
+      DB_PASSWORD: randomBytes(32).toString('hex'),
+      APP_DB_PASSWORD: randomBytes(32).toString('hex'),
+      KEYCLOAK_DB_PASSWORD: randomBytes(32).toString('hex'),
+      KEYCLOAK_ADMIN_PASSWORD: randomBytes(32).toString('hex'),
     };
     const docker = async (...args: string[]) =>
       (await promisify(execFile)('docker', args, { windowsHide: true, timeout: 120000 })).stdout.trim();
@@ -50,16 +54,36 @@ it(
           windowsHide: true,
           env: {
             ...process.env,
-            DB_PASSWORD: 'fixture-only',
-            APP_DB_PASSWORD: 'fixture-only',
-            KEYCLOAK_DB_PASSWORD: 'fixture-only',
-            KEYCLOAK_ADMIN_PASSWORD: 'fixture-only',
             ...env,
           },
         },
       );
-      const keycloak = JSON.parse(stdout).services.keycloak;
+      const { keycloak, app, proxy } = JSON.parse(stdout).services;
       assert.equal(keycloak.image, 'quay.io/keycloak/keycloak:26.4.7');
+      assert.equal(app.environment.OAUTH_JWKS_URL, env.OAUTH_JWKS_URL);
+      assert.equal(app.environment.OAUTH_ALLOW_LOCAL_KEYCLOAK_JWKS, 'false');
+      assert.ok(proxy.networks.default.aliases.includes(env.LOGIN_DOMAIN));
+      // Compose escapes dollars when serializing a reusable configuration.
+      const [entrypoint, ...entrypointArgs] = (keycloak.entrypoint as string[]).map((value) =>
+        value.replaceAll('$$', '$'),
+      );
+      await assert.rejects(
+        docker(
+          'run',
+          '--rm',
+          '--entrypoint',
+          entrypoint!,
+          '-e',
+          'KC_BOOTSTRAP_ADMIN_PASSWORD=replace-with-generated-hex',
+          keycloak.image,
+          ...entrypointArgs,
+          ...keycloak.command,
+        ),
+        (error: any) =>
+          error.code === 1 &&
+          error.stderr.includes('KEYCLOAK_ADMIN_PASSWORD:') &&
+          !error.stderr.includes('replace-with-generated-hex'),
+      );
       const mount = keycloak.volumes.find(
         (v: { target: string }) => v.target === '/opt/keycloak/data/import/ticketing.json',
       );
@@ -128,6 +152,8 @@ it(
         name,
         '--memory',
         '1g',
+        '--entrypoint',
+        entrypoint!,
         '-p',
         '127.0.0.1::8080',
         '--mount',
@@ -139,8 +165,9 @@ it(
         '-e',
         'KC_BOOTSTRAP_ADMIN_USERNAME=fixture-admin',
         '-e',
-        'KC_BOOTSTRAP_ADMIN_PASSWORD=fixture-only',
+        `KC_BOOTSTRAP_ADMIN_PASSWORD=${env.KEYCLOAK_ADMIN_PASSWORD}`,
         keycloak.image,
+        ...entrypointArgs,
         ...keycloak.command,
       );
       assert.equal(await docker('image', 'inspect', keycloak.image, '--format', '{{.Config.User}}'), '1000');

@@ -1,16 +1,16 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, rm, rmdir } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, rmdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { it } from 'node:test';
 import { createSqliteAdapters } from '../src/adapters/sqlite.js';
-import { fixture } from '../src/testing/contracts.js';
+import { fixture, hasCode } from '../src/testing/contracts.js';
 // @ts-expect-error The standalone dispatcher runs directly on Node.
-import { openLedger, ReviewLaunchError, scanReviews } from '../examples/review-dispatch.mjs';
+import { modelReview, openLedger, ReviewLaunchError, scanReviews } from '../examples/review-dispatch.mjs';
 
-it('recovers an abruptly interrupted review and discards a superseded approval', async (t) => {
+it('recovers an abruptly interrupted review and discards superseded feedback', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'ticketing-review-restart-'));
   const ledgerPath = join(directory, 'review.sqlite');
   const sqlitePath = join(directory, 'tickets.sqlite');
@@ -83,7 +83,7 @@ it('recovers an abruptly interrupted review and discards a superseded approval',
                 criteria: ['New criterion after the reviewer started.'],
               });
             }
-            return { decision: 'approve', feedback: 'The submitted evidence meets the original criterion.' };
+            return { decision: 'request_changes', feedback: 'Supply the current verification receipt.' };
           },
         });
       const status = async (id: string) => (await f.read(id)).ticket.status;
@@ -92,8 +92,8 @@ it('recovers an abruptly interrupted review and discards a superseded approval',
         await scan();
         assert.equal(await status(interrupted.ticket.id), 'in_review');
       }
-      assert.equal(await status(fresh.ticket.id), 'done');
-      t.diagnostic('Four scans left the held attempt alone while a new submission reached done');
+      assert.equal(await status(fresh.ticket.id), 'ready');
+      t.diagnostic('Four scans left the held attempt alone while returning the new submission for changes');
 
       const superseded = await submit();
       supersededTicketId = superseded.ticket.id;
@@ -108,7 +108,7 @@ it('recovers an abruptly interrupted review and discards a superseded approval',
       assert.deepEqual(reviews.items, []);
       t.diagnostic('Changing criteria mid-review returned the ticket to ready with no recorded review');
 
-      assert.equal(await status(interrupted.ticket.id), 'done');
+      assert.equal(await status(interrupted.ticket.id), 'ready');
       assert.deepEqual(
         { ...ledgerState(interrupted.submission.id) },
         {
@@ -146,7 +146,7 @@ it('recovers an abruptly interrupted review and discards a superseded approval',
         assert.equal(await status(contested.ticket.id), 'in_review');
         clock += 30_000;
         await scan();
-        assert.equal(await status(contested.ticket.id), 'done');
+        assert.equal(await status(contested.ticket.id), 'ready');
       } finally {
         release.resolve();
         try {
@@ -215,7 +215,7 @@ it('routes a pending independent submission once and retries recording the durab
             assert.equal(input.submission_id, submission.id);
             recorded.push(input);
             if (recorded.length === 1) throw new Error('lost connection before commit');
-            ticket.status = 'done';
+            ticket.status = 'ready';
             return {};
           }
           default:
@@ -231,7 +231,7 @@ it('routes a pending independent submission once and retries recording the durab
         db,
         async review() {
           launches++;
-          return { decision: 'approve', feedback: 'The pinned evidence meets the criterion.' };
+          return { decision: 'request_changes', feedback: 'Add a pinned verification receipt.' };
         },
       });
     await scan();
@@ -253,10 +253,139 @@ it('routes a pending independent submission once and retries recording the durab
     assert.equal(launches, 1);
     assert.equal(recorded.length, 2);
     assert.deepEqual(recorded[0], recorded[1]);
-    assert.equal(ticket.status, 'done');
+    assert.equal(ticket.status, 'ready');
   } finally {
     db.close();
     await rm(ledgerPath);
+    await rmdir(directory);
+  }
+});
+
+it('requires a new decision after reassignment and keeps model approval advisory', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'ticketing-review-reassignment-'));
+  const adapters = createSqliteAdapters(join(directory, 'tickets.sqlite'));
+  const db = openLedger(':memory:');
+  try {
+    await adapters.storage.migrate();
+    const f = await fixture(adapters);
+    for (const actor of [f.other, f.outsider])
+      await f.call(f.admin.id, 'member_set', { actor_id: actor.id, role: 'verifier' });
+    const assign = async (actorId: string) =>
+      f.call(f.admin.id, 'project_update', {
+        expected_revision: (await adapters.storage.get('projects', f.project.id))!.revision,
+        reviewer_actor_id: actorId,
+      });
+    await assign(f.other.id);
+    const first = await f.ticket();
+    const firstClaim = await f.claim(first.id);
+    const submitted = await f.submit(first.id, firstClaim.claim.token);
+    const options = { app: f.app, db, projectId: f.project.id };
+    await scanReviews({
+      ...options,
+      reviewerId: f.other.id,
+      async review() {
+        await assign(f.outsider.id);
+        return { decision: 'request_changes', feedback: 'Former reviewer decision.' };
+      },
+    });
+    const input = {
+      ticket_id: first.id,
+      expected_revision: submitted.ticket.revision,
+      submission_id: submitted.submission.id,
+      automatic: true,
+    };
+    await assert.rejects(
+      f.call(f.other.id, 'ticket_review', { ...input, decision: 'request_changes', feedback: 'Stale.' }),
+      hasCode('FORBIDDEN'),
+    );
+    await assert.rejects(
+      f.call(f.outsider.id, 'ticket_review', { ...input, decision: 'approve', feedback: 'Unsupported.' }),
+      hasCode('FORBIDDEN'),
+    );
+    let checks = 0;
+    const scan = () =>
+      scanReviews({
+        ...options,
+        reviewerId: f.outsider.id,
+        async review() {
+          checks++;
+          return { decision: 'approve', feedback: 'Advisory recommendation.' };
+        },
+      });
+    await scan();
+    await scan();
+    assert.equal(checks, 1);
+    assert.equal((await f.read(first.id)).ticket.status, 'in_review');
+    const saved = db
+      .prepare('SELECT reviewer_id, decision FROM review_dispatch WHERE submission_id=?')
+      .get(submitted.submission.id);
+    assert.equal(saved?.reviewer_id, f.outsider.id);
+    assert.match(String(saved?.decision), /Advisory recommendation/);
+    await f.call(f.reviewer.id, 'ticket_review', {
+      ticket_id: first.id,
+      expected_revision: submitted.ticket.revision,
+      submission_id: submitted.submission.id,
+      decision: 'approve',
+      feedback: 'Independently verified.',
+    });
+    assert.equal((await f.read(first.id)).ticket.status, 'done');
+  } finally {
+    db.close();
+    await Promise.all([adapters.storage.close(), adapters.search.close()]);
+    assert.equal(resolve(dirname(directory)), resolve(tmpdir()));
+    assert.ok(basename(directory).startsWith('ticketing-review-reassignment-'));
+    await rm(directory, { recursive: true });
+  }
+});
+
+it('sends only the bounded evidence packet to the tool-free review model', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'ticketing-review-packet-'));
+  const evidenceRoot = join(directory, 'evidence');
+  const privateFile = join(directory, 'private.txt');
+  const evidenceFile = join(evidenceRoot, 'receipt.txt');
+  try {
+    await mkdir(evidenceRoot);
+    await writeFile(privateFile, 'workspace-only-sentinel');
+    await writeFile(evidenceFile, 'allowed receipt');
+    const result = await modelReview(
+      { workspace: directory, evidenceRoot, apiKey: 'credential-header-sentinel' },
+      {
+        detail: {
+          ticket: { title: 'Fixture', description: 'Review the change.' },
+          criteria: [],
+          blockers: [],
+        },
+        submission: {
+          summary: 'Fixture submission',
+          evidence: [{ references: [privateFile, evidenceFile] }],
+        },
+      },
+      async (url: string, init: RequestInit) => {
+        assert.equal(url, 'https://api.openai.com/v1/responses');
+        assert.equal(new Headers(init.headers).get('authorization'), 'Bearer credential-header-sentinel');
+        const body = JSON.parse(String(init.body));
+        assert.deepEqual(body.tools, []);
+        assert.equal(body.store, false);
+        assert.match(body.input, /allowed receipt/);
+        assert.doesNotMatch(body.input, /workspace-only-sentinel|credential-header-sentinel/);
+        return Response.json({
+          status: 'completed',
+          output: [
+            {
+              type: 'message',
+              content: [
+                { type: 'output_text', text: '{"decision":"approve","feedback":"Fixture recommendation"}' },
+              ],
+            },
+          ],
+        });
+      },
+    );
+    assert.deepEqual(result, { decision: 'approve', feedback: 'Fixture recommendation' });
+  } finally {
+    await rm(evidenceFile, { force: true });
+    await rm(privateFile, { force: true });
+    await rmdir(evidenceRoot);
     await rmdir(directory);
   }
 });
@@ -301,7 +430,7 @@ it('retries launch failures within budget and recovers a current legacy failure'
             if (operation === 'ticket_get') return { ticket };
             if (operation === 'ticket_review') {
               recorded++;
-              ticket.status = 'done';
+              ticket.status = 'ready';
               return {};
             }
             throw new Error(`Unexpected operation ${operation}`);
@@ -314,7 +443,7 @@ it('retries launch failures within budget and recovers a current legacy failure'
         async review() {
           launches++;
           if (failure) throw failure;
-          return { decision: 'approve', feedback: 'The complete receipt meets both criteria.' };
+          return { decision: 'request_changes', feedback: 'Add a complete receipt for both criteria.' };
         },
         report(_event: string, fields: Record<string, unknown>) {
           log.push(fields);

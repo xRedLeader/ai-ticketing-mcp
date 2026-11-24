@@ -2056,9 +2056,13 @@ export class Application {
         'WAKE_PENDING',
         'Exact invocation exit and usage settlement are required.',
       );
+      if (dispatch.state === 'completed' && dispatch.admission_uncertain === false) return true;
       await tx.put('wake_conditions', {
         ...row,
-        active: { ...row.active, dispatch: { ...dispatch, state: 'completed', code: null } },
+        active: {
+          ...row.active,
+          dispatch: { ...dispatch, state: 'completed', code: null, admission_uncertain: false },
+        },
         revision: row.revision + 1,
         updated_at: this.timestamp(),
       });
@@ -4411,6 +4415,15 @@ export class Application {
       }
       case 'ticket_review': {
         this.version(ticket, input.expected_revision);
+        if (input.automatic)
+          ensure(
+            project.policy === 'independent' &&
+              project.reviewer_actor_id === actor.id &&
+              actor.kind === 'agent' &&
+              input.decision === 'request_changes',
+            'FORBIDDEN',
+            'Automatic review requires the current assigned agent and cannot approve submissions.',
+          );
         ensure(ticket.status === 'in_review', 'INVALID_TRANSITION', 'Ticket is not awaiting review.');
         const submission = await tx.get('submissions', input.submission_id);
         ensure(

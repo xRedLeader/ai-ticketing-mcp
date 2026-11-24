@@ -58,7 +58,8 @@ export class ContinuationDispatcher {
       }));
     if (!decision) return { state: 'waiting' as const, code: 'CONDITION_PENDING' };
     const fence = { ticket_id: row.ticket_id, generation: decision.generation, token: decision.token };
-    let budgetSnapshot: string;
+    let admittedToken: string | undefined;
+    let launcherCalled = false;
     const predecessor = (context: ContinuationDispatchContext) => {
       const entry = capacity
         .inspect(input.predecessor.host_id)
@@ -122,10 +123,10 @@ export class ContinuationDispatcher {
                 : 'HOST_CAPACITY',
           };
         }
-        budgetSnapshot = JSON.stringify(capacity.report(input.budget_run_id));
+        admittedToken = admitted.request.execution_token!;
         return {
           state: 'starting',
-          invocation: { host_id: host, queue_id: queue, execution_token: admitted.request.execution_token! },
+          invocation: { host_id: host, queue_id: queue, execution_token: admittedToken },
         };
       },
       (context, invocation) => {
@@ -140,12 +141,21 @@ export class ContinuationDispatcher {
           'CONFLICT',
           'Continuation capacity ownership changed.',
         );
+        const budget = capacity.report(input.budget_run_id);
         ensure(
-          JSON.stringify(capacity.report(input.budget_run_id)) === budgetSnapshot,
+          budget.attempts.some(
+            (attempt) =>
+              attempt.attempt_id === invocation.queue_id &&
+              attempt.actor_id === context.actor_id &&
+              attempt.ticket_id === context.ticket_id &&
+              attempt.requirements_revision === context.requirements_revision &&
+              !attempt.settlement,
+          ) && !budget.reasons.some((reason) => /^(?:overrun|unknown|overdue):/.test(reason)),
           'BUDGET_CHANGED',
-          'Budget changed after continuation admission.',
+          'Continuation reservation is no longer eligible to launch.',
         );
         capacity.heartbeat(entry.lease);
+        launcherCalled = true;
         return this.options.launch(context, invocation);
       },
       (context) => {
@@ -178,6 +188,33 @@ export class ContinuationDispatcher {
         return { host_id: host, queue_id: queue, execution_token: previous.execution_token };
       },
     );
+    const invocation = dispatch.invocation;
+    if (dispatch.state === 'needs_attention' && invocation?.host_id === host) {
+      const entry = capacity.inspect(host).entries.find((entry) => entry.queue_id === invocation.queue_id);
+      const source = 'continuation-dispatch-before-launch';
+      const proof = entry?.observation;
+      if (proof?.source === source && proof.state === 'never_started') {
+        await this.reconcile(fence, proof);
+        return { ...dispatch, state: 'completed' as const, admission_uncertain: false, fence };
+      }
+      if (invocation.execution_token === admittedToken && !launcherCalled) {
+        await this.reconcile(fence, {
+          source,
+          execution_token: invocation.execution_token,
+          observed_at: Date.now(),
+          state: 'never_started',
+          settlement: {
+            outcome: 'cancelled',
+            runtime_ms: 0,
+            usage_source: source,
+            usage: { input_tokens: 0, output_tokens: 0 },
+            cost_usd_micros: 0,
+            cost_source: source,
+          },
+        });
+        return { ...dispatch, state: 'completed' as const, admission_uncertain: false, fence };
+      }
+    }
     if (
       dispatch.state === 'needs_attention' &&
       !dispatch.invocation &&
