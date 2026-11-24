@@ -7,6 +7,7 @@ import { serializeSuccessEnvelope } from '../src/envelope.js';
 import { createHttpServer } from '../src/http.js';
 import { parseMcpProfile, profileOperations, type McpProfile } from '../src/profiles.js';
 import { schemas } from '../src/schemas.js';
+import { countReferenceTokens } from '../src/tokens.js';
 
 const shared = [
   'project_list',
@@ -107,10 +108,17 @@ it('serves profile-specific HTTP catalogs and prompts without changing scope aut
       try {
         const suffix = profile === 'worker' ? '' : `?profile=${profile}`;
         await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp${suffix}`)));
-        assert.deepEqual(
-          (await client.listTools()).tools.map((tool) => tool.name).sort(),
-          expected[profile].sort(),
-        );
+        const { tools } = await client.listTools();
+        assert.deepEqual(tools.map((tool) => tool.name).sort(), expected[profile].sort());
+        if (profile === 'worker')
+          assert.ok(
+            countReferenceTokens(
+              JSON.stringify(
+                tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+              ),
+            ) <= 5000,
+            'Worker input catalog exceeds the protocol budget.',
+          );
         assert.deepEqual(
           (await client.listPrompts()).prompts.map((prompt) => prompt.name).sort(),
           prompts[profile].sort(),

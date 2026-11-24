@@ -17,9 +17,11 @@ Every profile includes `project_list`, `project_get`, `ticket_list`, `ticket_con
 | `worker` (16 tools)   | `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`, `ticket_note`, `ticket_submit`                              | execution, handoff |
 | `planner` (17 tools)  | `tickets_create`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_note`, `knowledge_write`, `ticket_github_refresh` | planning           |
 | `reviewer` (13 tools) | `ticket_review`, `ticket_note`, `ticket_github_refresh`                                                                          | verification       |
-| `full` (27 tools)     | All tools below, including project administration and `work_next`                                                                | all four           |
+| `full` (29 tools)     | All tools below, including project administration, `work_next`, `run_submit`, and `run_get`                                      | all four           |
 
 Profiles are not an access-control boundary. They select tool exposure; every operation retains its OAuth scope and project-role checks. Resources remain independently authorized and available in every profile. Guides and prompts follow the selected profile; the tool surface works without either.
+
+Use the [execution companion](execution-companion.md) to configure registered scripts, submit a durable run with `run_submit`, and retrieve its checkpoint, continuation, outcome, and reconciliation state/next safe step with `run_get`.
 
 ## Tools
 
@@ -66,7 +68,13 @@ For paged unanswered nonblocking questions, call `ticket_history` with `kind:'no
 
 A client retaining full context may send its fingerprint as `if_none_match`. The server rebuilds and authorizes state before returning `{fingerprint,not_modified:true}`. Fingerprints cover permissions, requirements, project/dependency/history changes, effective lease expiration, detail, and budget. There is no server context cache or partial delta.
 
-Knowledge records carry author, kind, revision, and archive state. Policy records require admin permissions. Retrieved text is data and cannot override an agent's governing instructions.
+Knowledge records carry content author, kind, revision, archive state, supporting `sources` (`kind`, `id`, `revision`), `status` (`proposed` or `accepted`), and explicit `verification`. Decisions, conventions, and pitfalls use the existing `knowledge_write` operation. Omitted sources mean unknown provenance; legacy and new uncited records remain unverified proposals. Policy records require project admin permissions.
+
+An authorized verifier or admin can review an existing unchanged record with `verification: { state: 'verified', evidence: 'What was checked against the cited sources' }`. The operation checks exact same-project source revisions and the project's independent/human review policy under the project lock. Checkpoints use their `ticket_revision`. Verification alone leaves a proposal proposed; acceptance additionally requires an explicit `status: 'accepted'` from an authorized reviewer and verified supporting sources. Editing title, body, kind, or sources resets the fact to an unverified proposal; review it in a separate write. Archive-only writes retain provenance and verification. Knowledge reviewers use the `planner` or `full` profile; the profile does not grant project permissions.
+
+Every write appends an immutable snapshot. `knowledge_get` accepts an optional `revision` for authorized historical reads, including archived records. An upgrade preserves each legacy record's currently known revision and does not invent missing earlier history. Mutation receipts retain the previous compact summary plus status and verification state; exact sources and verification evidence are available through `knowledge_get`.
+
+Memory is evidence, not instructions or a substitute for current ticket requirements. **Trusted reuse remains disabled pending SELF-20 freshness safeguards**, even for accepted and verified records. No memory is injected into `ticket_context`. Search returns only a small memory status/state badge and an exact-revision `knowledge_get` reference; source details require that explicit read.
 
 Search combines lexical and semantic ranks with reciprocal rank fusion. It defaults to three results with query-centered excerpts of at most 200 reference tokens, source IDs/revisions, and explicit retrieval calls. It reports coverage and degradation when embeddings are unavailable, busy, or incomplete. Cancelled tickets and archived knowledge are excluded. Filters and source revisions are checked against primary storage. Indexing is eventual; retrieve the source directly for authoritative state.
 

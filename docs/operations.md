@@ -6,6 +6,8 @@
 
 Do not run automatic migrations from every HTTP process. Compose runs an explicit migration job before application and worker startup. For another backend, use its adapter-owned migration operation.
 
+The durable execution stack requires a controlled migration and restart/reconnect of all runtimes and companions; see [execution recovery upgrades](execution-companion.md#controlled-upgrade). Migration identity is the full filename: preserve both accepted project-memory/execution filenames and main's independent review-fixes filenames even when numeric prefixes coincide. Backups and restore verification include runs, continuations, controller ownership, immutable attempts and observations.
+
 ## SQLite local operation
 
 Select `STORAGE_ADAPTER=sqlite` and `SQLITE_PATH` for the persistent file, or use the CLI's `--sqlite PATH` convenience flag. SQLite stdio bootstraps its schema automatically. `EMBEDDING_PROVIDER=none` avoids external inference; SQLite search always uses FTS5 and explicitly reports full-text-only capability. SQLite stdio drains its durable indexing queue with one in-flight background indexOnce call and awaits it during shutdown; no separate worker is needed. PostgreSQL and HTTP deployments keep the existing worker command.
@@ -141,7 +143,7 @@ docker compose cp .local/ticketing.dump db:/tmp/ticketing-restore.dump
 docker compose exec -T db pg_restore -U ticketing_owner -d ticketing_restore --no-owner --no-privileges /tmp/ticketing-restore.dump
 ```
 
-Recreate least-privilege runtime grants for the restored database before connecting the application. Check ticket, criterion, submission, review, knowledge, and event counts; run application reads against it before any cutover. Back up the Keycloak database separately, along with encrypted operator configuration and the identities' issuer URL. Search indexes are reconstructible, but audit history, receipts, and primary records are not.
+Recreate least-privilege runtime grants for the restored database before connecting the application. Check ticket, criterion, submission, review, knowledge, immutable knowledge revision, and event counts; run application reads against it before any cutover. Back up the Keycloak database separately, along with encrypted operator configuration and the identities' issuer URL. Search indexes are reconstructible, but audit history, receipts, and primary records are not.
 
 Use `scripts/verify-restore.ts` to compare a source and restored database with `SOURCE_DATABASE_URL` and `RESTORE_DATABASE_URL`; it performs read-only checks. Retention and restoration scheduling belong to the operator. No destructive restore or automatic deletion command is exposed over MCP.
 

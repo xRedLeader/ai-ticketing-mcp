@@ -24,6 +24,16 @@ import {
   type GitHubCIStatus,
   type WebhookTarget,
   type SchedulingPolicy,
+  type ExecutionRecipeRegistration,
+  type ExecutionJob,
+  type ExecutionOutcome,
+  type ExecutionController,
+  type ExecutionControllerFence,
+  type ExecutionAttempt,
+  type ExecutionObservation,
+  type ExecutionProcessIdentity,
+  type ExecutionReconciliation,
+  type Continuation,
   validateGitHubConfiguration,
 } from './contracts.js';
 import { resultSchemas, githubEvidenceSchema } from './result-schemas.js';
@@ -40,6 +50,7 @@ export interface ApplicationOptions {
   referenceTokenMetrics?: boolean;
   github?: GitHubConfiguration & { provider: GitHubProvider };
   webhook?: WebhookTarget;
+  executionRecipes?: readonly ExecutionRecipeRegistration[];
 }
 const LEASE_MS = 600_000;
 const webhookEvents = new Set([
@@ -77,6 +88,7 @@ export class Application {
   private referenceTokenMetrics: boolean;
   private readonly github?: GitHubConfiguration & { provider: GitHubProvider };
   private readonly webhook?: WebhookTarget;
+  private readonly executionRecipes = new Map<string, ExecutionRecipeRegistration>();
   readonly metrics = {
     requests: 0,
     errors: 0,
@@ -89,6 +101,21 @@ export class Application {
     token_accounting_failures: 0,
   };
   constructor(options: ApplicationOptions) {
+    for (const recipe of options.executionRecipes ?? []) {
+      ensure(
+        /^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$/.test(recipe.id) &&
+          /^[a-f0-9]{64}$/.test(recipe.fingerprint) &&
+          recipe.project_ids.length > 0 &&
+          recipe.project_ids.every((id) => uuid.test(id)) &&
+          !this.executionRecipes.has(recipe.id),
+        'INVALID_CONFIG',
+        'Configure distinct execution recipes with a fingerprint and authorized projects.',
+      );
+      this.executionRecipes.set(
+        recipe.id,
+        Object.freeze({ ...recipe, project_ids: Object.freeze([...recipe.project_ids]) }),
+      );
+    }
     this.storage = options.storage;
     this.searchAdapter = options.search;
     this.embeddings = options.embeddings
@@ -649,6 +676,656 @@ export class Application {
     );
     return claim;
   }
+  private executionRecipe(projectId: string, recipeId: string) {
+    const recipe = this.executionRecipes.get(recipeId);
+    ensure(
+      recipe && recipe.project_ids.includes(projectId),
+      'RECIPE_NOT_AUTHORIZED',
+      'Recipe is not registered for this project.',
+    );
+    return recipe;
+  }
+  private async executionAuthority(reader: Reader, run: ExecutionJob) {
+    const ticket = await reader.get('tickets', run.ticket_id);
+    const claim = await reader.get('claims', run.ticket_id);
+    const member = await reader.get('members', `${run.project_id}:${run.actor_id}`);
+    const actor = await reader.get('actors', run.actor_id);
+    if (!(
+      ticket &&
+      ticket.project_id === run.project_id &&
+      ticket.status === 'in_progress' &&
+      ticket.requirements_revision === run.requirements_revision &&
+      claim?.project_id === run.project_id &&
+      claim.token === run.claim_token &&
+      claim.expires_at > this.timestamp() &&
+      claim.actor_id === run.actor_id &&
+      (!ticket.assignee_id || ticket.assignee_id === run.actor_id) &&
+      (actor?.system_admin || (member && ['contributor', 'admin'].includes(member.role)))
+    ))
+      return false;
+    try {
+      return !(await this.blockers(reader, ticket)).length;
+    } catch (error) {
+      if (error instanceof DomainError && error.code === 'GRAPH_LIMIT') return false;
+      throw error;
+    }
+  }
+  private async executionTransaction<T>(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    work: (tx: Transaction, run: ExecutionJob) => Promise<T>,
+  ) {
+    ensure(uuid.test(projectId) && uuid.test(runId), 'INVALID_INPUT', 'Execution identifiers must be UUIDs.');
+    ensure(
+      this.storage.executionRuns,
+      'UNSUPPORTED_EXECUTION_RUNS',
+      'Storage does not support durable execution runs.',
+    );
+    return this.storage.transaction(projectId, async (tx) => {
+      await this.access(tx, await this.actor(actorId, tx), projectId, ['admin']);
+      const run = await tx.get('execution_jobs', runId);
+      ensure(run?.project_id === projectId, 'NOT_FOUND', 'Execution run not found.');
+      ensure(
+        tx.compareExecutionRun,
+        'UNSUPPORTED_EXECUTION_RUNS',
+        'Storage does not support execution ownership fencing.',
+      );
+      return work(tx, run);
+    });
+  }
+  private executionLease(leaseMs: number) {
+    ensure(
+      Number.isSafeInteger(leaseMs) && leaseMs >= 1000 && leaseMs <= 3_600_000,
+      'INVALID_INPUT',
+      'Execution lease must be 1000–3600000 milliseconds.',
+    );
+    return new Date(this.now().getTime() + leaseMs).toISOString();
+  }
+  /** Trusted companion API; these methods are deliberately absent from the MCP catalog. */
+  async acquireExecutionController(
+    actorId: string,
+    projectId: string,
+    ownerId: string,
+    leaseMs: number,
+  ): Promise<ExecutionController | null> {
+    const expiresAt = this.executionLease(leaseMs);
+    ensure(
+      typeof ownerId === 'string' && ownerId.length > 0 && ownerId.length <= 200,
+      'INVALID_INPUT',
+      'Controller owner must be bounded.',
+    );
+    return this.storage.transaction('execution-controller', async (tx) => {
+      await this.access(tx, await this.actor(actorId, tx), projectId, ['admin']);
+      ensure(
+        tx.lockExecutionController,
+        'UNSUPPORTED_EXECUTION_RUNS',
+        'Storage does not support controller fencing.',
+      );
+      const previous = await tx.lockExecutionController();
+      if (previous && previous.expires_at > this.timestamp()) return null;
+      const next: ExecutionController = {
+        id: 'execution',
+        owner_id: ownerId,
+        token: randomUUID(),
+        generation: (previous?.generation ?? 0) + 1,
+        expires_at: expiresAt,
+      };
+      ensure(
+        Number.isSafeInteger(next.generation) && next.generation <= 2147483647,
+        'CONFLICT',
+        'Controller generation exhausted.',
+      );
+      await tx.put('execution_controllers', next);
+      return next;
+    });
+  }
+  async heartbeatExecutionController(
+    actorId: string,
+    projectId: string,
+    controller: ExecutionControllerFence,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const expiresAt = this.executionLease(leaseMs);
+    return this.storage.transaction('execution-controller', async (tx) => {
+      await this.access(tx, await this.actor(actorId, tx), projectId, ['admin']);
+      if (!(await this.currentExecutionController(tx, controller))) return false;
+      const current = (await tx.get('execution_controllers', 'execution'))!;
+      await tx.put('execution_controllers', { ...current, expires_at: expiresAt });
+      return true;
+    });
+  }
+  async releaseExecutionController(
+    actorId: string,
+    projectId: string,
+    controller: ExecutionControllerFence,
+  ): Promise<void> {
+    await this.storage.transaction('execution-controller', async (tx) => {
+      await this.access(tx, await this.actor(actorId, tx), projectId, ['admin']);
+      if (!(await this.currentExecutionController(tx, controller))) return;
+      const current = (await tx.get('execution_controllers', 'execution'))!;
+      await tx.put('execution_controllers', { ...current, expires_at: this.timestamp() });
+    });
+  }
+  private async currentExecutionController(tx: Transaction, controller?: ExecutionControllerFence) {
+    ensure(
+      tx.lockExecutionController,
+      'UNSUPPORTED_EXECUTION_RUNS',
+      'Storage does not support controller fencing.',
+    );
+    const current = await tx.lockExecutionController();
+    ensure(current, 'INVALID_REFERENCE', 'Execution controller singleton is missing.');
+    // The permanently locked singleton serializes legacy calls with the first acquisition too.
+    if (current.owner_id === 'unclaimed' && current.generation === 1) return !controller;
+    return (
+      !!controller &&
+      current.token === controller.token &&
+      current.generation === controller.generation &&
+      current.expires_at > this.timestamp()
+    );
+  }
+  private async executionClaimCurrent(reader: Reader, run: ExecutionJob) {
+    const claim = await reader.get('claims', run.ticket_id);
+    return (
+      claim?.token === run.claim_token &&
+      claim.actor_id === run.actor_id &&
+      claim.expires_at > this.timestamp()
+    );
+  }
+  private async executionAttempt(reader: Reader, runId: string) {
+    return (await reader.find('execution_attempts', { where: { run_id: runId }, limit: 1 }))[0] ?? null;
+  }
+  private async latestExecutionObservation(reader: Reader, attempt: ExecutionAttempt) {
+    return (
+      (
+        await reader.find('execution_observations', {
+          where: { attempt_id: attempt.id },
+          order: [{ field: 'sequence', direction: 'desc' }],
+          limit: 1,
+        })
+      )[0] ?? null
+    );
+  }
+  private async observeExecution(
+    tx: Transaction,
+    run: ExecutionJob,
+    attempt: ExecutionAttempt,
+    controller: ExecutionControllerFence | undefined,
+    kind: ExecutionObservation['kind'],
+    nextStep: ExecutionObservation['next_step'],
+    identity?: ExecutionProcessIdentity | null,
+    outcome: ExecutionOutcome | null = null,
+  ) {
+    const previous = await this.latestExecutionObservation(tx, attempt);
+    const observation: ExecutionObservation = {
+      id: randomUUID(),
+      project_id: run.project_id,
+      run_id: run.id,
+      attempt_id: attempt.id,
+      sequence: (previous?.sequence ?? 0) + 1,
+      controller_generation: controller?.generation ?? 0,
+      kind,
+      next_step: nextStep,
+      process_identity: identity === undefined ? (previous?.process_identity ?? null) : identity,
+      outcome,
+      created_at: this.timestamp(),
+    };
+    await tx.put('execution_observations', observation);
+    return observation;
+  }
+  private async executionReconciliation(reader: Reader, run: ExecutionJob): Promise<ExecutionReconciliation> {
+    const attempt = await this.executionAttempt(reader, run.id);
+    const observation = attempt ? await this.latestExecutionObservation(reader, attempt) : null;
+    const completed = ['succeeded', 'failed'].includes(run.status);
+    const state = completed
+      ? 'completed'
+      : run.status === 'queued'
+        ? 'queued'
+        : observation?.kind === 'running'
+          ? 'running'
+          : 'unresolved';
+    return {
+      run,
+      attempt,
+      observation,
+      state,
+      next_step: completed
+        ? 'none'
+        : (observation?.next_step ?? (run.status === 'queued' ? 'dispatch' : 'inspect_launch')),
+    };
+  }
+  async listExecutionReconciliations(
+    actorId: string,
+    projectId: string,
+    runIds?: string[],
+    afterId?: string,
+  ): Promise<ExecutionReconciliation[]> {
+    ensure(
+      !runIds || (runIds.length <= 100 && runIds.every((id) => uuid.test(id))),
+      'INVALID_INPUT',
+      'Provide at most 100 run identifiers.',
+    );
+    ensure(!afterId || (!runIds && uuid.test(afterId)), 'INVALID_INPUT', 'Invalid recovery cursor.');
+    return this.storage.readSnapshot(async (reader) => {
+      await this.access(reader, await this.actor(actorId, reader), projectId, ['admin']);
+      const runs = await reader.find('execution_jobs', {
+        where: {
+          project_id: projectId,
+          ...(runIds
+            ? { id: { in: runIds } }
+            : {
+                status: { in: ['reserved', 'running'] as ExecutionJob['status'][] },
+                ...(afterId ? { id: { gt: afterId } } : {}),
+              }),
+        },
+        order: [{ field: 'id', direction: 'asc' }],
+        limit: 100,
+      });
+      const states: ExecutionReconciliation[] = [];
+      for (const run of runs) states.push(await this.executionReconciliation(reader, run));
+      return states;
+    });
+  }
+  /** Transfer observation rights only. An adopted attempt is never dispatched again. */
+  async adoptExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    controller: ExecutionControllerFence,
+    leaseMs: number,
+  ): Promise<ExecutionReconciliation | null> {
+    const lockedUntil = this.executionLease(leaseMs);
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (
+        !(await this.currentExecutionController(tx, controller)) ||
+        !['reserved', 'running'].includes(run.status)
+      )
+        return null;
+      let attempt = await this.executionAttempt(tx, run.id);
+      if (!attempt) {
+        attempt = {
+          id: randomUUID(),
+          project_id: projectId,
+          run_id: runId,
+          previous_attempt_id: null,
+          ordinal: 1,
+          process_token: randomUUID(),
+          created_at: this.timestamp(),
+        };
+        await tx.put('execution_attempts', attempt);
+      }
+      const previous = await this.latestExecutionObservation(tx, attempt);
+      const next = { ...run, reservation_token: randomUUID(), locked_until: lockedUntil };
+      if (!(await tx.compareExecutionRun!(run, next))) return null;
+      if (!previous)
+        await this.observeExecution(tx, next, attempt, controller, 'unresolved', 'inspect_launch');
+      return this.executionReconciliation(tx, next);
+    });
+  }
+  async observeExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    token: string,
+    attemptId: string,
+    processToken: string,
+    controller: ExecutionControllerFence,
+    identity: ExecutionProcessIdentity | null,
+    state: 'running' | 'unresolved',
+  ): Promise<boolean> {
+    ensure(
+      identity === null ||
+        (Number.isSafeInteger(identity.pid) &&
+          identity.pid > 0 &&
+          typeof identity.start_marker === 'string' &&
+          identity.start_marker.length > 0 &&
+          identity.start_marker.length <= 200),
+      'INVALID_INPUT',
+      'Provide a bounded process identity.',
+    );
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (
+        !(await this.currentExecutionController(tx, controller)) ||
+        run.reservation_token !== token ||
+        !run.locked_until ||
+        run.locked_until <= this.timestamp() ||
+        !['reserved', 'running'].includes(run.status)
+      )
+        return false;
+      const attempt = await this.executionAttempt(tx, runId);
+      if (
+        !attempt ||
+        attempt.id !== attemptId ||
+        attempt.process_token !== processToken ||
+        (state === 'running' && !(await this.executionClaimCurrent(tx, run)))
+      )
+        return false;
+      const previous = await this.latestExecutionObservation(tx, attempt);
+      if (previous?.kind === state && digest(previous.process_identity) === digest(identity)) return true;
+      await this.observeExecution(
+        tx,
+        run,
+        attempt,
+        controller,
+        state,
+        state === 'running' ? 'wait_for_result' : 'inspect_side_effects',
+        identity,
+      );
+      return true;
+    });
+  }
+  async recoverExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    token: string,
+    attemptId: string,
+    processToken: string,
+    outcome: ExecutionOutcome,
+    controller: ExecutionControllerFence,
+  ): Promise<boolean> {
+    // Attempt credentials are immutable; the rotating reservation and controller fence authorize replay.
+    const attempt = await this.storage.get('execution_attempts', attemptId);
+    if (
+      !attempt ||
+      attempt.run_id !== runId ||
+      attempt.project_id !== projectId ||
+      attempt.process_token !== processToken
+    )
+      return false;
+    return this.settleExecutionRun(actorId, projectId, runId, token, outcome, controller, true);
+  }
+  async listExecutionRuns(actorId: string, projectId: string): Promise<ExecutionJob[]> {
+    ensure(uuid.test(projectId), 'INVALID_INPUT', 'Project identifier must be a UUID.');
+    ensure(
+      this.storage.executionRuns,
+      'UNSUPPORTED_EXECUTION_RUNS',
+      'Storage does not support durable execution runs.',
+    );
+    return this.storage.readSnapshot(async (reader) => {
+      await this.access(reader, await this.actor(actorId, reader), projectId, ['admin']);
+      const eligible: ExecutionJob[] = [];
+      for (let offset = 0; eligible.length < 100; offset += 100) {
+        const page = await reader.find('execution_jobs', {
+          where: { project_id: projectId, status: 'queued' },
+          order: [
+            { field: 'created_at', direction: 'asc' },
+            { field: 'id', direction: 'asc' },
+          ],
+          limit: 100,
+          offset,
+        });
+        for (const run of page)
+          if (await this.executionAuthority(reader, run)) {
+            eligible.push(run);
+            if (eligible.length === 100) break;
+          }
+        if (page.length < 100) break;
+      }
+      return eligible;
+    });
+  }
+  async reserveExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    leaseMs: number,
+    controller?: ExecutionControllerFence,
+  ): Promise<ExecutionJob | null> {
+    const lockedUntil = this.executionLease(leaseMs);
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (
+        !(await this.currentExecutionController(tx, controller)) ||
+        run.status !== 'queued' ||
+        !(await this.executionAuthority(tx, run))
+      )
+        return null;
+      const next: ExecutionJob = {
+        ...run,
+        status: 'reserved',
+        reservation_token: randomUUID(),
+        locked_until: lockedUntil,
+      };
+      if (!(await tx.compareExecutionRun!(run, next))) return null;
+      const attempt: ExecutionAttempt = {
+        id: randomUUID(),
+        project_id: projectId,
+        run_id: runId,
+        previous_attempt_id: null,
+        ordinal: 1,
+        process_token: randomUUID(),
+        created_at: this.timestamp(),
+      };
+      await tx.put('execution_attempts', attempt);
+      await this.observeExecution(tx, next, attempt, controller, 'reserved', 'dispatch');
+      return next;
+    });
+  }
+  async startExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    token: string,
+    leaseMs: number,
+    controller?: ExecutionControllerFence,
+  ): Promise<ExecutionJob | null> {
+    const lockedUntil = this.executionLease(leaseMs);
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (
+        !(await this.currentExecutionController(tx, controller)) ||
+        run.status !== 'reserved' ||
+        run.reservation_token !== token ||
+        !run.locked_until ||
+        run.locked_until <= this.timestamp() ||
+        !(await this.executionAuthority(tx, run))
+      )
+        return null;
+      const recipe = this.executionRecipes.get(run.recipe_id);
+      if (!recipe?.project_ids.includes(projectId) || recipe.fingerprint !== run.recipe_fingerprint)
+        return null;
+      const next: ExecutionJob = {
+        ...run,
+        status: 'running',
+        started_at: this.timestamp(),
+        locked_until: lockedUntil,
+      };
+      if (!(await tx.compareExecutionRun!(run, next))) return null;
+      const attempt = await this.executionAttempt(tx, runId);
+      if (attempt)
+        await this.observeExecution(tx, next, attempt, controller, 'dispatching', 'inspect_launch');
+      return next;
+    });
+  }
+  /** Capacity identity creation must serialize with adoption and its never-started proof. */
+  async admitExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    token: string,
+    controller: ExecutionControllerFence,
+    admit: () => undefined,
+  ): Promise<boolean> {
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (
+        !(await this.currentExecutionController(tx, controller)) ||
+        run.status !== 'reserved' ||
+        run.reservation_token !== token ||
+        !run.locked_until ||
+        !(await this.executionAuthority(tx, run))
+      )
+        return false;
+      const current = (await tx.get('execution_controllers', 'execution'))!;
+      const claim = await tx.get('claims', run.ticket_id);
+      const now = this.timestamp();
+      if (current.expires_at <= now || run.locked_until <= now || !claim || claim.expires_at <= now)
+        return false;
+      admit();
+      return true;
+    });
+  }
+  /** Native spawn must be synchronous here: takeover waits until the launch boundary has passed. */
+  async dispatchExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    token: string,
+    attemptId: string,
+    processToken: string,
+    fingerprint: string,
+    controller: ExecutionControllerFence,
+    dispatch: () => undefined,
+  ): Promise<boolean> {
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (
+        !(await this.currentExecutionController(tx, controller)) ||
+        run.status !== 'running' ||
+        run.reservation_token !== token ||
+        !run.locked_until ||
+        run.locked_until <= this.timestamp() ||
+        run.recipe_fingerprint !== fingerprint ||
+        !(await this.executionAuthority(tx, run))
+      )
+        return false;
+      const attempt = await this.executionAttempt(tx, runId);
+      if (!attempt || attempt.id !== attemptId || attempt.process_token !== processToken) return false;
+      const observation = await this.latestExecutionObservation(tx, attempt);
+      if (observation?.kind !== 'dispatching' || observation.controller_generation !== controller.generation)
+        return false;
+      const current = (await tx.get('execution_controllers', 'execution'))!;
+      const claim = await tx.get('claims', run.ticket_id);
+      const now = this.timestamp();
+      if (current.expires_at <= now || run.locked_until <= now || !claim || claim.expires_at <= now)
+        return false;
+      dispatch();
+      return true;
+    });
+  }
+  async heartbeatExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    token: string,
+    leaseMs: number,
+    controller?: ExecutionControllerFence,
+  ): Promise<boolean> {
+    const lockedUntil = this.executionLease(leaseMs);
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (
+        !(await this.currentExecutionController(tx, controller)) ||
+        (controller && !(await this.executionClaimCurrent(tx, run))) ||
+        !['reserved', 'running'].includes(run.status) ||
+        run.reservation_token !== token ||
+        !run.locked_until ||
+        run.locked_until <= this.timestamp()
+      )
+        return false;
+      return tx.compareExecutionRun!(run, { ...run, locked_until: lockedUntil });
+    });
+  }
+  async settleExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+    token: string,
+    outcome: ExecutionOutcome,
+    controller?: ExecutionControllerFence,
+    recovery = false,
+  ): Promise<boolean> {
+    ensure(
+      (outcome.exit_code === null ||
+        (Number.isSafeInteger(outcome.exit_code) &&
+          outcome.exit_code >= -2147483648 &&
+          outcome.exit_code <= 4294967295)) &&
+        (outcome.signal === null ||
+          (typeof outcome.signal === 'string' && outcome.signal.length > 0 && outcome.signal.length <= 80)) &&
+        Array.isArray(outcome.artifacts) &&
+        outcome.artifacts.length <= 50 &&
+        outcome.artifacts.every((ref) => typeof ref === 'string' && ref.length > 0 && ref.length <= 2000) &&
+        (outcome.error_code === null ||
+          (typeof outcome.error_code === 'string' && /^[A-Z0-9_]{1,80}$/.test(outcome.error_code))) &&
+        (outcome.exit_code !== null || outcome.signal !== null || outcome.error_code !== null),
+      'INVALID_INPUT',
+      'Provide a bounded authoritative execution outcome.',
+    );
+    const result: ExecutionOutcome = {
+      exit_code: outcome.exit_code,
+      signal: outcome.signal,
+      artifacts: [...outcome.artifacts],
+      error_code: outcome.error_code,
+    };
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (
+        !(await this.currentExecutionController(tx, controller)) ||
+        run.reservation_token !== token ||
+        (!recovery && controller && !(await this.executionClaimCurrent(tx, run)))
+      )
+        return false;
+      if (['succeeded', 'failed'].includes(run.status))
+        return (
+          digest({
+            exit_code: run.exit_code,
+            signal: run.signal,
+            artifacts: run.artifacts,
+            error_code: run.error_code,
+          }) === digest(result)
+        );
+      if (
+        !['reserved', 'running'].includes(run.status) ||
+        !run.locked_until ||
+        run.locked_until <= this.timestamp() ||
+        (run.status === 'reserved' &&
+          (result.exit_code !== null || result.signal !== null || !result.error_code))
+      )
+        return false;
+      if (result.error_code === 'RECOVERED_NOT_DISPATCHED') {
+        const attempt = await this.executionAttempt(tx, runId);
+        const observation = attempt ? await this.latestExecutionObservation(tx, attempt) : null;
+        if (
+          !recovery ||
+          run.status !== 'reserved' ||
+          observation?.next_step !== 'dispatch' ||
+          result.exit_code !== null ||
+          result.signal !== null ||
+          result.artifacts.length !== 0
+        )
+          return false;
+      }
+      const finishedAt = this.timestamp();
+      const next: ExecutionJob = {
+        ...run,
+        ...result,
+        status: result.exit_code === 0 && !result.signal && !result.error_code ? 'succeeded' : 'failed',
+        finished_at: finishedAt,
+      };
+      if (!(await tx.compareExecutionRun!(run, next))) return false;
+      const attempt = await this.executionAttempt(tx, runId);
+      if (attempt)
+        await this.observeExecution(tx, next, attempt, controller, 'completed', 'none', undefined, result);
+      const continuation = await tx.get('continuations', run.continuation_id);
+      ensure(
+        continuation?.project_id === projectId && continuation.run_id === run.id,
+        'INVALID_REFERENCE',
+        'Execution continuation is missing.',
+      );
+      const current = await this.executionAuthority(tx, run);
+      const satisfied =
+        current &&
+        !result.error_code &&
+        !result.signal &&
+        result.exit_code === continuation.completion_condition.exit_code;
+      await tx.put('continuations', {
+        ...continuation,
+        status: satisfied ? 'satisfied' : 'failed',
+        failure_reason: satisfied
+          ? null
+          : current
+            ? (result.error_code ?? 'EXIT_CONDITION_FAILED')
+            : 'STALE_AUTHORITY',
+        settled_at: finishedAt,
+      });
+      return true;
+    });
+  }
   private async childrenDone(tx: Reader, ticket: Ticket) {
     const children = await tx.find('tickets', {
       where: { project_id: ticket.project_id, parent_id: ticket.id },
@@ -713,7 +1390,12 @@ export class Application {
   private async checkParent(reader: Reader, ticket: Ticket, parentId: string | null) {
     if (parentId) await this.checkCycle(reader, ticket.project_id, parentId, ticket.id);
   }
-  private async canReview(reader: Reader, actor: Actor, project: Project, submission: Submission) {
+  private async canReview(
+    reader: Reader,
+    actor: Actor,
+    project: Project,
+    submission: Pick<Submission, 'actor_id'>,
+  ) {
     await this.access(reader, actor, project.id, ['verifier', 'admin']);
     ensure(
       project.policy === 'self' || submission.actor_id !== actor.id,
@@ -751,7 +1433,7 @@ export class Application {
     const roles: Role[] = ['contributor', 'admin'];
     if (['project_update', 'member_set'].includes(operation)) roles.splice(0, roles.length, 'admin');
     if (operation === 'ticket_review') roles.splice(0, roles.length, 'verifier', 'admin');
-    if (operation === 'ticket_note') roles.push('verifier');
+    if (operation === 'ticket_note' || operation === 'knowledge_write') roles.push('verifier');
     return this.scoped(actorId, operation, input, roles, async (tx, project, actor) => {
       switch (operation) {
         case 'project_create': {
@@ -880,24 +1562,105 @@ export class Application {
           }
           if (input.kind === 'policy' || previous?.kind === 'policy')
             await this.access(tx, actor, project.id, ['admin']);
+          const sources: Knowledge['sources'] = input.sources ?? previous?.sources ?? [];
+          const changed =
+            !previous ||
+            digest([input.title, input.body, input.kind, sources]) !==
+              digest([previous.title, previous.body, previous.kind, previous.sources]);
+          if (changed || input.archived !== previous?.archived)
+            await this.access(tx, actor, project.id, ['contributor', 'admin']);
+          let verification: Knowledge['verification'] = changed
+            ? { state: 'unverified' }
+            : previous!.verification;
+          const status: Knowledge['status'] =
+            input.status ??
+            (changed || input.verification?.state === 'unverified' ? 'proposed' : previous!.status);
+          if (
+            input.sources !== undefined ||
+            input.verification?.state === 'verified' ||
+            input.status === 'accepted'
+          ) {
+            for (const source of sources) {
+              const current = await this.sourceDocument(tx, source.kind, source.id);
+              ensure(
+                current && current.project_id === project.id,
+                'INVALID_REFERENCE',
+                'Knowledge sources must belong to this project.',
+              );
+              ensure(
+                current.revision === source.revision,
+                'VERSION_CONFLICT',
+                'A knowledge source revision changed. Read the current source before citing or verifying it.',
+              );
+              if (input.verification?.state === 'verified' || input.status === 'accepted') {
+                const parent =
+                  current.kind === 'checkpoint' && current.ticket_id
+                    ? await tx.get('tickets', current.ticket_id)
+                    : undefined;
+                ensure(
+                  !current.archived && parent?.status !== 'cancelled',
+                  'INVALID_REFERENCE',
+                  'Archived sources cannot be verified as current evidence.',
+                );
+              }
+            }
+          }
+          if (input.verification?.state === 'verified') {
+            ensure(
+              previous && !changed,
+              'INVALID_INPUT',
+              'Review an existing unchanged proposal before verifying it.',
+            );
+            await this.canReview(tx, actor, project, previous);
+            ensure(
+              sources.length > 0,
+              'INVALID_INPUT',
+              'Verification requires supporting source identities and revisions.',
+            );
+            verification = {
+              state: 'verified',
+              actor_id: actor.id,
+              verified_at: this.timestamp(),
+              evidence: input.verification.evidence,
+            };
+          } else if (input.verification?.state === 'unverified') verification = { state: 'unverified' };
+          if (status === 'accepted') {
+            if (input.status === 'accepted')
+              await this.canReview(tx, actor, project, previous ?? { actor_id: actor.id });
+            ensure(
+              verification.state === 'verified' && sources.length > 0,
+              'INVALID_INPUT',
+              'Acceptance requires explicitly verified supporting evidence.',
+            );
+          }
           const document: Knowledge = {
             id: previous?.id ?? randomUUID(),
             project_id: project.id,
             title: input.title,
             body: input.body,
             kind: input.kind,
+            sources,
+            status,
+            verification,
             revision: (previous?.revision ?? 0) + 1,
             archived: input.archived,
-            actor_id: actor.id,
+            actor_id: changed ? actor.id : previous!.actor_id,
             updated_at: this.timestamp(),
           };
           await tx.put('knowledge', document);
+          await tx.put('knowledge_revisions', {
+            ...document,
+            id: `${document.id}:${document.revision}`,
+            knowledge_id: document.id,
+          });
           await this.queue(tx, document, 'knowledge');
           await this.event(tx, project, actor, 'knowledge.updated', document.id, {
             revision: document.revision,
             archived: document.archived,
+            status: document.status,
+            verification_state: document.verification.state,
           });
-          return document;
+          return { ...document, verification_state: document.verification.state };
         }
         case 'work_claim': {
           const ticket = input.ticket_id
@@ -998,6 +1761,90 @@ export class Application {
   ): Promise<unknown> {
     const ticket = await this.ticket(tx, project.id, input.ticket_id);
     switch (operation) {
+      case 'run_submit': {
+        ensure(
+          this.storage.executionRuns && tx.compareExecutionRun,
+          'UNSUPPORTED_EXECUTION_RUNS',
+          'Storage does not support durable execution runs.',
+        );
+        await this.liveClaim(tx, ticket, actor, input.claim_token);
+        ensure(
+          ticket.status === 'in_progress' && (!ticket.assignee_id || ticket.assignee_id === actor.id),
+          'NOT_CLAIMABLE',
+          'Execution requires an in-progress ticket assigned to this worker or unassigned.',
+        );
+        ensure(
+          !(await this.blockers(tx, ticket)).length,
+          'DEPENDENCY_BLOCKED',
+          'Resolve prerequisites and blocking questions before execution.',
+        );
+        const recipe = this.executionRecipe(project.id, input.recipe_id);
+        const checkpoint = await this.note(tx, actor, ticket, 'checkpoint', input.checkpoint.progress, {
+          metadata: {
+            remaining: input.checkpoint.remaining,
+            decisions: input.checkpoint.decisions,
+            references: input.checkpoint.references,
+          },
+        });
+        await this.touch(tx, ticket);
+        await this.queue(tx, checkpoint, 'checkpoint');
+        const runId = randomUUID(),
+          continuationId = randomUUID(),
+          createdAt = this.timestamp();
+        const run: ExecutionJob = {
+          id: runId,
+          project_id: project.id,
+          ticket_id: ticket.id,
+          actor_id: actor.id,
+          checkpoint_id: checkpoint.id,
+          continuation_id: continuationId,
+          claim_token: input.claim_token,
+          requirements_revision: ticket.requirements_revision,
+          recipe_id: recipe.id,
+          recipe_fingerprint: recipe.fingerprint,
+          status: 'queued',
+          reservation_token: null,
+          locked_until: null,
+          started_at: null,
+          finished_at: null,
+          exit_code: null,
+          signal: null,
+          artifacts: [],
+          error_code: null,
+          created_at: createdAt,
+        };
+        await tx.put('execution_jobs', run);
+        const continuation: Continuation = {
+          id: continuationId,
+          project_id: project.id,
+          ticket_id: ticket.id,
+          run_id: runId,
+          checkpoint_id: checkpoint.id,
+          requirements_revision: ticket.requirements_revision,
+          completion_condition: input.completion_condition,
+          status: 'pending',
+          failure_reason: null,
+          created_at: createdAt,
+          settled_at: null,
+        };
+        await tx.put('continuations', continuation);
+        await this.event(tx, project, actor, 'run.submitted', ticket.id, {
+          run_id: runId,
+          checkpoint_id: checkpoint.id,
+          continuation_id: continuationId,
+        });
+        return {
+          run_id: runId,
+          project_id: project.id,
+          ticket_id: ticket.id,
+          checkpoint_id: checkpoint.id,
+          continuation_id: continuationId,
+          recipe_id: recipe.id,
+          recipe_fingerprint: recipe.fingerprint,
+          status: 'queued',
+          retrieval: { tool: 'run_get', arguments: { project_id: project.id, run_id: runId } },
+        };
+      }
       case 'ticket_update': {
         this.version(ticket, input.expected_revision);
         if (input.execution_hints !== undefined) {
@@ -1292,6 +2139,41 @@ export class Application {
     };
   }
   private async read(actorId: string, operation: Operation, input: any): Promise<unknown> {
+    if (operation === 'run_get')
+      return this.storage.readSnapshot(async (reader) => {
+        await this.access(reader, await this.actor(actorId, reader), input.project_id);
+        ensure(
+          this.storage.executionRuns,
+          'UNSUPPORTED_EXECUTION_RUNS',
+          'Storage does not support durable execution runs.',
+        );
+        const run = await reader.get('execution_jobs', input.run_id);
+        ensure(run && run.project_id === input.project_id, 'NOT_FOUND', 'Execution run not found.');
+        const continuation = await reader.get('continuations', run.continuation_id);
+        const checkpoint = await reader.get('notes', run.checkpoint_id);
+        ensure(
+          continuation &&
+            continuation.project_id === input.project_id &&
+            continuation.run_id === run.id &&
+            checkpoint &&
+            checkpoint.project_id === input.project_id &&
+            checkpoint.kind === 'checkpoint',
+          'INVALID_REFERENCE',
+          'Execution checkpoint or continuation is missing.',
+        );
+        const recovery = await this.executionReconciliation(reader, run);
+        return {
+          run,
+          continuation,
+          checkpoint,
+          stale: !(await this.executionAuthority(reader, run)),
+          reconciliation: {
+            state: recovery.state,
+            next_step: recovery.next_step,
+            attempt_id: recovery.attempt?.id ?? null,
+          },
+        };
+      });
     if (operation === 'ticket_context') {
       const snapshot = await this.storage.readSnapshot(async (reader) => {
         const actor = await this.actor(actorId, reader);
@@ -1470,9 +2352,12 @@ export class Application {
         return note;
       }
       case 'knowledge_get': {
-        const document = await this.storage.get('knowledge', input.knowledge_id);
+        const document =
+          input.revision === undefined
+            ? await this.storage.get('knowledge', input.knowledge_id)
+            : await this.storage.get('knowledge_revisions', `${input.knowledge_id}:${input.revision}`);
         ensure(document && document.project_id === project.id, 'NOT_FOUND', 'Knowledge document not found.');
-        return document;
+        return { ...document, id: input.knowledge_id };
       }
       case 'changes_since': {
         const events = await this.storage.find('events', {
@@ -1524,6 +2409,11 @@ export class Application {
             title: item.title,
             text: item.body,
             archived: item.archived,
+            memory: {
+              status: item.status,
+              verification_state: item.verification.state,
+              trusted_reuse: false,
+            },
           }
         : null;
     }
@@ -1603,9 +2493,11 @@ export class Application {
               : hit.kind === 'checkpoint'
                 ? 'checkpoint_id'
                 : 'knowledge_id']: source.id,
+            ...(hit.kind === 'knowledge' ? { revision: source.revision } : {}),
           },
         },
         untrusted_content: true,
+        ...(source.memory ? { memory: source.memory } : {}),
       });
       if (results.length === input.limit) break;
     }
