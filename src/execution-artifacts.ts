@@ -1,8 +1,23 @@
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  realpathSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+} from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { z } from 'zod';
-import { ensure } from './contracts.js';
+import { ensure, type ArtifactRetirement } from './contracts.js';
+import { durableExecutionFile } from './execution-journal.js';
 
 const uuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 export const artifactIdentity = new RegExp(`^execution:(${uuid}):(${uuid}):(stdout|stderr|result)$`);
@@ -40,6 +55,10 @@ export interface ArtifactAuthority {
   process_token: string;
   recipe_fingerprint: string;
 }
+type RetentionProof = Pick<
+  ArtifactRetirement,
+  'expires_at' | 'size_bytes' | 'sha256' | 'root_identity' | 'file_identity'
+>;
 
 /** Only canonical, authorized execution identities reach this private filesystem boundary. */
 export class ExecutionArtifacts {
@@ -80,7 +99,7 @@ export class ExecutionArtifacts {
       'INVALID_ARTIFACT',
       'Artifact escaped its private directory.',
     );
-    const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
     try {
       const info = fstatSync(fd),
         current = lstatSync(path);
@@ -94,19 +113,287 @@ export class ExecutionArtifacts {
         'INVALID_ARTIFACT',
         'Artifact is not a private regular file.',
       );
-      return { fd, size: info.size };
+      return { fd, size: info.size, path };
     } catch (error) {
       closeSync(fd);
       throw error;
     }
   }
 
+  private retentionJournal(artifactId: string, authority: ArtifactAuthority, settledAt: number, now: number) {
+    const identity = artifactIdentity.exec(artifactId);
+    ensure(
+      identity &&
+        identity[3] !== 'result' &&
+        identity[1] === authority.run_id &&
+        identity[2] === authority.attempt_id,
+      'INVALID_REFERENCE',
+      'Only an exact published stdout/stderr log can be retired.',
+    );
+    const journal = this.open(identity[1]!, identity[2]!, 'result.json');
+    let metadata: any;
+    try {
+      ensure(
+        journal.size <= MAX_ARTIFACT_RANGE_BYTES,
+        'INVALID_ARTIFACT',
+        'Artifact result journal is too large.',
+      );
+      const bytes = Buffer.alloc(journal.size);
+      ensure(
+        readSync(journal.fd, bytes, 0, bytes.length, 0) === bytes.length,
+        'INVALID_ARTIFACT',
+        'Artifact result journal is incomplete.',
+      );
+      metadata = JSON.parse(bytes.toString('utf8'));
+    } finally {
+      closeSync(journal.fd);
+    }
+    ensure(
+      Object.entries(authority).every(([key, value]) => metadata[key] === value) &&
+        metadata.cleanup_verified === true &&
+        Number.isSafeInteger(metadata.finished_at) &&
+        metadata.finished_at > 0 &&
+        Number.isFinite(settledAt) &&
+        metadata.finished_at <= settledAt &&
+        settledAt + this.ttlMs <= now,
+      'ARTIFACT_NOT_EXPIRED',
+      'Retirement requires a verified terminal journal and expired durable settlement.',
+    );
+    ensure(
+      !lstatSync(this.directory).isSymbolicLink(),
+      'INVALID_ARTIFACT',
+      'Artifact root links are not allowed.',
+    );
+    const root = realpathSync(this.directory),
+      info = lstatSync(root, { bigint: true });
+    ensure(info.isDirectory() && info.ino > 0n, 'INVALID_ARTIFACT', 'Artifact root identity is unavailable.');
+    return {
+      identity,
+      metadata,
+      root_identity: hash(
+        Buffer.from(JSON.stringify([root, String(info.dev), String(info.ino), String(info.birthtimeNs)])),
+      ),
+      expires_at: new Date(settledAt + this.ttlMs).toISOString(),
+    };
+  }
+  inspectRetirement(
+    artifactId: string,
+    authority: ArtifactAuthority,
+    settledAt: number,
+    now: number,
+  ): RetentionProof {
+    const journal = this.retentionJournal(artifactId, authority, settledAt, now);
+    const name = journal.identity[3]!;
+    const file = this.open(authority.run_id, authority.attempt_id, `${name}.log`);
+    try {
+      ensure(
+        file.size <= 16 * 1024 * 1024 && journal.metadata.bytes?.[name] === file.size,
+        'INVALID_ARTIFACT',
+        'Retirement requires an unchanged bounded capture.',
+      );
+      const digest = createHash('sha256'),
+        bytes = Buffer.alloc(MAX_ARTIFACT_RANGE_BYTES);
+      for (let position = 0; position < file.size;) {
+        const read = readSync(file.fd, bytes, 0, Math.min(bytes.length, file.size - position), position);
+        ensure(read > 0, 'INVALID_ARTIFACT', 'Artifact changed during inspection.');
+        digest.update(bytes.subarray(0, read));
+        position += read;
+      }
+      const sha256 = digest.digest('hex');
+      ensure(
+        sha256 === journal.metadata.sha256?.[name],
+        'INVALID_ARTIFACT',
+        'Retirement requires the trusted capture hash.',
+      );
+      const info = fstatSync(file.fd, { bigint: true });
+      ensure(info.ino > 0n, 'INVALID_ARTIFACT', 'Artifact file identity is unavailable.');
+      return {
+        expires_at: journal.expires_at,
+        root_identity: journal.root_identity,
+        size_bytes: file.size,
+        sha256,
+        file_identity: JSON.stringify([
+          String(info.dev),
+          String(info.ino),
+          String(info.size),
+          String(info.mtimeNs),
+          String(info.birthtimeNs),
+        ]),
+      };
+    } finally {
+      closeSync(file.fd);
+    }
+  }
+  unlinkRetired(decision: ArtifactRetirement, authority: ArtifactAuthority, settledAt: number, now: number) {
+    ensure(
+      process.platform === 'linux',
+      'UNSUPPORTED_PHYSICAL_CLEANUP',
+      'Physical cleanup requires Linux directory handles.',
+    );
+    const journal = this.retentionJournal(decision.id, authority, settledAt, now);
+    ensure(
+      journal.root_identity === decision.root_identity && journal.expires_at === decision.expires_at,
+      'INVALID_ARTIFACT',
+      'Retirement ownership changed.',
+    );
+    const handles: number[] = [];
+    const directory = (path: string) => {
+      const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      handles.push(fd);
+      const info = fstatSync(fd, { bigint: true });
+      ensure(
+        info.isDirectory() && info.uid === BigInt(process.getuid!()) && (info.mode & 0o022n) === 0n,
+        'INVALID_ARTIFACT',
+        'Retirement directories must be owned and protected from other writers.',
+      );
+      return fd;
+    };
+    const openCapture = (path: string) => {
+      try {
+        return openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw error;
+      }
+    };
+    const matches = (fd: number) => {
+      const info = fstatSync(fd, { bigint: true });
+      if (
+        !info.isFile() ||
+        info.nlink !== 1n ||
+        info.uid !== BigInt(process.getuid!()) ||
+        JSON.stringify([
+          String(info.dev),
+          String(info.ino),
+          String(info.size),
+          String(info.mtimeNs),
+          String(info.birthtimeNs),
+        ]) !== decision.file_identity
+      )
+        return false;
+      const digest = createHash('sha256'),
+        bytes = Buffer.alloc(MAX_ARTIFACT_RANGE_BYTES);
+      for (let position = 0; position < decision.size_bytes;) {
+        const read = readSync(fd, bytes, 0, Math.min(bytes.length, decision.size_bytes - position), position);
+        if (read <= 0) return false;
+        digest.update(bytes.subarray(0, read));
+        position += read;
+      }
+      return digest.digest('hex') === decision.sha256;
+    };
+    try {
+      const root = realpathSync(this.directory),
+        rootFd = directory(root),
+        rootInfo = fstatSync(rootFd, { bigint: true });
+      ensure(
+        hash(
+          Buffer.from(
+            JSON.stringify([root, String(rootInfo.dev), String(rootInfo.ino), String(rootInfo.birthtimeNs)]),
+          ),
+        ) === decision.root_identity,
+        'INVALID_ARTIFACT',
+        'Retirement root changed before staging.',
+      );
+      const runFd = directory(`/proc/self/fd/${rootFd}/${authority.run_id}`);
+      const attemptFd = directory(`/proc/self/fd/${runFd}/${authority.attempt_id}`);
+      const parent = `/proc/self/fd/${attemptFd}`,
+        name = `${journal.identity[3]}.log`;
+      const stageName = `.retired-${journal.identity[3]}`,
+        stage = `${parent}/${stageName}`;
+      let created = false;
+      try {
+        mkdirSync(stage, { mode: 0o700 });
+        created = true;
+        fsyncSync(attemptFd);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+      const stageFd = directory(stage),
+        anchoredStage = `/proc/self/fd/${stageFd}`;
+      const marker = {
+        id: decision.id,
+        root_identity: decision.root_identity,
+        file_identity: decision.file_identity,
+        sha256: decision.sha256,
+      };
+      if (created) {
+        durableExecutionFile(`${anchoredStage}/decision.json`, marker);
+        fsyncSync(stageFd);
+      }
+      const markerFd = openCapture(`${anchoredStage}/decision.json`);
+      ensure(
+        markerFd !== null,
+        'ARTIFACT_STAGING_CONFLICT',
+        'Retirement staging marker is missing; no capture was removed. Inspect the protected staging directory before retrying.',
+        { staging_directory: stageName },
+      );
+      try {
+        const info = fstatSync(markerFd);
+        ensure(
+          info.isFile() &&
+            info.nlink === 1 &&
+            info.size <= 4096 &&
+            JSON.stringify(JSON.parse(readFileSync(markerFd, 'utf8'))) === JSON.stringify(marker),
+          'ARTIFACT_STAGING_CONFLICT',
+          'Retirement staging ownership is uncertain; inspect the protected staging directory.',
+        );
+      } finally {
+        closeSync(markerFd);
+      }
+      const capture = `${anchoredStage}/capture`,
+        source = `${parent}/${name}`;
+      let fd = openCapture(capture);
+      if (fd === null) {
+        fd = openCapture(source);
+        if (fd === null) return false;
+        try {
+          ensure(matches(fd), 'INVALID_ARTIFACT', 'Retirement file identity changed.');
+        } finally {
+          closeSync(fd);
+        }
+        renameSync(source, capture);
+        fsyncSync(attemptFd);
+        fsyncSync(stageFd);
+        fd = openCapture(capture);
+        ensure(
+          fd !== null,
+          'ARTIFACT_STAGING_CONFLICT',
+          'Staged capture disappeared; inspect the protected staging directory.',
+        );
+      }
+      try {
+        if (!matches(fd)) {
+          try {
+            linkSync(capture, source);
+            fsyncSync(attemptFd);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+          }
+          ensure(
+            false,
+            'ARTIFACT_STAGING_CONFLICT',
+            'Selected file changed during staging. Bytes remain in the protected staging directory; inspect it before retrying.',
+            { staging_directory: stageName },
+          );
+        }
+        // This owner-only staging directory is never a recipe output directory.
+        unlinkSync(capture);
+        fsyncSync(stageFd);
+      } finally {
+        closeSync(fd);
+      }
+      return true;
+    } finally {
+      for (const fd of handles.reverse()) closeSync(fd);
+    }
+  }
   read(
     artifactId: string,
     authority: ArtifactAuthority,
     offset: number,
     length: number,
     now: number,
+    pinned = false,
   ): ArtifactResult {
     const identity = artifactIdentity.exec(artifactId);
     ensure(
@@ -153,8 +440,10 @@ export class ExecutionArtifacts {
         'Artifact result identity is invalid.',
       );
       result.expires_at = new Date(metadata.finished_at + this.ttlMs).toISOString();
-      if (now >= metadata.finished_at + this.ttlMs)
-        return unavailableArtifact(artifactId, offset, length, 'expired', result.expires_at);
+      if (now >= metadata.finished_at + this.ttlMs) {
+        if (!pinned) return unavailableArtifact(artifactId, offset, length, 'expired', result.expires_at);
+        result.expires_at = null;
+      }
       if (identity[3] === 'result' && metadata.artifact_errors?.includes('OUTCOME_WRITE_FAILED'))
         return result;
       const name = identity[3]!,

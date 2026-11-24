@@ -23,6 +23,7 @@ async function main() {
       resume: { type: 'boolean' },
       drain: { type: 'boolean' },
       cancel: { type: 'string' },
+      retire: { type: 'string' },
       reconcile: { type: 'string' },
       evidence: { type: 'string' },
     },
@@ -30,10 +31,11 @@ async function main() {
   ensure(
     values.actor &&
       values.project &&
-      [values.pause, values.resume, values.drain, values.cancel, values.reconcile].filter(Boolean).length <=
-        1,
+      [values.pause, values.resume, values.drain, values.cancel, values.reconcile, values.retire].filter(
+        Boolean,
+      ).length <= 1,
     'INVALID_CONFIG',
-    'Require --actor --project and at most one of --pause --resume --drain --cancel RUN_UUID --reconcile RUN_UUID.',
+    'Require --actor --project and at most one of --pause --resume --drain --cancel RUN_UUID --reconcile RUN_UUID --retire ARTIFACT_ID.',
   );
   const app = createRuntime({
     ...process.env,
@@ -48,6 +50,17 @@ async function main() {
   process.once('SIGTERM', stop);
   try {
     if (app.storage.executionLaunchStorage?.adapter === 'sqlite') await app.storage.migrate();
+    if (values.retire) {
+      ensure(
+        values.artifacts && isAbsolute(values.artifacts),
+        'INVALID_CONFIG',
+        'Retirement requires --artifacts ABSOLUTE_OWNED_ROOT.',
+      );
+      process.stdout.write(
+        JSON.stringify(await app.retireExecutionArtifact(values.actor, values.project, values.retire)) + '\n',
+      );
+      return;
+    }
     if (values.pause || values.resume || values.cancel) {
       const result = values.cancel
         ? await app.cancelExecutionRun(values.actor, values.project, values.cancel)
@@ -139,6 +152,9 @@ main().catch((error: unknown) => {
     JSON.stringify({
       event: 'execution_companion_error',
       code: error instanceof DomainError ? error.code : 'ERROR',
+      ...(error instanceof DomainError && error.code === 'ARTIFACT_STAGING_CONFLICT'
+        ? { message: error.message, details: error.details }
+        : {}),
     }) + '\n',
   );
   process.exitCode = 1;

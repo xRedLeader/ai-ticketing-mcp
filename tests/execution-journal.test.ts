@@ -16,7 +16,10 @@ it('publishes a complete immutable journal after repeated crashes during staging
   const directory = mkdtempSync(join(tmpdir(), 'ticketing-journal-'));
   try {
     const path = join(directory, 'never-started.json');
-    const module = new URL('../src/execution-journal.ts', import.meta.url).href;
+    const javascript = new URL('../src/execution-journal.js', import.meta.url);
+    const module = (
+      existsSync(javascript) ? javascript : new URL('../src/execution-journal.ts', import.meta.url)
+    ).href;
     for (let i = 0; i < 2; i++) {
       const child = spawnSync(
         process.execPath,
@@ -40,6 +43,25 @@ it('publishes a complete immutable journal after repeated crashes during staging
     assert.throws(() => durableExecutionFile(path, { spawned: true }), { code: 'EEXIST' });
     assert.deepEqual(readExecutionFile(path), proof);
     assert.equal(readdirSync(directory).filter((name) => name.endsWith('.tmp')).length, 2);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it('checks the deadline after syncing bytes and before publishing an immutable journal', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ticketing-journal-deadline-'));
+  try {
+    const path = join(directory, 'result.json');
+    assert.throws(
+      () =>
+        durableExecutionFile(path, { status: 'passed' }, () => {
+          throw new Error('TIMEOUT');
+        }),
+      /TIMEOUT/,
+    );
+    assert.equal(existsSync(path), false);
+    durableExecutionFile(path, { status: 'failed', error_code: 'TIMEOUT' });
+    assert.deepEqual(readExecutionFile(path), { status: 'failed', error_code: 'TIMEOUT' });
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

@@ -2,7 +2,8 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, openSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { ExecutionControllerFence, StorageAdapter } from './contracts.js';
 import { createRuntime } from './runtime.js';
 import { MAX_EXECUTION_RECIPE_BYTES, type ExecutionRecipe } from './execution-recipes.js';
@@ -13,6 +14,9 @@ import {
   terminateExecutionProcessTree,
 } from './execution-journal.js';
 import type { HostCapacityNeverStartedProof } from './host-capacity.js';
+import { pipelineIdentityError, verificationRunnerPath } from './verification-pipeline.js';
+import type { VerificationReport } from './verification-runner.js';
+import { readVerificationTimeout } from './verification-timeout.js';
 
 export interface ExecutionManifest {
   run_id: string;
@@ -41,6 +45,8 @@ async function supervise(directory: string) {
   }
   const launch = JSON.parse(Buffer.concat(input).toString('utf8')) as ExecutionLaunch;
   const { recipe } = launch;
+  const pipeline = 'kind' in recipe ? recipe : null;
+  const command = 'executable' in recipe ? recipe : null;
   if (recipe.fingerprint !== manifest.recipe_fingerprint) throw new Error('Recipe fingerprint changed.');
   const identity = {
     run_id: manifest.run_id,
@@ -49,6 +55,7 @@ async function supervise(directory: string) {
     recipe_fingerprint: recipe.fingerprint,
   };
   let started = Date.now();
+  let totalDeadline = Infinity;
   durableExecutionFile(join(directory, 'supervisor.json'), {
     ...identity,
     identity: executionProcessIdentity(process.pid),
@@ -78,6 +85,7 @@ async function supervise(directory: string) {
   let timeout: NodeJS.Timeout | undefined;
   const cancellation = setInterval(() => {
     if (existsSync(join(directory, 'cancel.json'))) stop('CANCELLED');
+    else if (pipeline && readVerificationTimeout(directory, manifest)) stop('TIMEOUT');
   }, 100);
   try {
     let completion: Promise<{ code: number | null; signal: NodeJS.Signals | null }> | undefined;
@@ -102,19 +110,39 @@ async function supervise(directory: string) {
           if (stopped || existsSync(join(directory, 'cancel.json')))
             throw new Error('Execution was cancelled before its launch fence was acquired.');
           started = Date.now();
-          timeout = setTimeout(() => stop('TIMEOUT'), recipe.timeout_ms);
+          totalDeadline = performance.now() + recipe.timeout_ms;
+          timeout = setTimeout(() => stop('TIMEOUT'), recipe.timeout_ms + (pipeline ? 15_000 : 0));
           // Consuming this capability before spawn makes a duplicate or uncertain launch non-replayable.
           durableExecutionFile(join(directory, 'launch.json'), identity);
           durableExecutionFile(join(directory, 'dispatch.json'), { ...identity, started_at: started });
           try {
-            child = spawn(recipe.executable, [...recipe.argv], {
-              cwd: recipe.cwd,
-              env: { ...recipe.env },
+            const runner = verificationRunnerPath();
+            const args = pipeline
+              ? runner.endsWith('.ts')
+                ? ['--import', pathToFileURL(createRequire(import.meta.url).resolve('tsx')).href, runner]
+                : [runner]
+              : [...command!.argv];
+            child = spawn(pipeline ? process.execPath : command!.executable, args, {
+              cwd: pipeline ? pipeline.source.command.cwd : command!.cwd,
+              env: pipeline ? {} : { ...command!.env },
               shell: false,
               detached: process.platform !== 'win32',
               windowsHide: true,
-              stdio: ['ignore', 'pipe', 'pipe'],
+              stdio: [pipeline ? 'pipe' : 'ignore', 'pipe', 'pipe'],
             });
+            if (pipeline) {
+              child.stdin!.on('error', () => {
+                error ??= 'PIPELINE_INPUT_FAILED';
+              });
+              child.stdin!.end(
+                JSON.stringify({
+                  pipeline,
+                  report_path: join(directory, 'pipeline-report.json'),
+                  deadline_at: started + recipe.timeout_ms,
+                  identity: manifest,
+                }),
+              );
+            }
             completion = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
               child!.once('spawn', () => {
                 spawned = true;
@@ -186,11 +214,44 @@ async function supervise(directory: string) {
       await Promise.allSettled([app.storage.close(), app.searchAdapter.close()]);
     }
     const observed = await completion!;
+    let verification: VerificationReport | undefined;
+    if (pipeline) {
+      try {
+        verification = readExecutionFile(join(directory, 'pipeline-report.json')) as VerificationReport;
+        if (
+          verification.recipe_fingerprint !== pipeline.fingerprint ||
+          verification.pipeline_id !== pipeline.id ||
+          JSON.stringify(verification.source) !== JSON.stringify(pipeline.source.identity)
+        ) {
+          verification = undefined;
+          error ??= 'PIPELINE_REPORT_INVALID';
+        }
+      } catch {
+        error ??= 'PIPELINE_REPORT_MISSING';
+      }
+      error ??= pipelineIdentityError(pipeline);
+      if (verification?.status !== 'passed') error ??= verification?.error_code ?? 'PIPELINE_FAILED';
+      if (verification) {
+        for (const stream of ['stdout', 'stderr'] as const) {
+          total_bytes[stream] = verification.steps.reduce(
+            (total, step) => Math.min(Number.MAX_SAFE_INTEGER, total + step.diagnostics[stream].total_bytes),
+            0,
+          );
+          truncated[stream] ||= total_bytes[stream] > bytes[stream];
+        }
+      }
+    }
     try {
       fsyncSync(stdout);
       fsyncSync(stderr);
     } catch {
       error ??= 'LOG_SYNC_FAILED';
+    }
+    if (pipeline && performance.now() >= totalDeadline) error ??= 'TIMEOUT';
+    if (verification && stopped) verification.cleanup_verified = (await termination) === true;
+    if (verification && (error || observed.code !== 0 || observed.signal)) {
+      verification.status = 'failed';
+      verification.error_code ??= error ?? 'PIPELINE_EXIT_FAILED';
     }
     const finished = Date.now();
     const sha256 = {
@@ -210,10 +271,23 @@ async function supervise(directory: string) {
       total_bytes,
       truncated,
       sha256: { stdout: sha256.stdout, stderr: sha256.stderr },
+      ...(verification ? { verification } : {}),
     };
     const artifact_errors: string[] = [];
     try {
-      durableExecutionFile(join(directory, 'outcome.json'), outcome);
+      const expired = new Error('Pipeline publication deadline exceeded.');
+      try {
+        durableExecutionFile(join(directory, 'outcome.json'), outcome, () => {
+          if (verification?.status === 'passed' && performance.now() >= totalDeadline) throw expired;
+        });
+      } catch (cause) {
+        if (cause !== expired) throw cause;
+        error ??= 'TIMEOUT';
+        outcome.error_code = error;
+        verification!.status = 'failed';
+        verification!.error_code = 'TIMEOUT';
+        durableExecutionFile(join(directory, 'outcome.json'), outcome);
+      }
       sha256.result = createHash('sha256')
         .update(JSON.stringify(outcome) + '\n')
         .digest('hex');
@@ -238,7 +312,9 @@ async function supervise(directory: string) {
       sha256,
       artifact_errors,
       truncated,
-      cleanup_verified: stopped ? (await termination) === true : observed.signal === null,
+      cleanup_verified: stopped
+        ? (await termination) === true
+        : observed.signal === null && (!pipeline || verification?.cleanup_verified === true),
     });
   } finally {
     if (timeout) clearTimeout(timeout);

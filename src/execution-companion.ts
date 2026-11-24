@@ -28,6 +28,7 @@ import {
   terminateExecutionProcessTree,
 } from './execution-journal.js';
 import type { ExecutionLaunch, ExecutionManifest } from './execution-supervisor.js';
+import { readVerificationTimeout, recordVerificationTimeout } from './verification-timeout.js';
 
 export type ExecutionApplication = Pick<
   Application,
@@ -579,11 +580,32 @@ export class ExecutionCompanion {
     const directory = join(this.directory, state.run.id, state.attempt.id);
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const cancelled = await this.requestCancellation(state, directory);
-    if (cancelled && !this.liveSupervisor(state, directory)) {
+    const timeoutIdentity = {
+      run_id: state.run.id,
+      attempt_id: state.attempt.id,
+      process_token: state.attempt.process_token,
+      recipe_fingerprint: state.run.recipe_fingerprint,
+    };
+    const timedOut = readVerificationTimeout(directory, timeoutIdentity);
+    if ((cancelled || timedOut) && !this.liveSupervisor(state, directory)) {
       const identity = this.liveIdentity(state, directory);
       if (identity && (await terminateExecutionProcessTree(identity))) {
+        const timeoutResult = timedOut
+          ? recordVerificationTimeout(
+              directory,
+              {
+                run_id: state.run.id,
+                attempt_id: state.attempt.id,
+                process_token: state.attempt.process_token,
+                recipe_fingerprint: state.run.recipe_fingerprint,
+              },
+              Date.parse(state.run.started_at!),
+              cancelled ? 'CANCELLED' : 'TIMEOUT',
+            )
+          : null;
+        if (timedOut && !timeoutResult) return;
         const previous = this.result(state, directory);
-        const result: ResultJournal = {
+        const result: ResultJournal = timeoutResult ?? {
           run_id: state.run.id,
           attempt_id: state.attempt.id,
           process_token: state.attempt.process_token,

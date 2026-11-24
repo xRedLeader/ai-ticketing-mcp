@@ -173,6 +173,14 @@ export function registerExecutionArtifactContracts(name: string, factory: () => 
     await rm(join(f.path, 'stdout.log'));
     assert.equal((await f.read()).status, 'missing');
     f.clock.now = new Date(f.clock.now.getTime() + 1000);
+    assert.equal((await f.read({ artifact_id: f.refs[1] })).status, 'available');
+    const ticket = (await f.storage.get('tickets', f.run.ticket_id))!;
+    await f.call(f.worker.id, 'ticket_transition', {
+      ticket_id: ticket.id,
+      expected_revision: ticket.revision,
+      status: 'cancelled',
+      reason: 'Complete the unpinned expiry check.',
+    });
     const expired = await f.read({ artifact_id: f.refs[1] });
     assert.equal(expired.status, 'expired');
     assert.equal(expired.range.unavailable_reason, 'expired');

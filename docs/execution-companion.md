@@ -1,6 +1,6 @@
 # Durable local script companion
 
-The optional companion runs operator-registered finite foreground scripts in a separate Node 24+ process. Start it independently of the MCP server/client: closing the submitting chat or MCP connection does not terminate that process. It makes no model calls, uses no agent token budget, and never retries an execution. MCP `run_submit` selects only a registered recipe ID and atomically stores its checkpoint, immutable recipe fingerprint and exit-code continuation; `run_get` reads that exact authorized project run later. These tools use the `full` MCP profile.
+The optional companion runs operator-registered finite foreground scripts in a separate Node 24+ process. Start it independently of the MCP server/client: closing the submitting chat or MCP connection does not terminate that process. It makes no model calls, uses no agent token budget, and never retries an execution. MCP `run_submit` selects only a registered recipe ID and atomically stores its checkpoint, immutable recipe fingerprint and exit-code continuation; `run_get` reads that exact authorized project run later. These tools use the `executor` or `full` MCP profile. Use bounded `run_wait` for status and `artifact_read` for exact evidence; see [capability profiles](mcp.md#capability-profiles).
 
 When storage supports [durable wakes](durable-wakes.md), each companion pass also evaluates a bounded page of explicitly registered wake conditions. It stores coalesced reasons and cursors, without consuming decisions or starting models. Terminal execution settlement emits one durable `run.settled` event with run/continuation IDs and result code; repeated identical settlement does not emit duplicates. Restart resumes each registration's durable cursor and retains active consumption fences.
 
@@ -34,6 +34,50 @@ Set `EXECUTION_RECIPES_FILE` to an **absolute** operator-owned JSON file for bot
 The registry resolves real paths, requires an absolute native executable, rejects shell scripts/Windows command files, and restricts cwd to configured workspace roots. It freezes fixed argv and an exact explicit environment: the child inherits **none** of the companion's environment. There is no shell, interpolation, ticket-supplied argv, model-supplied environment or command text. Scripts needing other programs must use operator-approved absolute paths or explicitly configured environment values. Windows environment keys cannot differ only in case.
 
 The registry file is bounded to 1 MiB; each normalized recipe and its private supervisor input are bounded to 2 MiB, checked before dispatch. Timeout defaults to 30 minutes and cannot exceed it. Each stdout/stderr file defaults to 1 MiB, with a configured maximum of 16 MiB each. Both pipes continue draining after the retained byte limit, so truncation does not deadlock the child. Recipe IDs are at most 80 characters. The SHA-256 fingerprint covers normalized registration, including argv, cwd, environment, limits and project allowlist. It does not hash executable/script contents: the operator must protect those files and bump registration when changing their meaning. Changing/removing a recipe does not silently redirect an already submitted job; it fails before spawn.
+
+## Deterministic verification pipelines
+
+An optional top-level `pipelines` array registers a finite verification pass as one ordinary execution recipe ID. `run_submit` selects that ID; the built-in runner executes every eligible step without model calls or individual MCP turns. The existing supervisor owns the runner and its foreground step children, and the existing attempt, continuation, cancellation, recovery and capacity fences still apply. A pipeline never retries a step.
+
+Each step references a registered native-executable recipe whose `cwd` is the pinned repository root. Register an additional Git recipe with empty `argv` and the same `cwd`, then add the pipeline to the same registry:
+
+```json
+{
+  "pipelines": [
+    {
+      "id": "verify-pipeline",
+      "project_ids": ["00000000-0000-4000-8000-000000000001"],
+      "source": {
+        "recipe_id": "source-git",
+        "commit": "0123456789abcdef0123456789abcdef01234567"
+      },
+      "steps": [
+        {
+          "id": "checks",
+          "recipe_id": "verify",
+          "needs": [],
+          "on_failure": "stop",
+          "toolchain_files": ["G:\\Work\\repo\\package-lock.json"]
+        }
+      ],
+      "timeout_ms": 1800000,
+      "max_log_bytes": 1048576
+    }
+  ]
+}
+```
+
+The commit must be the exact current Git HEAD, and tracked files must be clean when both processes load the registry. Source identity includes HEAD, its tree object and a SHA-256 digest of every tracked working file's actual bytes, including files hidden by Git index flags. Untracked generated output is excluded. Tracked symbolic links and submodules are rejected. Run verification in a dedicated checkout and declare every additional file consumed by tooling outside the tracked source in `toolchain_files`; those entries must be canonical regular files inside a configured workspace root. The existing trusted foreground-work contract applies to all inputs and commands.
+
+The immutable pipeline fingerprint includes normalized commands and project allowlists, source identity, step/dependency order, stop/proceed rules, executable hashes, declared toolchain-file hashes, and the built-in runner/runtime hashes. Every referenced recipe must allow every pipeline project. Limits are 32 pipelines, 16 steps per pipeline, 64 declared toolchain files per step, a 2 MiB normalized pipeline, and a 30-minute total timeout. Steps execute in declaration order; dependencies must reference earlier unique step IDs. Admission uses the largest declared CPU and memory requirement across the sequential steps.
+
+`on_failure: "stop"` skips all remaining steps after a failed or timed-out step. `"proceed"` permits independent later steps; any step whose dependencies did not pass is recorded as skipped with the failed dependency IDs. Source or toolchain changes always stop further execution. Source, relevant step tooling and runtime identities are checked before and after each executed step, and all identities are checked again before the supervisor publishes its result. Missing or changed identities fail verification. Timeout cleanup that cannot be proved retains unresolved capacity under the existing host rules.
+
+The existing authorized `result` artifact contains a `verification` object with exact identity hashes, ordered step results, exit codes, timeout/failure/skip codes and separate stdout/stderr diagnostics. Each step retains at most 512 diagnostic bytes per stream, with total byte counts and truncation flags. Aggregate stdout/stderr logs share the pipeline capture limits. Reports omit command arguments, environment, source paths and process credentials; captured command output remains untrusted content.
+
+On a Linux step timeout, the runner retains the supervisor-owned process group, publishes the failed `pipeline-report.json` and an exact-attempt `pipeline-timeout.json` marker containing its hash, and waits for outer termination. The supervisor terminates the runner group, including the step and its descendants. If the supervisor exits first, a replacement companion validates the original identity and marker before attempting group termination and publishing the same bounded failure report. Unverifiable cleanup retains capacity. These two immutable files are recovery journals. Cancellation remains a separate primary outcome when it wins the race, while the report retains the timed-out step diagnostics. Total deadlines use monotonic time and are checked after identity validation and immediately before atomic publication; an overdue result cannot be published as passing.
+
+A passing pipeline only satisfies its execution continuation. It does not submit or approve a ticket, replace evidence for current criteria, refresh exact-SHA GitHub CI, or perform independent review. Those operations and their existing validation remain separate. Artifacts identify the source actually checked; a later source revision requires a new pinned pipeline run and current CI/review evidence.
 
 ## Starting the process
 
@@ -88,7 +132,7 @@ For existing single-host capacity and agent-budget data, configure both `EXECUTI
 
 ## Operator pause, drain and cancellation
 
-These trusted local controls require a project-admin actor and stay out of worker MCP tools. Pause and cancellation requests persist in the ticket store across controller restart. No process ID is accepted from a ticket or cancellation command.
+These trusted controls require a project-admin actor and stay out of worker MCP tools. Executor/full expose `run_cancel` with the same administrator requirement and strict idempotency receipts; pause, resume, drain and reconciliation remain trusted local controls. Pause and cancellation requests persist in the ticket store across controller restart. No process ID is accepted from a ticket or cancellation command.
 
 ```powershell
 # Requests need only the store, actor and project; an existing companion observes cancellation.
@@ -149,7 +193,7 @@ With `--artifacts ROOT`, private write-once files live under `ROOT/<run UUID>/<a
 - `operator-reconciliation.json`: explicit externally confirmed exit/effect evidence, retained separately from original logs and native results.
 - `never-started.json`: write-once, fsynced pre-dispatch recovery proof bound to the run, immutable attempt/process identity, recipe fingerprint, and exact host capacity state/execution token captured at admission. It precedes direct pre-start failure and recovered terminal settlement so restart can drain a stranded slot only when the stored outcome and capacity identity match.
 
-Configure the MCP server's `EXECUTION_ARTIFACTS_DIRECTORY` to the same absolute `ROOT` to enable `artifact_read` in the full profile. It accepts `project_id`, an exact published `artifact_id`, a zero-based byte `offset`, `length` (0–65,536 bytes), and `max_tokens` (512–32,768; default 2,048). Responses contain base64 bytes, the stored artifact's SHA-256, the returned range's SHA-256, captured/total/omitted byte counts, and explicit availability. Byte ranges can split a UTF-8 character; base64 preserves those bytes exactly. A zero-length request reads metadata only. New captures hash incrementally; older logs use a bounded streaming hash fallback.
+Configure the MCP server's `EXECUTION_ARTIFACTS_DIRECTORY` to the same absolute `ROOT` to enable `artifact_read` in the executor or full profile. It accepts `project_id`, an exact published `artifact_id`, a zero-based byte `offset`, `length` (0–65,536 bytes), and `max_tokens` (512–32,768; default 2,048). Responses contain base64 bytes, the stored artifact's SHA-256, the returned range's SHA-256, captured/total/omitted byte counts, and explicit availability. Byte ranges can split a UTF-8 character; base64 preserves those bytes exactly. A zero-length request reads metadata only. New captures hash incrementally; older logs use a bounded streaming hash fallback.
 
 `range.complete` means the whole requested byte range was returned. `response_budget` returns a shorter exact prefix and `next_offset` for continuation; `capture_limit` identifies output discarded after the per-stream recipe cap, and `past_end` identifies a range beyond a complete file. `missing`, `expired`, and `not_configured` return no content. `EXECUTION_ARTIFACT_TTL_MS` defaults to seven days after the private result's finish time; expiry denies reads without deleting files. Missing older public outcome files are reported explicitly. Project membership, the run's published references, immutable attempt identity, and private journal identity are checked before reads. Path/URL references, symlinks, junctions, hard links and cross-project identities are rejected.
 
@@ -186,3 +230,7 @@ For manual investigation, fence the old controller, inspect exact authorized run
 Stop the MCP runtime/worker and companion, take a consistent backup including SQLite WAL state, migrate with schema-owner privileges, rebuild, then restart and reconnect clients. Do not hot-reload this stack into an old process: the earlier project-memory migration rebuilds a SQLite table, and new adapters require the recovery schema.
 
 Migration identity is the complete filename in `schema_migrations`, not a unique numeric prefix. Preserve the accepted `013_project_memory.sql` / `014_execution_runs.sql` (SQLite `005_project_memory.sql` / `006_execution_runs.sql`) alongside main's independent `013_review_fixes.sql` (SQLite `005_review_fixes.sql`). Their exact names and bytes are retained so either already-applied history upgrades once without replaying ALTERs or losing data. Recovery appends PostgreSQL `015_execution_recovery.sql` and SQLite `007_execution_recovery.sql`. Operator controls append PostgreSQL `016_execution_control.sql` and SQLite `008_execution_control.sql`. Both adapters test main-first and accepted-stack-first upgrade histories, preserving existing tickets, claims, checkpoints, receipts and runs.
+
+## Explicit artifact retention
+
+See [operator artifact retention](artifact-retention.md) to retire an exact expired, unreferenced terminal stdout/stderr capture. Retirement preserves authoritative outcomes, private recovery journals and durable audit/receipt records. It is never automatic or model-controlled.

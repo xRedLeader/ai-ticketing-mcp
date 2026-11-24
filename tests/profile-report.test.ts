@@ -424,6 +424,21 @@ it('flags open, dropped, rotated, omitted-gap, and tampered segment metadata', a
   );
 });
 
+it('preserves the executor profile in offline reports', async () => {
+  await recording(
+    [
+      message(1, 'private-connection', 'incoming', request(1, 'run_wait'), { profile: 'executor' }),
+      message(2, 'private-connection', 'outgoing', result(1), { profile: 'executor' }),
+      sent(3, 2),
+    ],
+    async (directory) => {
+      const report = await analyzeProfile(directory);
+      assert.equal(report.messages[0]!.profile, 'executor');
+      assert.equal(report.calls[0]!.profile, 'executor');
+      assert.equal(report.calls[0]!.operation, 'run_wait');
+    },
+  );
+});
 it('does not expose unknown route/profile metadata and refuses negative observed durations', async () => {
   await recording(
     [

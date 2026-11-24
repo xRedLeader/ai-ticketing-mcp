@@ -1,6 +1,7 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { createApplication } from '../application.js';
 import type { ExecutionOutcome, StorageAdapter } from '../contracts.js';
 import { fixture, hasCode, type ContractAdapters } from './contracts.js';
@@ -52,6 +53,215 @@ export function registerExecutionContractTests(
     artifacts: ['execution:result'],
     error_code: null,
   };
+  check('waits without retaining a transaction and returns bounded authorized run status', async (f) => {
+    const receipt = await f.submit();
+    const input = { project_id: f.project.id, run_id: receipt.run_id, timeout_ms: 0 };
+    assert.deepEqual(await f.app.execute(f.worker.id, 'run_wait', input), await f.get(receipt.run_id));
+    for (const extra of [{ timeout_ms: 30001 }, { command: 'untrusted' }])
+      await assert.rejects(
+        f.app.execute(f.worker.id, 'run_wait', { ...input, ...extra }),
+        hasCode('INVALID_INPUT'),
+      );
+    const started = performance.now();
+    const bounded = (await f.app.execute(f.worker.id, 'run_wait', { ...input, timeout_ms: 60 })) as any;
+    assert.ok(performance.now() - started >= 50);
+    assert.equal(bounded.run.status, 'queued');
+    const waiting = f.app.execute(f.worker.id, 'run_wait', { ...input, timeout_ms: 3000 });
+    await delay(25);
+    await f.app.cancelExecutionRun(f.admin.id, f.project.id, receipt.run_id);
+    const completed = (await waiting) as any;
+    assert.equal(completed.run.status, 'failed');
+    assert.equal(completed.run.error_code, 'CANCELLED_NOT_STARTED');
+    assert.deepEqual(completed, await f.get(receipt.run_id));
+  });
+  check('reauthorizes each wait snapshot after project access is revoked', async (f) => {
+    const receipt = await f.submit();
+    const waiting = assert.rejects(
+      f.app.execute(f.worker.id, 'run_wait', {
+        project_id: f.project.id,
+        run_id: receipt.run_id,
+        timeout_ms: 3000,
+      }),
+      hasCode('FORBIDDEN'),
+    );
+    await delay(25);
+    await f.app.execute(f.admin.id, 'member_set', {
+      project_id: f.project.id,
+      actor_id: f.worker.id,
+      role: 'none',
+      idempotency_key: randomUUID(),
+    });
+    await waiting;
+  });
+  check('the trusted companion renews only live authorized claims across the original lease', async (f) => {
+    const receipt = await f.submit();
+    const controller = (await f.app.acquireExecutionController(
+      f.admin.id,
+      f.project.id,
+      'companion',
+      3600000,
+    ))!;
+    try {
+      const run = (await f.app.reserveExecutionRun(
+        f.admin.id,
+        f.project.id,
+        receipt.run_id,
+        60000,
+        controller,
+      ))!;
+      await f.app.startExecutionRun(
+        f.admin.id,
+        f.project.id,
+        run.id,
+        run.reservation_token!,
+        60000,
+        controller,
+      );
+      const originalExpiry = f.claim.claim.expires_at;
+      for (let step = 0; step < 25; step++) {
+        f.clock.now = new Date(f.clock.now.getTime() + 30000);
+        assert.equal(
+          await f.app.heartbeatExecutionRun(
+            f.admin.id,
+            f.project.id,
+            run.id,
+            run.reservation_token!,
+            60000,
+            controller,
+          ),
+          true,
+        );
+      }
+      assert.ok(f.clock.now.toISOString() > originalExpiry);
+      assert.ok((await f.storage.get('claims', f.ticket.id))!.expires_at > f.clock.now.toISOString());
+      assert.equal(
+        await f.app.settleExecutionRun(
+          f.admin.id,
+          f.project.id,
+          run.id,
+          run.reservation_token!,
+          outcome,
+          controller,
+        ),
+        true,
+      );
+      const current = await f.read(f.ticket.id);
+      const submitted = (await f.call(f.worker.id, 'ticket_submit', {
+        ticket_id: f.ticket.id,
+        claim_token: f.claim.claim.token,
+        expected_revision: current.ticket.revision,
+        summary: 'Verified execution result.',
+        evidence: current.criteria.map((criterion: any) => ({
+          criterion_id: criterion.id,
+          result: 'pass',
+          summary: 'Exact run succeeded.',
+          references: [`run:${run.id}`],
+        })),
+      })) as any;
+      assert.equal(submitted.ticket.status, 'in_review');
+    } finally {
+      await f.app.releaseExecutionController(f.admin.id, f.project.id, controller);
+    }
+  });
+  check('companion heartbeats cannot renew revoked or expired worker authority', async (f) => {
+    const receipt = await f.submit();
+    const controller = (await f.app.acquireExecutionController(
+      f.admin.id,
+      f.project.id,
+      'companion',
+      3600000,
+    ))!;
+    try {
+      const run = (await f.app.reserveExecutionRun(
+        f.admin.id,
+        f.project.id,
+        receipt.run_id,
+        3600000,
+        controller,
+      ))!;
+      const original = await f.storage.get('claims', f.ticket.id);
+      await f.app.execute(f.admin.id, 'member_set', {
+        project_id: f.project.id,
+        actor_id: f.worker.id,
+        role: 'reader',
+        idempotency_key: randomUUID(),
+      });
+      assert.equal(
+        await f.app.heartbeatExecutionRun(
+          f.admin.id,
+          f.project.id,
+          run.id,
+          run.reservation_token!,
+          60000,
+          controller,
+        ),
+        false,
+      );
+      assert.deepEqual(await f.storage.get('claims', f.ticket.id), original);
+      await f.app.execute(f.admin.id, 'member_set', {
+        project_id: f.project.id,
+        actor_id: f.worker.id,
+        role: 'contributor',
+        idempotency_key: randomUUID(),
+      });
+      f.clock.now = new Date(f.clock.now.getTime() + 600001);
+      assert.equal(
+        await f.app.heartbeatExecutionRun(
+          f.admin.id,
+          f.project.id,
+          run.id,
+          run.reservation_token!,
+          60000,
+          controller,
+        ),
+        false,
+      );
+      assert.deepEqual(await f.storage.get('claims', f.ticket.id), original);
+    } finally {
+      await f.app.releaseExecutionController(f.admin.id, f.project.id, controller);
+    }
+  });
+  check('cancels through strict admin receipts and reauthorizes identical retries', async (f) => {
+    const receipt = await f.submit();
+    const input = { project_id: f.project.id, run_id: receipt.run_id, idempotency_key: randomUUID() };
+    await assert.rejects(f.app.execute(f.worker.id, 'run_cancel', input), hasCode('FORBIDDEN'));
+    await f.app.execute(f.admin.id, 'member_set', {
+      project_id: f.project.id,
+      actor_id: f.other.id,
+      role: 'admin',
+      idempotency_key: randomUUID(),
+    });
+    const cancelled = (await f.app.execute(f.other.id, 'run_cancel', input)) as any;
+    assert.deepEqual(await f.app.execute(f.other.id, 'run_cancel', input), cancelled);
+    assert.deepEqual(
+      Object.keys(cancelled).sort(),
+      ['run_id', 'project_id', 'requested_at', 'process_state', 'effects_state', 'retrieval'].sort(),
+    );
+    assert.equal(cancelled.process_state, 'never_started');
+    assert.equal(cancelled.effects_state, 'not_started');
+    assert.equal((await f.get(receipt.run_id)).checkpoint.body, f.input.checkpoint.progress);
+    assert.ok(await f.storage.get('claims', f.ticket.id));
+    await assert.rejects(
+      f.app.execute(f.other.id, 'run_cancel', { ...input, run_id: randomUUID() }),
+      hasCode('IDEMPOTENCY_CONFLICT'),
+    );
+    const foreign = (await f.app.execute(f.admin.id, 'project_create', {
+      idempotency_key: randomUUID(),
+      key: 'C' + randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase(),
+      name: 'Other project',
+    })) as any;
+    await assert.rejects(
+      f.app.execute(f.admin.id, 'run_cancel', { ...input, project_id: foreign.id }),
+      hasCode('NOT_FOUND'),
+    );
+    await f.app.execute(f.admin.id, 'member_set', {
+      project_id: f.project.id,
+      actor_id: f.other.id,
+      role: 'contributor',
+      idempotency_key: randomUUID(),
+    });
+    await assert.rejects(f.app.execute(f.other.id, 'run_cancel', input), hasCode('FORBIDDEN'));
+  });
 
   check(
     'atomically stores checkpoint, separate job, continuation and one immutable compact retry receipt',
