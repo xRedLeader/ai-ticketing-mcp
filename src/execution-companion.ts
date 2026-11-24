@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Application } from './application.js';
 import {
+  DomainError,
   ensure,
   type ExecutionControllerFence,
   type ExecutionOutcome,
@@ -14,6 +15,7 @@ import {
   type ExecutionReconciliation,
 } from './contracts.js';
 import {
+  HOST_CAPACITY_LIMIT,
   HostCapacity,
   type HostCapacityNeverStartedProof,
   type HostCapacityObservation,
@@ -181,26 +183,33 @@ export class ExecutionCompanion {
         let admission!: ReturnType<HostCapacity['claimNext']>;
         let noStartCapacity: HostCapacityNeverStartedProof | null = null;
         while (true) {
-          const current = await app.admitExecutionRun(actor, project, job.id, token, controller, () => {
-            capacity.enqueue(host, {
-              queue_id: job.id,
-              run_id: job.id,
-              project_id: project,
-              kind: 'script',
-              resources: { ...recipe.resources },
-              timeout_ms: recipe.timeout_ms,
-              created_at: Date.parse(job.created_at),
+          let current: boolean;
+          try {
+            current = await app.admitExecutionRun(actor, project, job.id, token, controller, () => {
+              capacity.enqueue(host, {
+                queue_id: job.id,
+                run_id: job.id,
+                project_id: project,
+                kind: 'script',
+                resources: { ...recipe.resources },
+                timeout_ms: recipe.timeout_ms,
+                created_at: Date.parse(job.created_at),
+              });
+              admission = capacity.claimNext(host, this.owner, { kind: 'script', queue_ids: [job.id] });
+              noStartCapacity = {
+                host_id: host,
+                queue_id: job.id,
+                run_id: job.id,
+                project_id: project,
+                state: admission.admitted ? 'running' : 'queued',
+                execution_token: admission.admitted ? admission.request.execution_token : null,
+              };
             });
-            admission = capacity.claimNext(host, this.owner, { kind: 'script', queue_ids: [job.id] });
-            noStartCapacity = {
-              host_id: host,
-              queue_id: job.id,
-              run_id: job.id,
-              project_id: project,
-              state: admission.admitted ? 'running' : 'queued',
-              execution_token: admission.admitted ? admission.request.execution_token : null,
-            };
-          });
+          } catch (error) {
+            if (!(error instanceof DomainError) || error.details.reason !== HOST_CAPACITY_LIMIT) throw error;
+            await this.settleNeverStarted(job.id, controller, 'NOT_STARTED');
+            return true;
+          }
           if (!current) {
             if (
               (await app.storage.get('execution_admissions', project))?.paused &&
