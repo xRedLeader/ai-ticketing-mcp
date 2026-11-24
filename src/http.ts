@@ -52,7 +52,9 @@ export function createHttpServer(app: Application, config: HttpConfig) {
   const resource = new URL('/mcp', url).href;
   const metadataUrl = new URL('/.well-known/oauth-protected-resource/mcp', url).href;
   const validateHost = hostHeaderValidation([url.hostname, 'localhost', '127.0.0.1', '[::1]']);
-  const validateOrigin = originValidation(config.allowedOrigins ?? [url.hostname]);
+  const validateOrigin = originValidation(
+    (config.allowedOrigins ?? [url.hostname]).map((host) => host.trim()),
+  );
   let active = 0;
   const server = createServer(async (req, res) => {
     const start = performance.now();
