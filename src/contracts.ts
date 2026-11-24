@@ -401,6 +401,33 @@ export interface ContinuationInvocation {
   queue_id: string;
   execution_token: string;
 }
+export interface DependencyBranch {
+  ticket_id: string;
+  relationship: 'dependency' | 'child';
+  requirements_revision: number;
+  state: 'accepted' | 'pending' | 'failed' | 'cancelled' | 'superseded';
+  submission_id: string | null;
+  evidence: Evidence[];
+  retryable: boolean;
+}
+export interface DependencyJoin {
+  ticket_id: string;
+  requirements_revision: number;
+  identity: string;
+  ready: boolean;
+  branches: DependencyBranch[];
+}
+export interface BranchDispatchRecord {
+  id: string;
+  project_id: string;
+  actor_id: string;
+  claim_token: string;
+  requirements_revision: number;
+  capacity_id: string;
+  budget_run_id: string;
+  host_id: string;
+  dispatch: ContinuationDispatch;
+}
 export interface ContinuationDispatch {
   state: 'waiting' | 'starting' | 'running' | 'completed' | 'needs_attention';
   code: string | null;
@@ -558,6 +585,7 @@ export interface MilestoneProgress {
   status_counts: Record<Ticket['status'], number>;
 }
 export interface Tables {
+  branch_dispatches: BranchDispatchRecord;
   milestones: Milestone;
   milestone_memberships: MilestoneMembership;
   artifact_retirements: ArtifactRetirement;
@@ -637,6 +665,7 @@ export interface Transaction extends Reader {
   remove<K extends Table>(table: K, id: string): Promise<void>;
 }
 export interface StorageAdapter extends Reader {
+  readonly branchDispatches?: true;
   /** Optional proposal intake; ticket reads remain compatible without these tables. */
   readonly ideaIntake?: true;
   readonly milestones?: true;

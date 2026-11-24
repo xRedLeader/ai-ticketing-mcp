@@ -46,6 +46,8 @@ import {
   type ContinuationDispatch,
   type ContinuationDispatchContext,
   type ContinuationInvocation,
+  type DependencyJoin,
+  type BranchDispatchRecord,
   type WakeFence,
   type WakeRegistration,
   validateGitHubConfiguration,
@@ -64,6 +66,7 @@ import {
   unavailableArtifact,
 } from './execution-artifacts.js';
 import { ClientCapabilities } from './client-capabilities.js';
+import { dependencyJoin } from './dependency-join.js';
 import { pipelineIdentityError, type VerificationPipeline } from './verification-pipeline.js';
 import { inspectVerificationCache } from './execution-cache.js';
 import {
@@ -895,39 +898,331 @@ export class Application {
     dispatch: (selection: ClientSelection) => undefined,
   ) {
     return this.storage.transaction(projectId, async (reader) => {
-      const actor = await this.actor(actorId, reader),
-        project = await this.access(reader, actor, projectId, ['contributor', 'admin']);
-      const ticket = await this.ticket(reader, projectId, ticketId),
-        claim = await this.liveClaim(reader, ticket, actor, token);
-      ensure(
-        ticket.status === 'in_progress' && (!ticket.assignee_id || ticket.assignee_id === actor.id),
-        'NOT_CLAIMABLE',
-        'Agent dispatch requires in-progress work assigned to this worker or unassigned.',
+      const { execution } = await this.clientExecutionContext(reader, actorId, projectId, ticketId, token);
+      await this.noBranchInvocation(reader, ticketId);
+      await this.noContinuationInvocation(reader, ticketId);
+      dispatch(execution);
+      return execution;
+    });
+  }
+  private async noBranchInvocation(reader: Reader, ticketId: string) {
+    const row = this.storage.branchDispatches ? await reader.get('branch_dispatches', ticketId) : null;
+    ensure(
+      !row || row.dispatch.state === 'completed',
+      'BRANCH_PREDECESSOR_UNRESOLVED',
+      'Reconcile the managed branch before another agent launch.',
+    );
+  }
+  private async noContinuationInvocation(reader: Reader, ticketId: string) {
+    const wake = this.storage.wakeDecisions ? await reader.get('wake_conditions', ticketId) : null;
+    ensure(
+      !wake?.active?.dispatch || wake.active.dispatch.state === 'completed',
+      'CONTINUATION_PREDECESSOR_UNRESOLVED',
+      'Reconcile the managed continuation before another agent launch.',
+    );
+  }
+  private async clientExecutionContext(
+    reader: Reader,
+    actorId: string,
+    projectId: string,
+    ticketId: string,
+    token: string,
+  ) {
+    const actor = await this.actor(actorId, reader),
+      project = await this.access(reader, actor, projectId, ['contributor', 'admin']);
+    const ticket = await this.ticket(reader, projectId, ticketId),
+      claim = await this.liveClaim(reader, ticket, actor, token);
+    ensure(
+      ticket.status === 'in_progress' && (!ticket.assignee_id || ticket.assignee_id === actor.id),
+      'NOT_CLAIMABLE',
+      'Agent dispatch requires in-progress work assigned to this worker or unassigned.',
+    );
+    ensure(
+      !(await this.blockers(reader, ticket)).length,
+      'DEPENDENCY_BLOCKED',
+      'Resolve blockers before dispatch.',
+    );
+    const matched = this.matchClient(project, ticket, actor, claim.execution?.client_id);
+    ensure(
+      matched.selection && claim.execution && digest(matched.selection) === digest(claim.execution),
+      'CLIENT_SELECTION_CHANGED',
+      'Reclaim work and match again; its client, requirements or requested choices changed.',
+      { reasons: matched.reasons },
+    );
+    ensure(
+      await researchAdmission(reader, ticket, () => this.timestamp()),
+      'SPIKE_BUDGET_EXHAUSTED',
+      'Research elapsed time budget is exhausted.',
+    );
+    ensure(
+      claim.expires_at > this.timestamp(),
+      'CLAIM_EXPIRED',
+      'Research or delivery ownership expired before dispatch.',
+    );
+    return { execution: claim.execution, ticket, actor, project };
+  }
+  /** Snapshot only; dispatchClientExecution rechecks the join under the project mutation lock. */
+  async getDependencyJoin(actorId: string, projectId: string, ticketId: string): Promise<DependencyJoin> {
+    return this.storage.readSnapshot(async (reader) => {
+      await this.access(reader, await this.actor(actorId, reader), projectId);
+      return dependencyJoin(
+        reader,
+        await this.ticket(reader, projectId, ticketId),
+        this.storage.executionRuns,
+        this.storage.branchDispatches,
+      );
+    });
+  }
+  async getBranchDispatch(actorId: string, projectId: string, ticketId: string, token: string) {
+    ensure(
+      this.storage.branchDispatches,
+      'UNSUPPORTED_BRANCH_DISPATCH',
+      'Storage does not support durable branch dispatch.',
+    );
+    return this.storage.readSnapshot(async (reader) => {
+      await this.clientExecutionContext(reader, actorId, projectId, ticketId, token);
+      return reader.get('branch_dispatches', ticketId);
+    });
+  }
+  /** Ticket-store fence survives native claim release/reclaim and independent host ledgers. */
+  async dispatchBranchExecution(
+    actorId: string,
+    projectId: string,
+    ticketId: string,
+    token: string,
+    authority: { capacity_id: string; host_id: string; budget_run_id: string },
+    admit: (context: {
+      execution: ClientSelection;
+      join: DependencyJoin;
+    }) =>
+      | { state: 'waiting' | 'needs_attention'; code: string }
+      | { state: 'starting'; invocation: ContinuationInvocation },
+    launch: (
+      context: { execution: ClientSelection; join: DependencyJoin },
+      invocation: ContinuationInvocation,
+    ) => undefined,
+    recover: (record: BranchDispatchRecord) => ContinuationInvocation | null,
+    expectedJoin?: string,
+  ): Promise<ContinuationDispatch> {
+    ensure(
+      this.storage.branchDispatches,
+      'UNSUPPORTED_BRANCH_DISPATCH',
+      'Storage does not support durable branch dispatch.',
+    );
+    ensure(
+      uuid.test(ticketId) &&
+        uuid.test(token) &&
+        uuid.test(authority.capacity_id) &&
+        authority.host_id.length > 0,
+      'INVALID_INPUT',
+      'Invalid branch dispatch fence.',
+    );
+    const context = async (tx: Transaction) => {
+      const current = await this.clientExecutionContext(tx, actorId, projectId, ticketId, token);
+      await this.noContinuationInvocation(tx, ticketId);
+      const join = await dependencyJoin(
+        tx,
+        current.ticket,
+        this.storage.executionRuns,
+        this.storage.branchDispatches,
       );
       ensure(
-        !(await this.blockers(reader, ticket)).length,
+        join.ready,
         'DEPENDENCY_BLOCKED',
-        'Resolve blockers before dispatch.',
-      );
-      const matched = this.matchClient(project, ticket, actor, claim.execution?.client_id);
-      ensure(
-        matched.selection && claim.execution && digest(matched.selection) === digest(claim.execution),
-        'CLIENT_SELECTION_CHANGED',
-        'Reclaim work and match again; its client, requirements or requested choices changed.',
-        { reasons: matched.reasons },
+        'Every required branch needs acceptance for its current requirements.',
+        { join },
       );
       ensure(
-        await researchAdmission(reader, ticket, () => this.timestamp()),
-        'SPIKE_BUDGET_EXHAUSTED',
-        'Research elapsed time budget is exhausted.',
+        !expectedJoin || expectedJoin === join.identity,
+        'JOIN_CHANGED',
+        'Accepted branch identity changed.',
       );
       ensure(
-        claim.expires_at > this.timestamp(),
+        (await this.liveClaim(tx, current.ticket, current.actor, token)).expires_at > this.timestamp(),
         'CLAIM_EXPIRED',
-        'Research or delivery ownership expired before dispatch.',
+        'Ownership expired before branch dispatch.',
       );
-      dispatch(claim.execution);
-      return claim.execution;
+      return { execution: current.execution, join };
+    };
+    const current = async (tx: Transaction) => {
+      const row = await tx.get('branch_dispatches', ticketId);
+      ensure(
+        row?.project_id === projectId &&
+          row.actor_id === actorId &&
+          row.claim_token === token &&
+          row.capacity_id === authority.capacity_id &&
+          row.budget_run_id === authority.budget_run_id &&
+          row.host_id === authority.host_id,
+        'BRANCH_OWNERSHIP_CHANGED',
+        'Branch admission belongs to another claim or host authority.',
+      );
+      return row;
+    };
+    const save = async (tx: Transaction, row: BranchDispatchRecord, dispatch: ContinuationDispatch) => {
+      await tx.put('branch_dispatches', { ...row, dispatch });
+      return dispatch;
+    };
+    await this.storage.transaction(projectId, async (tx) => {
+      const validated = await context(tx);
+      const previous = await tx.get('branch_dispatches', ticketId);
+      if (previous?.claim_token === token) {
+        await current(tx);
+        return;
+      }
+      ensure(
+        !previous || previous.dispatch.state === 'completed',
+        'BRANCH_PREDECESSOR_UNRESOLVED',
+        'Reconcile the prior branch invocation before a new claim can dispatch.',
+      );
+      await tx.put('branch_dispatches', {
+        id: ticketId,
+        project_id: projectId,
+        actor_id: actorId,
+        claim_token: token,
+        requirements_revision: validated.join.requirements_revision,
+        ...authority,
+        dispatch: {
+          state: 'waiting',
+          code: 'ADMISSION_PENDING',
+          invocation: null,
+          identity: validated.join.identity,
+          admission_uncertain: true,
+        },
+      });
+    });
+    let reserved = false;
+    const intent = await this.storage.transaction(projectId, async (tx) => {
+      const row = await current(tx);
+      if (row.dispatch.state !== 'waiting') return row.dispatch;
+      try {
+        const recovered = recover(row);
+        if (recovered)
+          return save(tx, row, {
+            ...row.dispatch,
+            state: 'needs_attention',
+            code: 'ADMISSION_UNCERTAIN',
+            invocation: recovered,
+            admission_uncertain: true,
+          });
+        const validated = await context(tx);
+        ensure(
+          validated.join.identity === row.dispatch.identity,
+          'JOIN_CHANGED',
+          'Join changed after reservation.',
+        );
+        const admitted = admit(validated);
+        reserved = admitted.state === 'starting';
+        return save(tx, row, {
+          state: admitted.state,
+          code: 'code' in admitted ? admitted.code : null,
+          invocation: 'invocation' in admitted ? admitted.invocation : null,
+          identity: row.dispatch.identity,
+          admission_uncertain: reserved,
+        });
+      } catch (error) {
+        let invocation: ContinuationInvocation | null = null;
+        let checked = false;
+        try {
+          invocation = recover(row);
+          checked = true;
+        } catch {
+          /* Preserve uncertain local admission. */
+        }
+        return save(tx, row, {
+          ...row.dispatch,
+          state: 'needs_attention',
+          code: invocation
+            ? 'ADMISSION_UNCERTAIN'
+            : error instanceof DomainError
+              ? error.code
+              : 'DISPATCH_VALIDATION_FAILED',
+          invocation,
+          admission_uncertain: !!invocation || !checked,
+        });
+      }
+    });
+    if (!reserved) return intent;
+    return this.storage.transaction(projectId, async (tx) => {
+      const row = await current(tx);
+      ensure(
+        row.dispatch.state === 'starting' && digest(row.dispatch) === digest(intent),
+        'BRANCH_OWNERSHIP_CHANGED',
+        'Branch launch intent changed.',
+      );
+      try {
+        const validated = await context(tx);
+        ensure(
+          validated.join.identity === row.dispatch.identity,
+          'JOIN_CHANGED',
+          'Join changed before launch.',
+        );
+        ensure(
+          launch(validated, row.dispatch.invocation!) === undefined,
+          'INVALID_INPUT',
+          'Trusted launch callback must be synchronous.',
+        );
+        return save(tx, row, { ...row.dispatch, state: 'running', code: null });
+      } catch (error) {
+        return save(tx, row, {
+          ...row.dispatch,
+          state: 'needs_attention',
+          code: error instanceof DomainError ? error.code : 'LAUNCH_UNCERTAIN',
+        });
+      }
+    });
+  }
+  async completeBranchExecution(
+    actorId: string,
+    projectId: string,
+    ticketId: string,
+    token: string,
+    authority: { capacity_id: string; host_id: string; budget_run_id: string },
+    exited: (record: BranchDispatchRecord) => {
+      invocation: ContinuationInvocation | null;
+      outcome: 'succeeded' | 'failed' | 'cancelled' | 'rejected';
+    } | null,
+  ) {
+    ensure(
+      this.storage.branchDispatches,
+      'UNSUPPORTED_BRANCH_DISPATCH',
+      'Storage does not support durable branch dispatch.',
+    );
+    return this.storage.transaction(projectId, async (tx) => {
+      const actor = await this.actor(actorId, tx);
+      await this.access(tx, actor, projectId, ['contributor', 'admin']);
+      const row = await tx.get('branch_dispatches', ticketId);
+      ensure(
+        row?.project_id === projectId && (row.actor_id === actorId || actor.system_admin),
+        'FORBIDDEN',
+        'Branch belongs to another worker.',
+      );
+      const proof =
+        row.claim_token === token &&
+        row.capacity_id === authority.capacity_id &&
+        row.host_id === authority.host_id &&
+        row.budget_run_id === authority.budget_run_id
+          ? exited(row)
+          : null;
+      ensure(
+        row.claim_token === token &&
+          row.capacity_id === authority.capacity_id &&
+          row.host_id === authority.host_id &&
+          proof &&
+          (!row.dispatch.invocation || digest(row.dispatch.invocation) === digest(proof.invocation)),
+        'BRANCH_PREDECESSOR_UNRESOLVED',
+        'Exact branch exit and usage settlement are required.',
+      );
+      await tx.put('branch_dispatches', {
+        ...row,
+        dispatch: {
+          ...row.dispatch,
+          state: 'completed',
+          code: proof.outcome,
+          invocation: proof.invocation,
+          admission_uncertain: false,
+        },
+      });
+      return true;
     });
   }
   private async liveClaim(tx: Reader, ticket: Ticket, actor: Actor, token: string) {
@@ -1443,6 +1738,7 @@ export class Application {
       'Resolve execution exit and effects before continuation dispatch.',
     );
     const ticket = await this.ticket(tx, project.id, row.ticket_id);
+    await this.noBranchInvocation(tx, ticket.id);
     ensure(
       ticket.requirements_revision === run.requirements_revision,
       'REQUIREMENTS_CHANGED',
