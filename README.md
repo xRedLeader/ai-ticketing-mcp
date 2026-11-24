@@ -8,6 +8,7 @@ Headless ticketing built for agents: find useful work, claim it safely, recover 
 
 - Structured tickets with acceptance criteria, priorities, capabilities, parents, and blocking dependencies.
 - Opt-in trusted-host [parallel branch dispatch and verified joins](docs/branch-dispatch.md), with durable ownership and existing host capacity limits.
+- Optional local [integration preparation](docs/integration-companion.md) against the current target, with preserved conflicts and fresh candidate verification.
 - Project idea intake and triage, with atomic promotion into delivery tickets and source provenance.
 - [Time-boxed research](docs/research.md) with separate claims, durable findings and evidence-linked delivery decisions.
 - Atomic ten-minute claims, heartbeat renewal, stale-worker fencing, and retry-safe mutations.
