@@ -206,7 +206,7 @@ it(
         grant_type: 'password',
         client_id: 'admin-cli',
         username: 'fixture-admin',
-        password: 'fixture-only',
+        password: env.KEYCLOAK_ADMIN_PASSWORD,
       });
       const admin = async (path: string, init: RequestInit = {}) => {
         const response = await fetch(`${base}/admin/realms/ticketing/${path}`, {
