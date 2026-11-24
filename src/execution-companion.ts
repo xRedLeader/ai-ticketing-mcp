@@ -49,7 +49,8 @@ export type ExecutionApplication = Pick<
   | 'cancelExecutionRun'
   | 'reconcileExecutionCancellation'
   | 'evaluateWakeConditions'
->;
+> &
+  Partial<Pick<Application, 'tryReuseExecutionRun'>>;
 export interface ExecutionCompanionOptions {
   application: ExecutionApplication;
   capacity: HostCapacity;
@@ -179,6 +180,13 @@ export class ExecutionCompanion {
           await this.settleNeverStarted(job.id, controller, 'RECIPE_UNAVAILABLE');
           return true;
         }
+        if (
+          'kind' in recipe &&
+          recipe.cacheable &&
+          app.tryReuseExecutionRun &&
+          (await app.tryReuseExecutionRun(actor, project, job.id, token, controller, recipe))
+        )
+          return true;
         const capacityDeadline = Date.now() + 30_000;
         let admission!: ReturnType<HostCapacity['claimNext']>;
         let noStartCapacity: HostCapacityNeverStartedProof | null = null;

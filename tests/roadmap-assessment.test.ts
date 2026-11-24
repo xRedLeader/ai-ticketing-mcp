@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { join, dirname, basename, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
+import { createHash } from 'node:crypto';
 import {
   isolatedEnvironment,
   summarizeWire,
@@ -264,4 +265,190 @@ it('keeps a required paged omission pending until its terminal page is received'
   );
   calls.push(observed('ticket_history', { ...args, offset: 2 }, { items: [] }));
   assert.equal(deliveryProof(calls, 'worker', 'planner', 'ticket_update', mutation).success, true);
+});
+
+it('recovers all native result bytes before review and never accepts unavailable or failed artifact evidence', async () => {
+  const artifact =
+    'execution:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222:result';
+  const bytes = Buffer.from('{"exit_code":0}');
+  const hash = (value: Buffer) => createHash('sha256').update(value).digest('hex');
+  const args = { project_id: 'project', artifact_id: artifact, offset: 0, length: 65536, max_tokens: 8192 };
+  const route = { retrieve_with: 'artifact_read', arguments: args, required_before: 'review' };
+  const packet = {
+    ...context,
+    submissions: [
+      {
+        id: 'submission',
+        actor_id: 'worker',
+        requirements_revision: 2,
+        evidence: [
+          {
+            criterion_id: 'criterion',
+            result: 'pass',
+            summary: 'Worker reports success.',
+            references: [artifact],
+          },
+        ],
+      },
+    ],
+    omitted: [route],
+  };
+  const mutation = {
+    project_id: 'project',
+    ticket_id: 'ticket',
+    submission_id: 'submission',
+    expected_revision: 10,
+    decision: 'approve',
+  };
+  const page = (offset: number, end: number) => ({
+    artifact_id: artifact,
+    status: 'available',
+    size_bytes: bytes.length,
+    total_bytes: bytes.length,
+    truncated: false,
+    omitted_bytes: 0,
+    sha256: hash(bytes),
+    range: {
+      offset,
+      returned_length: end - offset,
+      data: bytes.subarray(offset, end).toString('base64'),
+      sha256: hash(bytes.subarray(offset, end)),
+    },
+  });
+  const calls = [
+    observed('ticket_context', { project_id: 'project', ticket_id: 'ticket' }, packet),
+    observed('artifact_read', args, page(0, 8)),
+  ];
+  assert.equal(deliveryProof(calls, 'reviewer', 'reviewer', 'ticket_review', mutation).success, false);
+  calls.push(observed('artifact_read', { ...args, offset: 8 }, page(8, bytes.length)));
+  assert.equal(deliveryProof(calls, 'reviewer', 'reviewer', 'ticket_review', mutation).success, true);
+  const requested: any[] = [];
+  const session: any = {
+    async call(_tool: string, received: any) {
+      requested.push(received);
+      return (received.offset ?? 0) === 0 ? page(0, 8) : page(8, bytes.length);
+    },
+  };
+  assert.equal((await recoverOmissions(session, packet, 'review')).length, 2);
+  assert.equal(requested[1].offset, 8);
+  const unavailable = { artifact_id: artifact, status: 'missing' };
+  assert.equal(
+    deliveryProof(
+      [calls[0], observed('artifact_read', args, unavailable)],
+      'reviewer',
+      'reviewer',
+      'ticket_review',
+      mutation,
+    ).success,
+    false,
+  );
+  await assert.rejects(
+    recoverOmissions(
+      {
+        async call() {
+          return unavailable;
+        },
+      } as any,
+      packet,
+      'review',
+    ),
+    /unavailable/,
+  );
+});
+
+it('shares reviewer validation for direct project, ticket and exact submission reads without packet omissions', () => {
+  const artifact =
+    'execution:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222:result';
+  const submission = {
+    id: 'submission',
+    project_id: 'project',
+    ticket_id: 'ticket',
+    actor_id: 'worker',
+    requirements_revision: 2,
+    ticket_revision: 10,
+    evidence: [
+      {
+        criterion_id: 'criterion',
+        result: 'pass',
+        summary: 'Worker reports all native checks passed.',
+        references: [artifact],
+      },
+    ],
+  };
+  const calls = [
+    observed(
+      'project_get',
+      { project_id: 'project' },
+      { project: { id: 'project', instructions: context.project_instructions.text, policy: 'independent' } },
+    ),
+    observed(
+      'ticket_get',
+      { project_id: 'project', ticket_id: 'ticket' },
+      { ticket: context.ticket, criteria: context.criteria, blockers: [], links: [] },
+    ),
+    observed(
+      'ticket_history',
+      { project_id: 'project', ticket_id: 'ticket', kind: 'submissions', item_id: submission.id },
+      { items: [submission] },
+    ),
+  ];
+  const mutation = {
+    project_id: 'project',
+    ticket_id: 'ticket',
+    submission_id: submission.id,
+    expected_revision: 10,
+    decision: 'approve',
+  };
+  const args = { project_id: 'project', artifact_id: artifact, offset: 0, length: 16 };
+  const hash = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
+  const read = (exit_code: number, offset = 0, end?: number) => {
+    const bytes = Buffer.from(JSON.stringify({ exit_code })),
+      range = bytes.subarray(offset, end ?? bytes.length);
+    return observed(
+      'artifact_read',
+      { ...args, offset },
+      {
+        artifact_id: artifact,
+        status: 'available',
+        size_bytes: bytes.length,
+        total_bytes: bytes.length,
+        omitted_bytes: 0,
+        truncated: false,
+        sha256: hash(bytes),
+        range: { offset, returned_length: range.length, sha256: hash(range), data: range.toString('base64') },
+      },
+    );
+  };
+  const missing = deliveryProof(calls, 'reviewer', 'reviewer', 'ticket_review', mutation);
+  assert.equal(missing.success, false);
+  assert.equal(missing.facts.submitted_artifacts_verified, false);
+  assert.ok(missing.review_validation?.proofs[0].missing.includes('submitted_artifact_bytes'));
+  const failed = deliveryProof([...calls, read(7)], 'reviewer', 'reviewer', 'ticket_review', mutation);
+  assert.equal(failed.success, false);
+  assert.equal(failed.facts.submitted_artifacts_verified, false);
+  assert.ok(failed.review_validation?.proofs[0].missing.includes('submitted_artifact_failed'));
+  assert.equal(
+    deliveryProof([...calls, read(0, 0, 8)], 'reviewer', 'reviewer', 'ticket_review', mutation).success,
+    false,
+  );
+  assert.equal(
+    deliveryProof([...calls, read(0, 0, 8), read(0, 8)], 'reviewer', 'reviewer', 'ticket_review', mutation)
+      .success,
+    true,
+  );
+  assert.equal(
+    deliveryProof([calls[0], calls[1], read(0), calls[2]], 'reviewer', 'reviewer', 'ticket_review', mutation)
+      .success,
+    false,
+  );
+  assert.equal(
+    deliveryProof(
+      [...calls, { ...read(0), actor_id: 'worker' }],
+      'reviewer',
+      'reviewer',
+      'ticket_review',
+      mutation,
+    ).success,
+    false,
+  );
 });

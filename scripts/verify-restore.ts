@@ -14,6 +14,7 @@ const tables = [
   'links',
   'notes',
   'claims',
+  'claim_handoffs',
   'submissions',
   'reviews',
   'knowledge',

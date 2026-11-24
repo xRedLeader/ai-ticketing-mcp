@@ -60,6 +60,7 @@ export function registerExecutionUpgradeContractTests(
               !file.includes('durable_wakes') &&
               !file.includes('client_capabilities') &&
               !file.includes('artifact_retention') &&
+              !file.includes('claim_handoffs') &&
               (history === 'main'
                 ? !file.includes('project_memory') && !file.includes('execution_runs')
                 : !file.includes('review_fixes')),

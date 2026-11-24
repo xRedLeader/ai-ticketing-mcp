@@ -146,6 +146,63 @@ export function registerExecutionArtifactContracts(name: string, factory: () => 
     await writeFile(join(f.path, 'outcome.json'), JSON.stringify({ exit_code: 0 }));
     await assert.rejects(f.read({ artifact_id: f.refs[2] }), hasCode('INVALID_ARTIFACT'));
   });
+
+  check('limits independent reviewer artifact recovery to the current submitted evidence', async (f) => {
+    const claim = (await f.storage.get('claims', f.run.ticket_id))!;
+    const current = (await f.app.execute(f.worker.id, 'ticket_get', {
+      project_id: f.project.id,
+      ticket_id: f.run.ticket_id,
+    })) as any;
+    const submission = (await f.app.execute(f.worker.id, 'ticket_submit', {
+      project_id: f.project.id,
+      ticket_id: f.run.ticket_id,
+      claim_token: claim.token,
+      expected_revision: current.ticket.revision,
+      idempotency_key: randomUUID(),
+      summary: 'Review the failed native result independently.',
+      evidence: current.criteria.map((criterion: any) => ({
+        criterion_id: criterion.id,
+        result: 'pass',
+        summary: 'Worker claims success.',
+        references: [f.refs[2]],
+      })),
+    })) as any;
+    const args = { project_id: f.project.id, artifact_id: f.refs[2], length: 65536, max_tokens: 8192 };
+    const result = (await f.app.execute(f.reviewer.id, 'artifact_read', args, 'reviewer')) as any;
+    assert.equal(JSON.parse(Buffer.from(result.range.data, 'base64').toString()).exit_code, 7);
+    const context = (await f.app.execute(
+      f.reviewer.id,
+      'ticket_context',
+      { project_id: f.project.id, ticket_id: f.run.ticket_id },
+      'reviewer',
+    )) as any;
+    assert.equal(context.latest_checkpoint, undefined);
+    assert.ok(
+      context.omitted.some(
+        (item: any) =>
+          item.required_before === 'review' &&
+          item.retrieve_with === 'artifact_read' &&
+          item.arguments.artifact_id === f.refs[2],
+      ),
+    );
+    await assert.rejects(
+      f.app.execute(f.reviewer.id, 'artifact_read', { ...args, artifact_id: f.refs[0] }, 'reviewer'),
+      hasCode('FORBIDDEN'),
+    );
+    await assert.rejects(
+      f.app.execute(f.outsider.id, 'artifact_read', args, 'reviewer'),
+      hasCode('FORBIDDEN'),
+    );
+    await f.call(f.worker.id, 'ticket_update', {
+      ticket_id: f.run.ticket_id,
+      expected_revision: submission.ticket.revision,
+      criteria: ['Changed criterion.'],
+    });
+    await assert.rejects(
+      f.app.execute(f.reviewer.id, 'artifact_read', args, 'reviewer'),
+      hasCode('FORBIDDEN'),
+    );
+  });
   check('makes captured gaps, past-end, missing and expired artifacts explicit', async (f) => {
     const gap = await f.read({ offset: f.content.length - 3, length: 20 });
     assert.equal(gap.range.returned_length, 3);

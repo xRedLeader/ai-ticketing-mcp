@@ -283,6 +283,22 @@ const executionJob = z.object({
   signal: z.string().nullable(),
   artifacts: z.array(z.string()),
   error_code: z.string().nullable(),
+  cache: z
+    .object({
+      key: z.string().regex(/^[a-f0-9]{64}$/),
+      source_run_id: id,
+      source_attempt_id: id,
+      artifacts: z
+        .array(
+          z.object({
+            artifact_id: z.string(),
+            sha256: z.string().regex(/^[a-f0-9]{64}$/),
+            size_bytes: z.number().int().nonnegative(),
+          }),
+        )
+        .max(3),
+    })
+    .optional(),
 });
 const continuation = z.object({
   id,
@@ -320,9 +336,14 @@ const omission = z.object({
   required_before: z.enum(['execution', 'review']).optional(),
 });
 const context = z.discriminatedUnion('not_modified', [
-  z.object({ fingerprint: z.string(), not_modified: z.literal(true) }),
   z.object({
     fingerprint: z.string(),
+    not_modified: z.literal(true),
+    authorization_binding: z.string().optional(),
+  }),
+  z.object({
+    fingerprint: z.string(),
+    authorization_binding: z.string().optional(),
     not_modified: z.literal(false),
     ticket,
     criteria: z.array(criterion),
@@ -332,6 +353,7 @@ const context = z.discriminatedUnion('not_modified', [
     approval_policy: z.enum(['self', 'independent', 'human']),
     blockers: z.array(blocker),
     completion_blockers: z.array(blocker),
+    review_blockers: z.array(blocker).optional(),
     dependencies: z.array(link.extend({ ticket: ticketSummary.nullable() })),
     claim: visibleClaim,
     untrusted_content_notice: z.string(),
@@ -394,6 +416,7 @@ const executionView = z.object({
       signal: true,
       error_code: true,
       artifacts: true,
+      cache: true,
     }),
   ]),
   continuation: z.union([continuation, continuation.pick({ id: true, status: true, failure_reason: true })]),
@@ -628,6 +651,7 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
     blockers: z.array(blocker),
   }),
   ticket_history: z.object({
+    authorization_binding: z.string().optional(),
     items: z.array(z.union([note, submission, review, githubEvidenceSchema, executionResumeSchema, change])),
     has_more: z.boolean().optional(),
     next_offset: z.number().optional(),
@@ -642,6 +666,7 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
   work_claim: z.object({
     ticket: ticketReceipt,
     claim,
+    handoff: z.object({ checkpoint_id: id, source_actor_id: id }).optional(),
     context: context.optional(),
     context_omitted: z.enum(['requested', 'legacy_receipt']).optional(),
     context_ref: retrieval.optional(),
@@ -713,7 +738,7 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
       trusted_reuse: z.literal(false).default(false),
       verification_state: z.enum(['unverified', 'verified']).default('unverified'),
     }),
-  checkpoint_get: note,
+  checkpoint_get: note.extend({ authorization_binding: z.string().optional() }),
   changes_since: z.object({
     events: z.array(change),
     next_cursor: z.number(),

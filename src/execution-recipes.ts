@@ -176,7 +176,12 @@ export class ExecutionRecipeRegistry {
   }
 
   metadata() {
-    return this.recipes.map(({ id, fingerprint, project_ids }) => ({ id, fingerprint, project_ids }));
+    return this.recipes.map((recipe) => ({
+      id: recipe.id,
+      fingerprint: recipe.fingerprint,
+      project_ids: recipe.project_ids,
+      ...('cacheable' in recipe && recipe.cacheable ? { cacheable: true as const } : {}),
+    }));
   }
 
   get(id: string, fingerprint: string, projectId: string): ExecutionRecipe {

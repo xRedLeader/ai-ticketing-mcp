@@ -202,7 +202,7 @@ it(
       ).join('');
       for (const secret of [tokens.good, tokens.readOnly, tokens.noRead, ...tokens.invalid])
         assert.equal(capture.includes(secret), false);
-      assert.equal(/authorization|bearer /i.test(capture), false);
+      assert.equal(/\bauthorization"?\s*:|\bbearer[ \t]/i.test(capture), false);
       for (const method of ['initialize', 'tools/list', 'tools/call', 'resources/read'])
         assert.ok(capture.includes(method), method);
       const manifest = JSON.parse(await readFile(join(recorder.runDirectory, 'run.json'), 'utf8'));

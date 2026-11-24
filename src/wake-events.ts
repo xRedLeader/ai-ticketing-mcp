@@ -37,6 +37,7 @@ const registrationInput = z.strictObject({
   expected_revision: z.int().positive().optional(),
 });
 const evaluationInput = z.strictObject({
+  ticket_id: z.uuid().optional(),
   after: z.uuid().optional(),
   limit: z.int().min(1).max(100).default(100),
   event_limit: z.int().min(1).max(100).default(100),
@@ -141,8 +142,12 @@ export async function registerWake(
 
 export async function evaluateWakes(tx: Transaction, project: Project, raw: unknown, now: string) {
   const input = parse(evaluationInput, raw);
+  ensure(!input.ticket_id || !input.after, 'INVALID_INPUT', 'Choose a ticket or registration page.');
   const page = await tx.find('wake_conditions', {
-    where: { project_id: project.id, ...(input.after ? { id: { gt: input.after } } : {}) },
+    where: {
+      project_id: project.id,
+      ...(input.ticket_id ? { id: input.ticket_id } : input.after ? { id: { gt: input.after } } : {}),
+    },
     order: [{ field: 'id', direction: 'asc' }],
     limit: input.limit + 1,
   });
@@ -285,6 +290,15 @@ export async function finishWake(tx: Transaction, projectId: string, raw: unknow
     };
   if (row.active.generation !== input.generation || row.active.token !== input.token)
     return { completed: false, changed: false, ticket_id: row.ticket_id, generation: input.generation };
+  ensure(
+    !row.active.dispatch ||
+      row.active.dispatch.state === 'completed' ||
+      (row.active.dispatch.state === 'needs_attention' &&
+        !row.active.dispatch.invocation &&
+        row.active.dispatch.admission_uncertain === false),
+    'WAKE_PENDING',
+    'Confirm invocation exit before finishing its wake decision.',
+  );
   await tx.put('wake_conditions', {
     ...row,
     active: null,

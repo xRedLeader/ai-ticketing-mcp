@@ -14,7 +14,11 @@ import {
   terminateExecutionProcessTree,
 } from './execution-journal.js';
 import type { HostCapacityNeverStartedProof } from './host-capacity.js';
-import { pipelineIdentityError, verificationRunnerPath } from './verification-pipeline.js';
+import {
+  MAX_VERIFICATION_REPORT_BYTES,
+  pipelineIdentityError,
+  verificationRunnerPath,
+} from './verification-pipeline.js';
 import type { VerificationReport } from './verification-runner.js';
 import { readVerificationTimeout } from './verification-timeout.js';
 
@@ -217,7 +221,10 @@ async function supervise(directory: string) {
     let verification: VerificationReport | undefined;
     if (pipeline) {
       try {
-        verification = readExecutionFile(join(directory, 'pipeline-report.json')) as VerificationReport;
+        verification = readExecutionFile(
+          join(directory, 'pipeline-report.json'),
+          MAX_VERIFICATION_REPORT_BYTES,
+        ) as VerificationReport;
         if (
           verification.recipe_fingerprint !== pipeline.fingerprint ||
           verification.pipeline_id !== pipeline.id ||
@@ -234,7 +241,15 @@ async function supervise(directory: string) {
       if (verification) {
         for (const stream of ['stdout', 'stderr'] as const) {
           total_bytes[stream] = verification.steps.reduce(
-            (total, step) => Math.min(Number.MAX_SAFE_INTEGER, total + step.diagnostics[stream].total_bytes),
+            (total, step) =>
+              Math.min(
+                Number.MAX_SAFE_INTEGER,
+                total +
+                  (step.attempts ?? [step]).reduce(
+                    (sum, attempt) => sum + attempt.diagnostics[stream].total_bytes,
+                    0,
+                  ),
+              ),
             0,
           );
           truncated[stream] ||= total_bytes[stream] > bytes[stream];
