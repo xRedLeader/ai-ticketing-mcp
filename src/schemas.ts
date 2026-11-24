@@ -50,6 +50,10 @@ const ticketFields = {
   parent_id: ref.nullable().default(null),
   criteria,
 };
+const deliveryTicket = z
+  .object({ ...ticketFields, status: z.enum(['backlog', 'ready']).default('backlog') })
+  .strict();
+const ideaStatus = z.enum(['submitted', 'parked', 'declined', 'promoted']);
 const evidence = z
   .object({
     criterion_id: id,
@@ -59,6 +63,115 @@ const evidence = z
   })
   .strict();
 export const schemas = {
+  spike_schedule: z
+    .object({
+      ...project,
+      ...mutation,
+      idea_id: id,
+      question: text.max(16000),
+      time_budget_ms: z.int().min(1).max(604800000),
+      assignee_id: id.nullable().default(null),
+      execution_hints: executionHintsSchema.optional(),
+    })
+    .strict(),
+  spike_list: z.object({ ...project, ...page, idea_id: id.optional() }).strict(),
+  spike_get: z.object({ ...project, spike_id: id }).strict(),
+  spike_claim: z
+    .object({
+      ...project,
+      ...mutation,
+      spike_id: id,
+      client_id: clientId.optional(),
+      handoff_checkpoint_id: id.optional(),
+      include_context: z.boolean().default(true),
+      max_tokens: maxTokens.default(4096),
+    })
+    .strict()
+    .refine((value) => !value.handoff_checkpoint_id || value.include_context, {
+      message: 'Handoff acknowledgment requires complete context.',
+    }),
+  spike_complete: z
+    .object({
+      ...project,
+      ...mutation,
+      ...revision,
+      spike_id: id,
+      claim_token: id,
+      findings: text.max(16000),
+      evidence: z.array(text.max(2000)).min(1).max(50),
+      recommendation: z.enum(['promote', 'park', 'decline']),
+    })
+    .strict(),
+  idea_create: z
+    .object({
+      ...project,
+      ...mutation,
+      title: text.max(300),
+      problem: text.max(16000),
+      proposal: text.max(16000),
+      why: text.max(16000),
+    })
+    .strict(),
+  idea_list: z.object({ ...project, ...page, status: ideaStatus.optional() }).strict(),
+  idea_get: z.object({ ...project, idea_id: id }).strict(),
+  idea_triage: z.discriminatedUnion('action', [
+    z
+      .object({
+        ...project,
+        ...mutation,
+        ...revision,
+        idea_id: id,
+        action: z.enum(['park', 'decline']),
+        rationale: text.max(4000),
+      })
+      .strict(),
+    z
+      .object({
+        ...project,
+        ...mutation,
+        ...revision,
+        idea_id: id,
+        action: z.literal('promote'),
+        rationale: text.max(4000),
+        tickets: z.array(deliveryTicket).min(1).max(50),
+        spike_ids: z.array(id).max(50).optional(),
+      })
+      .strict(),
+  ]),
+  milestone_create: z
+    .object({
+      ...project,
+      ...mutation,
+      name: text.max(200),
+      outcome: text.max(16000),
+      exit_criteria: criteria,
+    })
+    .strict(),
+  milestone_update: z
+    .object({
+      ...project,
+      ...mutation,
+      ...revision,
+      milestone_id: id,
+      name: text.max(200).optional(),
+      outcome: text.max(16000).optional(),
+      exit_criteria: criteria.optional(),
+    })
+    .strict(),
+  milestone_complete: z
+    .object({
+      ...project,
+      ...mutation,
+      ...revision,
+      milestone_id: id,
+      confirm_exit_criteria: z.literal(true),
+    })
+    .strict(),
+  ticket_milestone_set: z
+    .object({ ...ticket, ...mutation, milestone_id: id.nullable(), expected_milestone_id: id.nullable() })
+    .strict(),
+  milestone_list: z.object({ ...project, ...page }).strict(),
+  milestone_get: z.object({ ...project, ...page, milestone_id: id }).strict(),
   run_submit: z
     .object({
       ...ticket,
@@ -141,12 +254,7 @@ export const schemas = {
     .object({
       ...project,
       ...mutation,
-      tickets: z
-        .array(
-          z.object({ ...ticketFields, status: z.enum(['backlog', 'ready']).default('backlog') }).strict(),
-        )
-        .min(1)
-        .max(50),
+      tickets: z.array(deliveryTicket).min(1).max(50),
     })
     .strict(),
   ticket_get: z.object(ticket).strict(),
@@ -385,6 +493,12 @@ export const schemas = {
 export type Operation = keyof typeof schemas;
 export type Input<K extends Operation> = z.infer<(typeof schemas)[K]>;
 export const readOperations = new Set<Operation>([
+  'spike_list',
+  'spike_get',
+  'idea_list',
+  'idea_get',
+  'milestone_list',
+  'milestone_get',
   'run_get',
   'run_wait',
   'artifact_read',
@@ -403,6 +517,31 @@ export const readOperations = new Set<Operation>([
   'changes_since',
 ]);
 export const descriptions: Record<Operation, string> = {
+  spike_schedule:
+    'Schedule a separate research spike from an idea with a question and elapsed time budget, starting on first claim.',
+  spike_list:
+    'Discover project research separately from delivery work, including completed findings and budget exhaustion.',
+  spike_get: 'Read the research question, durable findings, evidence, recommendation and elapsed budget.',
+  spike_claim:
+    'Claim or resume research separately from delivery work. Reclaims never reset the first-claim deadline.',
+  spike_complete:
+    'Record findings, evidence and a promote/park/decline recommendation with the current research claim. Results remain allowed after budget exhaustion; idea triage stays separate.',
+  idea_create:
+    'Capture a project proposal with its problem, possible improvement and value. Ideas are never claimable.',
+  idea_list: 'List project ideas, including parked, declined and promoted dispositions.',
+  idea_get: 'Read a project idea, its disposition and source links to delivery tickets.',
+  idea_triage:
+    'Park, decline or promote an idea with rationale and revision protection. Promotion atomically creates delivery tickets and provenance; retry with the same idempotency key.',
+  milestone_create:
+    'Create a project milestone with outcome and exit criteria. Contributor or admin required.',
+  milestone_update: 'Edit a milestone with revision protection; edits reopen completion.',
+  milestone_complete:
+    'Explicitly confirm exit criteria after all member tickets have current accepted requirements.',
+  ticket_milestone_set:
+    'Attach, move or detach one same-project ticket. Supply its current milestone ID, or null, as expected_milestone_id. Does not change scheduling or dependencies.',
+  milestone_list: 'Page compact milestone summaries with live ticket status counts and accepted progress.',
+  milestone_get:
+    'Read outcome, exit criteria, live progress and a page of compact member tickets. Follow has_more.',
   run_timeline:
     'Explain one authorized run, its immutable observation timeline, current ownership and next safe wake/action. Paginate by after_sequence; max_tokens bounds the complete result. Full profile only; no transcripts or credentials.',
   run_submit: 'Checkpoint and queue an operator-registered recipe under a live claim.',

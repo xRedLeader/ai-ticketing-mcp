@@ -51,6 +51,19 @@ const expected = {
   ],
   planner: [
     ...shared,
+    'idea_create',
+    'idea_list',
+    'idea_get',
+    'idea_triage',
+    'spike_schedule',
+    'spike_list',
+    'spike_get',
+    'milestone_list',
+    'milestone_get',
+    'milestone_create',
+    'milestone_update',
+    'milestone_complete',
+    'ticket_milestone_set',
     'tickets_create',
     'ticket_update',
     'ticket_transition',
@@ -60,9 +73,31 @@ const expected = {
     'ticket_github_refresh',
   ],
   reviewer: [...shared, 'ticket_review', 'ticket_note', 'ticket_github_refresh', 'artifact_read'],
+  researcher: [
+    'project_list',
+    'project_get',
+    'idea_get',
+    'spike_list',
+    'spike_get',
+    'spike_claim',
+    'spike_complete',
+    'ticket_context',
+    'ticket_get',
+    'ticket_history',
+    'checkpoint_get',
+    'work_heartbeat',
+    'work_release',
+    'ticket_checkpoint',
+    'ticket_note',
+    'run_submit',
+    'run_get',
+    'run_wait',
+    'artifact_read',
+  ],
   full: Object.keys(schemas),
 };
 const prompts = {
+  researcher: ['execution', 'handoff'],
   worker: ['execution', 'handoff'],
   executor: ['execution', 'handoff'],
   planner: ['planning'],
@@ -162,12 +197,20 @@ it('serves profile-specific HTTP catalogs and prompts without changing scope aut
         );
         const before = executions;
         const mutation =
-          profile === 'planner' ? 'ticket_note' : profile === 'reviewer' ? 'ticket_review' : 'work_claim';
+          profile === 'researcher'
+            ? 'spike_claim'
+            : profile === 'planner'
+              ? 'ticket_note'
+              : profile === 'reviewer'
+                ? 'ticket_review'
+                : 'work_claim';
         const denied = await client.callTool({
           name: mutation,
           arguments: {
             project_id: 'dc71df55-80ee-4ca1-a22d-ecdc40566c79',
-            ticket_id: 'TST-1',
+            ...(mutation === 'spike_claim'
+              ? { spike_id: 'dc71df55-80ee-4ca1-a22d-ecdc40566c79' }
+              : { ticket_id: 'TST-1' }),
             idempotency_key: 'scope-test',
             ...(mutation === 'ticket_review'
               ? {

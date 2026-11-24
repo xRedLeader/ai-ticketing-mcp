@@ -8,17 +8,18 @@ Success JSON uses stable recursive object-key ordering and preserves array order
 
 ## Capability profiles
 
-The default profile is `worker`. Select `stdio --profile worker|executor|planner|reviewer|full` or connect to `/mcp?profile=executor`. HTTP profiles are stateless; empty, unknown, or repeated `profile` parameters are rejected. OAuth tokens still target the unqueried `/mcp` resource.
+The default profile is `worker`. Select `stdio --profile worker|executor|planner|researcher|reviewer|full` or connect to `/mcp?profile=executor`. HTTP profiles are stateless; empty, unknown, or repeated `profile` parameters are rejected. OAuth tokens still target the unqueried `/mcp` resource.
 
-Every profile includes `project_list`, `project_get`, `ticket_list`, `ticket_context`, `ticket_get`, `ticket_history`, and `checkpoint_get`. Worker, planner, reviewer and full also include `search`, `knowledge_get`, and `changes_since`.
+Every profile includes `project_list`, `project_get`, `ticket_context`, `ticket_get`, `ticket_history`, and `checkpoint_get`. Delivery profiles also include `ticket_list`. Worker, planner, reviewer and full also include `search`, `knowledge_get`, and `changes_since`.
 
-| Profile               | Additional tools                                                                                                                 | Prompts            |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
-| `worker` (16 tools)   | `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`, `ticket_note`, `ticket_submit`                              | execution, handoff |
-| `executor` (16 tools) | `work_claim`, `work_release`, `ticket_note`, `ticket_submit`, `run_submit`, `run_wait`, `run_get`, `run_cancel`, `artifact_read` | execution, handoff |
-| `planner` (17 tools)  | `tickets_create`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_note`, `knowledge_write`, `ticket_github_refresh` | planning           |
-| `reviewer` (14 tools) | `ticket_review`, `ticket_note`, `ticket_github_refresh`, `artifact_read`                                                         | verification       |
-| `full` (36 tools)     | All tools below, including project administration, `work_next`, and `run_timeline`                                               | all four           |
+| Profile                 | Additional tools                                                                                                                                                                                                                                                                                                                                              | Prompts            |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| `worker` (16 tools)     | `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`, `ticket_note`, `ticket_submit`                                                                                                                                                                                                                                                           | execution, handoff |
+| `executor` (16 tools)   | `work_claim`, `work_release`, `ticket_note`, `ticket_submit`, `run_submit`, `run_wait`, `run_get`, `run_cancel`, `artifact_read`                                                                                                                                                                                                                              | execution, handoff |
+| `planner` (30 tools)    | `idea_create`, `idea_list`, `idea_get`, `idea_triage`, `spike_schedule`, `spike_list`, `spike_get`, `milestone_list`, `milestone_get`, `milestone_create`, `milestone_update`, `milestone_complete`, `ticket_milestone_set`, `tickets_create`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_note`, `knowledge_write`, `ticket_github_refresh` | planning           |
+| `researcher` (19 tools) | Research discovery/claim/results, project and idea reads, checkpoint/context recovery and registered execution; see [research](research.md)                                                                                                                                                                                                                   | execution, handoff |
+| `reviewer` (14 tools)   | `ticket_review`, `ticket_note`, `ticket_github_refresh`, `artifact_read`                                                                                                                                                                                                                                                                                      | verification       |
+| `full` (51 tools)       | All tools below, including project administration, `work_next`, and `run_timeline`                                                                                                                                                                                                                                                                            | all four           |
 
 Profiles are not an access-control boundary. They select tool exposure; every operation retains its OAuth scope and project-role checks. Resources remain independently authorized and available in every profile. Guides and prompts follow the selected profile; the tool surface works without either.
 
@@ -30,15 +31,26 @@ Use the [execution companion](execution-companion.md) to configure registered sc
 
 ## Tools
 
-| Group                      | Tools                                                                                                                |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| Projects                   | `project_list`, `project_get`, `project_create`, `project_update`, `member_set`                                      |
-| Tickets                    | `tickets_create`, `ticket_list`, `ticket_get`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_history` |
-| Coordination               | `work_next`, `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`                                     |
-| Registered execution       | `run_submit`, `run_wait`, `run_get`, `run_cancel`, `artifact_read`, `run_timeline`                                   |
-| Collaboration and evidence | `ticket_note`, `ticket_submit`, `ticket_review`                                                                      |
-| Retrieval                  | `ticket_context`, `search`, `knowledge_get`, `knowledge_write`, `checkpoint_get`                                     |
-| Changes                    | `changes_since`                                                                                                      |
+| Group                      | Tools                                                                                                                   |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Projects                   | `project_list`, `project_get`, `project_create`, `project_update`, `member_set`                                         |
+| Research                   | `spike_schedule`, `spike_list`, `spike_get`, `spike_claim`, `spike_complete`                                            |
+| Ideas                      | `idea_create`, `idea_list`, `idea_get`, `idea_triage`                                                                   |
+| Tickets                    | `tickets_create`, `ticket_list`, `ticket_get`, `ticket_update`, `ticket_transition`, `ticket_link`, `ticket_history`    |
+| Coordination               | `work_next`, `work_claim`, `work_heartbeat`, `work_release`, `ticket_checkpoint`                                        |
+| Registered execution       | `run_submit`, `run_wait`, `run_get`, `run_cancel`, `artifact_read`, `run_timeline`                                      |
+| Collaboration and evidence | `ticket_note`, `ticket_submit`, `ticket_review`                                                                         |
+| Retrieval                  | `ticket_context`, `search`, `knowledge_get`, `knowledge_write`, `checkpoint_get`                                        |
+| Changes                    | `changes_since`                                                                                                         |
+| Milestones                 | `milestone_create`, `milestone_update`, `milestone_complete`, `ticket_milestone_set`, `milestone_list`, `milestone_get` |
+
+`idea_create` captures `title`, `problem`, `proposal` (the possible improvement), and `why`. Contributors and admins can submit and triage; all project members can read. Planner and full profiles expose idea tools without changing these permissions. Ideas are separate from delivery tickets and never enter `work_next` or `work_claim`.
+
+`idea_list` pages all dispositions, optionally filtering `status` (`submitted`, `parked`, `declined`, `promoted`); `idea_get` returns the full record and delivery links. `idea_triage` requires `idea_id`, `expected_revision`, `rationale`, and `action` (`park`, `decline`, `promote`). Promotion additionally requires 1-50 `tickets` using the `tickets_create` fields and acceptance criteria. Backlog is the default; explicitly use `ready` for claimable work. Promotion commits the decision, tickets, criteria, immutable provenance, events and receipt atomically. Identical retries with the same key return the original result, current authorization is rechecked, and stale revisions fail. Promoted ideas are terminal; parked and declined ideas can be reconsidered with their latest revision. Earlier decisions and rationale remain in `changes_since` events.
+
+Mutation receipts contain idea IDs, disposition and revision; promotion also returns source links with delivery ticket IDs. Fetch full prose through `idea_get`. Each promoted ticket's `ticket_get.source_idea` points back to the exact idea revision that produced it. Ideas are discoverable through their dedicated list/get tools rather than the ticket search index. Native execution artifact citations in proposal fields and rationale retain their logs; new citations to already-retired logs are rejected.
+
+Research uses a separate `researcher` profile and durable first-claim time budget. Completed findings and evidence recommend a decision without automatically triaging or creating tickets. `idea_triage` promotion accepts optional completed same-idea `spike_ids` for immutable evidence provenance. See [research tools and deadline semantics](research.md).
 
 `tickets_create` accepts 1–50 tickets atomically, defaulting to backlog. Use `ready` to queue execution. Each ticket needs 1–50 criteria. Priority 1 is highest; 5 is lowest. Default work selection orders by priority, creation time, then identifier, and respects declared capabilities, labels, assignment, blockers, and active claims.
 
@@ -105,6 +117,14 @@ Shared reads evaluate current source support and the promoting actor's authority
 Search combines lexical and semantic ranks with reciprocal rank fusion. It defaults to three results with query-centered excerpts of at most 200 reference tokens, source IDs/revisions, and explicit retrieval calls. It reports coverage and degradation when embeddings are unavailable, busy, or incomplete. Cancelled tickets and archived knowledge are excluded. Filters and source revisions are checked against primary storage. Indexing is eventual; retrieve the source directly for authoritative state.
 
 Resources: `ticketing://guide`, `ticketing://project/{project_id}`, `ticketing://ticket/{project_id}/{id}`, and `ticketing://knowledge/{project_id}/{id}`. Prompts: planning, execution, handoff, verification. The tool surface remains sufficient without resources or prompts.
+
+## Milestones
+
+Planner and full profiles expose project-scoped milestones. Contributors and administrators can create a milestone with `name`, `outcome`, and nonempty `exit_criteria`, update it with `expected_revision`, and attach, move or detach tickets with `ticket_milestone_set`. Supply `milestone_id:null` to detach and always supply the current milestone ID (or null) as `expected_milestone_id`. Each ticket has at most one membership; existing tickets need none. `ticket_get.milestone_id` exposes current membership when storage supports milestones. Grouping leaves ticket acceptance, revisions, claims, scheduling and dependency links unchanged.
+
+Any authorized project reader can use `milestone_list` and `milestone_get` on those profiles. Lists return compact names, revisions, status counts and accepted/total progress. `milestone_get` adds the outcome and exit criteria plus compact member tickets. Both default to ten rows and accept `limit` up to 100 and `offset`; follow `has_more` and `next_offset`. Counts aggregate all members in the same snapshot as the page. A ticket counts as accepted only when it is done and its exact approved submission matches the ticket, project and current requirements revision; cancelled work does not count.
+
+`milestone_complete` requires at least one member, current acceptance of every member, `expected_revision`, and `confirm_exit_criteria:true`. Completion never follows automatically from progress. Milestone edits, membership changes and reopening/invalidation of a member clear completion; accepting reopened work requires a fresh explicit confirmation. Confirmations and reopenings remain in project events and immutable mutation receipts. Identical retries reuse the original idempotency key; changed requests require a new key.
 
 ## Errors and limits
 

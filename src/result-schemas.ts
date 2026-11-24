@@ -80,6 +80,31 @@ const ticket = z.object({
   updated_at: timestamp,
 });
 const criterion = z.object({ id, project_id: id, ticket_id: id, text: z.string(), position: z.number() });
+const idea = z.object({
+  id,
+  project_id: id,
+  title: z.string(),
+  problem: z.string(),
+  proposal: z.string(),
+  why: z.string(),
+  status: z.enum(['submitted', 'parked', 'declined', 'promoted']),
+  revision: z.number().int().positive(),
+  created_by: id,
+  decided_by: id.nullable(),
+  rationale: z.string().nullable(),
+  created_at: timestamp,
+  updated_at: timestamp,
+});
+const ideaTicket = z.object({
+  id,
+  project_id: id,
+  idea_id: id,
+  idea_revision: z.number().int().positive(),
+  ticket_id: id,
+  spike_ids: z.array(id).optional(),
+});
+const ideaReceipt = idea.pick({ id: true, project_id: true, status: true, revision: true });
+const ideaSummary = idea.omit({ problem: true, proposal: true, why: true, rationale: true });
 const link = z.object({
   id,
   project_id: id,
@@ -432,7 +457,128 @@ const executionView = z.object({
     cancellation: executionCancellation.nullable().optional(),
   }),
 });
+const milestoneReceipt = z.object({
+  id,
+  project_id: id,
+  revision: z.number().int().positive(),
+  completed_at: timestamp.nullable(),
+  completed_by: id.nullable(),
+});
+const milestoneProgress = z.object({
+  total: z.number().int().nonnegative(),
+  accepted: z.number().int().nonnegative(),
+  status_counts: z.object({
+    backlog: z.number().int().nonnegative(),
+    ready: z.number().int().nonnegative(),
+    in_progress: z.number().int().nonnegative(),
+    in_review: z.number().int().nonnegative(),
+    done: z.number().int().nonnegative(),
+    cancelled: z.number().int().nonnegative(),
+  }),
+});
+const milestoneSummary = milestoneReceipt.extend({
+  name: z.string(),
+  status: z.enum(['open', 'completed']),
+  progress: milestoneProgress,
+});
 export const resultSchemas: Record<Operation, z.ZodType> = {
+  spike_schedule: z.object({
+    id,
+    project_id: id,
+    idea_id: id,
+    revision: z.number(),
+    time_budget_ms: z.number(),
+  }),
+  spike_list: z.object({
+    spikes: z.array(
+      z.object({
+        id,
+        project_id: id,
+        idea_id: id,
+        revision: z.number(),
+        assignee_id: id.nullable(),
+        status: z.enum(['scheduled', 'active', 'completed']),
+        budget: z.object({
+          time_budget_ms: z.number(),
+          first_claimed_at: timestamp.nullable(),
+          deadline: timestamp.nullable(),
+          exhausted: z.boolean(),
+        }),
+      }),
+    ),
+  }),
+  spike_get: z.object({
+    spike: z.object({
+      id,
+      project_id: id,
+      idea_id: id,
+      question: z.string(),
+      time_budget_ms: z.number(),
+      first_claimed_at: timestamp.nullable(),
+      findings: z.string().nullable(),
+      evidence: z.array(z.string()),
+      recommendation: z.enum(['promote', 'park', 'decline']).nullable(),
+      completed_at: timestamp.nullable(),
+      completed_by: id.nullable(),
+    }),
+    ticket: ticketReceipt,
+    claim: visibleClaim,
+    budget: z.object({
+      time_budget_ms: z.number(),
+      first_claimed_at: timestamp.nullable(),
+      deadline: timestamp.nullable(),
+      exhausted: z.boolean(),
+    }),
+  }),
+  spike_claim: z.object({
+    ticket: ticketReceipt,
+    claim,
+    context: context.optional(),
+    context_omitted: z.enum(['requested', 'legacy_receipt']).optional(),
+    context_ref: retrieval.optional(),
+  }),
+  spike_complete: z.object({
+    id,
+    project_id: id,
+    idea_id: id,
+    completed_at: timestamp,
+    completed_by: id,
+    revision: z.number(),
+    recommendation: z.enum(['promote', 'park', 'decline']),
+  }),
+  idea_create: ideaReceipt,
+  idea_list: z.object({ ideas: z.array(ideaSummary) }),
+  idea_get: z.object({ idea, tickets: z.array(ideaTicket) }),
+  idea_triage: z.object({ idea: ideaReceipt, tickets: z.array(ideaTicket) }),
+  milestone_create: milestoneReceipt,
+  milestone_update: milestoneReceipt,
+  milestone_complete: milestoneReceipt,
+  ticket_milestone_set: z.object({ ticket_id: id, milestone_id: id.nullable() }),
+  milestone_list: z.object({
+    items: z.array(milestoneSummary),
+    has_more: z.boolean(),
+    next_offset: z.number().int().nonnegative(),
+  }),
+  milestone_get: z.object({
+    milestone: milestoneSummary.extend({
+      outcome: z.string(),
+      exit_criteria: z.array(z.string()),
+      created_at: timestamp,
+      updated_at: timestamp,
+    }),
+    members: z.array(
+      z.object({
+        id,
+        key: z.string(),
+        title: z.string(),
+        status: ticket.shape.status,
+        requirements_revision: z.number().int().positive(),
+        accepted: z.boolean(),
+      }),
+    ),
+    has_more: z.boolean(),
+    next_offset: z.number().int().nonnegative(),
+  }),
   run_wait: executionView,
   run_cancel: z.object({
     run_id: id,
@@ -642,7 +788,9 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
   ticket_update: ticketReceipt,
   ticket_transition: ticketReceipt,
   ticket_get: z.object({
+    milestone_id: id.nullable().optional(),
     ticket,
+    source_idea: ideaTicket.optional(),
     effective_execution_hints: executionHints.optional(),
     github_evidence: githubEvidenceSchema.optional(),
     criteria: z.array(criterion),

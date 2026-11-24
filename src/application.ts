@@ -8,6 +8,7 @@ import {
   type Actor,
   type Project,
   type Ticket,
+  type Idea,
   type Reader,
   type Transaction,
   type StorageAdapter,
@@ -51,6 +52,7 @@ import {
 } from './contracts.js';
 import { resultSchemas, githubEvidenceSchema, executionResumeSchema } from './result-schemas.js';
 import { inspectMemory } from './memory.js';
+import { getSpike, spikeBudget, researchAdmission, deliveryOnly } from './research.js';
 import { serializeSuccessEnvelope } from './envelope.js';
 import { registerWake, evaluateWakes, wakeRegistration, claimWake, finishWake } from './wake-events.js';
 import { countReferenceTokens, queryExcerpt } from './tokens.js';
@@ -64,6 +66,15 @@ import {
 import { ClientCapabilities } from './client-capabilities.js';
 import { pipelineIdentityError, type VerificationPipeline } from './verification-pipeline.js';
 import { inspectVerificationCache } from './execution-cache.js';
+import {
+  createMilestone,
+  updateMilestone,
+  completeMilestone,
+  setTicketMilestone,
+  listMilestones,
+  readMilestone,
+  reopenTicketMilestone,
+} from './milestones.js';
 
 export interface ApplicationOptions {
   storage: StorageAdapter;
@@ -82,9 +93,16 @@ export interface ApplicationOptions {
 const LEASE_MS = 600_000;
 const resumeChangeTypes = ['ticket.updated', 'ticket.invalidated', 'ticket.transitioned', 'ticket.linked'];
 const artifactPinWriters = new Set<Operation>([
+  'milestone_create',
+  'milestone_update',
   'project_create',
   'project_update',
   'tickets_create',
+  'idea_create',
+  'idea_triage',
+  'spike_schedule',
+  'spike_claim',
+  'spike_complete',
   'ticket_update',
   'ticket_transition',
   'ticket_note',
@@ -266,6 +284,11 @@ export class Application {
     if (!ticket.execution_hints || !Object.keys(ticket.execution_hints).length) delete ticket.execution_hints;
     return ticket;
   }
+  private async idea(reader: Reader, projectId: string, id: string) {
+    const idea = await reader.get('ideas', id);
+    ensure(idea && idea.project_id === projectId, 'NOT_FOUND', 'Idea not found in project.');
+    return idea;
+  }
   private executionHints(project: Project, ticket: Ticket): ExecutionHints | undefined {
     const hints = { ...project.execution_hints, ...ticket.execution_hints };
     return Object.keys(hints).length ? hints : undefined;
@@ -348,6 +371,7 @@ export class Application {
         'An operator must configure the trusted GitHub repository and required checks.',
       );
       const ticket = await this.ticket(reader, input.project_id, input.ticket_id);
+      deliveryOnly(ticket);
       const number = input.pull_request_number ?? ticket.github_pull_request?.number;
       ensure(number, 'INVALID_INPUT', 'Provide pull_request_number when first linking a ticket.');
       const binding = ticket.github_pull_request ?? null;
@@ -552,20 +576,21 @@ export class Application {
         delete legacyInput.max_tokens;
         ensure(
           previous.input_hash === hash ||
-            (operation === 'work_claim' &&
+            ((operation === 'work_claim' || operation === 'spike_claim') &&
               input.include_context === true &&
               input.max_tokens === 4096 &&
               previous.input_hash === digest(legacyInput)),
           'IDEMPOTENCY_CONFLICT',
           'Use a new idempotency key when changing inputs.',
         );
-        if (operation === 'work_claim' || operation === 'work_heartbeat') {
+        if (operation === 'work_claim' || operation === 'spike_claim' || operation === 'work_heartbeat') {
           const stored = previous.result as {
             claim?: { ticket_id?: string; token?: string };
             ticket_id?: string;
             token?: string;
           };
-          const credential = operation === 'work_claim' ? stored.claim : stored;
+          const credential =
+            operation === 'work_claim' || operation === 'spike_claim' ? stored.claim : stored;
           if (
             credential?.ticket_id &&
             credential.token &&
@@ -594,7 +619,7 @@ export class Application {
         try {
           let stored = previous.result;
           if (
-            operation === 'work_claim' &&
+            (operation === 'work_claim' || operation === 'spike_claim') &&
             stored &&
             typeof stored === 'object' &&
             !('context' in stored) &&
@@ -611,7 +636,7 @@ export class Application {
             };
           }
           const result = this.result(operation, stored);
-          if (operation === 'work_claim') {
+          if (operation === 'work_claim' || operation === 'spike_claim') {
             const required = this.responseTokens(result);
             ensure(
               required <= input.max_tokens!,
@@ -674,7 +699,7 @@ export class Application {
               );
       }
       const result = this.result(operation, await work(tx, project!, actor));
-      if (operation === 'work_claim') {
+      if (operation === 'work_claim' || operation === 'spike_claim') {
         const required = this.responseTokens(result);
         ensure(
           required <= input.max_tokens!,
@@ -772,7 +797,9 @@ export class Application {
     capabilities: string[],
     labels: string[],
     at = this.timestamp(),
+    research = false,
   ) {
+    if ((ticket.work_kind === 'research') !== research) return false;
     if (
       !['ready', 'in_progress'].includes(ticket.status) ||
       (ticket.assignee_id && ticket.assignee_id !== actor.id)
@@ -889,6 +916,16 @@ export class Application {
         'Reclaim work and match again; its client, requirements or requested choices changed.',
         { reasons: matched.reasons },
       );
+      ensure(
+        await researchAdmission(reader, ticket, () => this.timestamp()),
+        'SPIKE_BUDGET_EXHAUSTED',
+        'Research elapsed time budget is exhausted.',
+      );
+      ensure(
+        claim.expires_at > this.timestamp(),
+        'CLAIM_EXPIRED',
+        'Research or delivery ownership expired before dispatch.',
+      );
       dispatch(claim.execution);
       return claim.execution;
     });
@@ -932,6 +969,7 @@ export class Application {
     }
   }
   private async transferable(reader: Reader, ticket: Ticket) {
+    if (!this.storage.executionRuns) return;
     ensure(
       !(
         await reader.find('execution_jobs', {
@@ -993,7 +1031,7 @@ export class Application {
     );
     return recipe;
   }
-  private async executionAuthority(reader: Reader, run: ExecutionJob) {
+  private async executionAuthority(reader: Reader, run: ExecutionJob, newStart = false) {
     const ticket = await reader.get('tickets', run.ticket_id);
     const claim = await reader.get('claims', run.ticket_id);
     const member = await reader.get('members', `${run.project_id}:${run.actor_id}`);
@@ -1012,6 +1050,7 @@ export class Application {
     ))
       return false;
     try {
+      if (newStart && !(await researchAdmission(reader, ticket, () => this.timestamp()))) return false;
       return !(await this.blockers(reader, ticket)).length;
     } catch (error) {
       if (error instanceof DomainError && error.code === 'GRAPH_LIMIT') return false;
@@ -1218,7 +1257,12 @@ export class Application {
       this.cancelRun(tx, run, actorId),
     );
   }
-  private async cancelRun(tx: Transaction, run: ExecutionJob, actorId: string) {
+  private async cancelRun(
+    tx: Transaction,
+    run: ExecutionJob,
+    actorId: string,
+    code = 'CANCELLED_NOT_STARTED',
+  ) {
     const runId = run.id,
       projectId = run.project_id;
     await tx.lockExecutionController!();
@@ -1247,7 +1291,7 @@ export class Application {
           exit_code: null,
           signal: null,
           artifacts: [],
-          error_code: 'CANCELLED_NOT_STARTED',
+          error_code: code,
         }),
         'CONFLICT',
         'Cancellation could not acquire the execution fence.',
@@ -1527,6 +1571,11 @@ export class Application {
       run_id: run.id,
       execution: claim.execution,
     };
+    ensure(
+      await researchAdmission(tx, ticket, () => this.timestamp()),
+      'SPIKE_BUDGET_EXHAUSTED',
+      'Research elapsed time budget is exhausted.',
+    );
     return { context, identity: digest([context, recovery.attempt, artifactAttempt, cache, artifacts]) };
   }
 
@@ -2306,7 +2355,12 @@ export class Application {
           offset,
         });
         for (const run of page)
-          if (await this.executionAuthority(reader, run)) {
+          if (
+            (await this.executionAuthority(reader, run)) ||
+            !(await researchAdmission(reader, (await reader.get('tickets', run.ticket_id))!, () =>
+              this.timestamp(),
+            ))
+          ) {
             eligible.push(run);
             if (eligible.length === 100) break;
           }
@@ -2324,12 +2378,16 @@ export class Application {
   ): Promise<ExecutionJob | null> {
     const lockedUntil = this.executionLease(leaseMs);
     return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      if (!(await this.currentExecutionController(tx, controller)) || run.status !== 'queued') return null;
+      const ticket = (await tx.get('tickets', run.ticket_id))!;
+      if (!(await researchAdmission(tx, ticket, () => this.timestamp()))) {
+        await this.cancelRun(tx, run, actorId, 'SPIKE_BUDGET_EXHAUSTED');
+        return null;
+      }
       if (
-        !(await this.currentExecutionController(tx, controller)) ||
-        run.status !== 'queued' ||
         (await tx.get('execution_admissions', projectId))?.paused ||
         (await tx.get('execution_cancellations', runId)) ||
-        !(await this.executionAuthority(tx, run))
+        !(await this.executionAuthority(tx, run, true))
       )
         return null;
       const next: ExecutionJob = {
@@ -2370,7 +2428,7 @@ export class Application {
         run.reservation_token !== token ||
         !run.locked_until ||
         run.locked_until <= this.timestamp() ||
-        !(await this.executionAuthority(tx, run))
+        !(await this.executionAuthority(tx, run, true))
       )
         return null;
       const recipe = this.executionRecipes.get(run.recipe_id);
@@ -2406,13 +2464,21 @@ export class Application {
         run.status !== 'reserved' ||
         run.reservation_token !== token ||
         !run.locked_until ||
-        !(await this.executionAuthority(tx, run))
+        !(await this.executionAuthority(tx, run, true))
       )
         return false;
       const current = (await tx.get('execution_controllers', 'execution'))!;
       const claim = await tx.get('claims', run.ticket_id);
+      const ticket = (await tx.get('tickets', run.ticket_id))!;
+      const researchCurrent = await researchAdmission(tx, ticket, () => this.timestamp());
       const now = this.timestamp();
-      if (current.expires_at <= now || run.locked_until <= now || !claim || claim.expires_at <= now)
+      if (
+        !researchCurrent ||
+        current.expires_at <= now ||
+        run.locked_until <= now ||
+        !claim ||
+        claim.expires_at <= now
+      )
         return false;
       admit();
       return true;
@@ -2445,7 +2511,7 @@ export class Application {
         run.reservation_token !== token ||
         !run.locked_until ||
         run.locked_until <= this.timestamp() ||
-        !(await this.executionAuthority(tx, run))
+        !(await this.executionAuthority(tx, run, true))
       )
         return false;
       ensure(
@@ -2534,7 +2600,7 @@ export class Application {
         pipelineIdentityError(pipeline) ||
         current.expires_at <= this.timestamp() ||
         run.locked_until <= this.timestamp() ||
-        !(await this.executionAuthority(tx, run))
+        !(await this.executionAuthority(tx, run, true))
       )
         return miss('IDENTITY_CHANGED');
       if (
@@ -2586,7 +2652,7 @@ export class Application {
         !run.locked_until ||
         run.locked_until <= this.timestamp() ||
         run.recipe_fingerprint !== fingerprint ||
-        !(await this.executionAuthority(tx, run))
+        !(await this.executionAuthority(tx, run, true))
       )
         return false;
       const attempt = await this.executionAttempt(tx, runId);
@@ -2596,8 +2662,16 @@ export class Application {
         return false;
       const current = (await tx.get('execution_controllers', 'execution'))!;
       const claim = await tx.get('claims', run.ticket_id);
+      const ticket = (await tx.get('tickets', run.ticket_id))!;
+      const researchCurrent = await researchAdmission(tx, ticket, () => this.timestamp());
       const now = this.timestamp();
-      if (current.expires_at <= now || run.locked_until <= now || !claim || claim.expires_at <= now)
+      if (
+        !researchCurrent ||
+        current.expires_at <= now ||
+        run.locked_until <= now ||
+        !claim ||
+        claim.expires_at <= now
+      )
         return false;
       dispatch();
       return true;
@@ -2797,6 +2871,14 @@ export class Application {
       const current = id === root.id ? root : await this.ticket(tx, project.id, id);
       current.requirements_revision++;
       current.approved_submission_id = null;
+      if (this.storage.milestones) {
+        const milestone = await reopenTicketMilestone(tx, current, this.timestamp());
+        if (milestone)
+          await this.event(tx, project, actor, 'milestone.reopened', milestone.id, {
+            ticket_id: current.id,
+            revision: milestone.revision,
+          });
+      }
       if (['done', 'in_review', 'in_progress'].includes(current.status)) current.status = 'ready';
       await tx.remove('claims', current.id);
       await this.touch(tx, current);
@@ -2867,6 +2949,14 @@ export class Application {
     this.metrics.requests++;
     try {
       ensure(Object.hasOwn(schemas, operation), 'UNKNOWN_OPERATION', 'Unknown operation.');
+      if (operation.startsWith('idea_'))
+        ensure(this.storage.ideaIntake, 'UNSUPPORTED_IDEAS', 'Storage does not support idea intake.');
+      if (operation.startsWith('spike_'))
+        ensure(
+          this.storage.researchSpikes,
+          'UNSUPPORTED_RESEARCH',
+          'Storage does not support research spikes.',
+        );
       const result = schemas[operation].safeParse(raw);
       if (!result.success)
         throw new DomainError('INVALID_INPUT', 'Input does not match the operation schema.', {
@@ -2897,7 +2987,225 @@ export class Application {
     if (operation === 'ticket_review') roles.splice(0, roles.length, 'verifier', 'admin');
     if (operation === 'ticket_note' || operation === 'knowledge_write') roles.push('verifier');
     return this.scoped(actorId, operation, input, roles, async (tx, project, actor) => {
+      if (
+        ['milestone_create', 'milestone_update', 'milestone_complete', 'ticket_milestone_set'].includes(
+          operation,
+        )
+      ) {
+        ensure(
+          this.storage.milestones && tx.milestoneProgress,
+          'UNSUPPORTED_MILESTONES',
+          'Storage does not support milestones.',
+        );
+        const result =
+          operation === 'milestone_create'
+            ? await createMilestone(tx, input, this.timestamp())
+            : operation === 'milestone_update'
+              ? await updateMilestone(tx, input, this.timestamp())
+              : operation === 'milestone_complete'
+                ? await completeMilestone(tx, input, actor.id, this.timestamp())
+                : await setTicketMilestone(
+                    tx,
+                    await this.ticket(tx, project.id, input.ticket_id),
+                    input,
+                    this.timestamp(),
+                  );
+        const eventType = {
+          milestone_create: 'milestone.created',
+          milestone_update: 'milestone.updated',
+          milestone_complete: 'milestone.completed',
+          ticket_milestone_set: 'ticket.milestone_changed',
+        }[
+          operation as 'milestone_create' | 'milestone_update' | 'milestone_complete' | 'ticket_milestone_set'
+        ];
+        await this.event(
+          tx,
+          project,
+          actor,
+          eventType,
+          'ticket_id' in result ? result.ticket_id : result.id,
+          result,
+        );
+        return result;
+      }
       switch (operation) {
+        case 'spike_schedule': {
+          const data = input as Input<'spike_schedule'>;
+          const idea = await this.idea(tx, project.id, data.idea_id);
+          ensure(idea.status !== 'promoted', 'INVALID_STATE', 'Research must precede delivery promotion.');
+          if (data.assignee_id)
+            await this.access(tx, await this.actor(data.assignee_id, tx), project.id, [
+              'contributor',
+              'admin',
+            ]);
+          const id = randomUUID();
+          const ticket: Ticket = {
+            id,
+            project_id: project.id,
+            key: `${project.key}-R${id}`,
+            work_kind: 'research',
+            title: `Research: ${idea.title}`,
+            description: data.question,
+            status: 'ready',
+            priority: 3,
+            labels: [],
+            capabilities: [],
+            assignee_id: data.assignee_id,
+            parent_id: null,
+            revision: 1,
+            requirements_revision: 1,
+            created_by: actor.id,
+            approved_submission_id: null,
+            created_at: this.timestamp(),
+            updated_at: this.timestamp(),
+            ...(data.execution_hints ? { execution_hints: data.execution_hints } : {}),
+          };
+          await tx.put('tickets', ticket);
+          await this.replaceCriteria(tx, ticket, ['Record findings, evidence and a recommendation.']);
+          const spike = {
+            id,
+            project_id: project.id,
+            idea_id: idea.id,
+            question: data.question,
+            time_budget_ms: data.time_budget_ms,
+            first_claimed_at: null,
+            findings: null,
+            evidence: [],
+            recommendation: null,
+            completed_at: null,
+            completed_by: null,
+          };
+          await tx.put('research_spikes', spike);
+          await this.event(tx, project, actor, 'spike.scheduled', id, { idea_id: idea.id });
+          return { ...spike, revision: ticket.revision };
+        }
+        case 'spike_complete': {
+          const spike = await getSpike(tx, project.id, input.spike_id);
+          const ticket = await this.ticket(tx, project.id, spike.id);
+          this.version(ticket, input.expected_revision);
+          ensure(!spike.completed_at, 'INVALID_STATE', 'Research result is already complete.');
+          ensure(
+            !this.storage.executionRuns ||
+              !(
+                await tx.find('execution_jobs', {
+                  where: {
+                    project_id: project.id,
+                    ticket_id: ticket.id,
+                    status: { in: ['queued', 'reserved', 'running'] },
+                  },
+                  limit: 1,
+                })
+              ).length,
+            'EXECUTION_PENDING',
+            'Settle or cancel managed research runs before completing findings.',
+          );
+          const wake = this.storage.wakeDecisions ? await tx.get('wake_conditions', ticket.id) : null;
+          ensure(
+            !wake?.active?.dispatch?.invocation || wake.active.dispatch.state === 'completed',
+            'EXECUTION_PENDING',
+            'Reconcile the research continuation before completing findings.',
+          );
+          const claim = await tx.get('claims', ticket.id);
+          ensure(
+            claim?.actor_id === actor.id &&
+              claim.token === input.claim_token &&
+              (claim.expires_at > this.timestamp() || spikeBudget(spike, this.timestamp()).exhausted),
+            'CLAIM_EXPIRED',
+            'Only the current research owner can record its result.',
+          );
+          ensure(ticket.status === 'in_progress', 'INVALID_STATE', 'Claim research before completing it.');
+          Object.assign(spike, {
+            findings: input.findings,
+            evidence: input.evidence,
+            recommendation: input.recommendation,
+            completed_at: this.timestamp(),
+            completed_by: actor.id,
+          });
+          await tx.put('research_spikes', spike);
+          ticket.status = 'done';
+          await tx.remove('claims', ticket.id);
+          await this.touch(tx, ticket);
+          await this.event(tx, project, actor, 'spike.completed', spike.id, {
+            idea_id: spike.idea_id,
+            recommendation: spike.recommendation,
+          });
+          return { ...spike, revision: ticket.revision };
+        }
+        case 'idea_create': {
+          const data = input as Input<'idea_create'>;
+          const idea: Idea = {
+            id: randomUUID(),
+            project_id: project.id,
+            title: data.title,
+            problem: data.problem,
+            proposal: data.proposal,
+            why: data.why,
+            status: 'submitted',
+            revision: 1,
+            created_by: actor.id,
+            decided_by: null,
+            rationale: null,
+            created_at: this.timestamp(),
+            updated_at: this.timestamp(),
+          };
+          await tx.put('ideas', idea);
+          await this.event(tx, project, actor, 'idea.created', idea.id);
+          return idea;
+        }
+        case 'idea_triage': {
+          const data = input as Input<'idea_triage'>;
+          const idea = await this.idea(tx, project.id, data.idea_id);
+          if (data.action === 'promote' && data.spike_ids?.length) {
+            ensure(
+              this.storage.researchSpikes,
+              'UNSUPPORTED_RESEARCH',
+              'Storage does not support research provenance.',
+            );
+            for (const id of data.spike_ids) {
+              const spike = await getSpike(tx, project.id, id);
+              ensure(
+                spike.idea_id === idea.id && spike.completed_at,
+                'INVALID_REFERENCE',
+                'Promotion evidence must be completed research for this idea.',
+              );
+            }
+          }
+          this.version(idea, data.expected_revision);
+          ensure(
+            idea.status !== 'promoted',
+            'INVALID_STATE',
+            'A promoted idea already has delivery tickets.',
+          );
+          idea.status =
+            data.action === 'promote' ? 'promoted' : data.action === 'park' ? 'parked' : 'declined';
+          idea.revision++;
+          idea.decided_by = actor.id;
+          idea.rationale = data.rationale;
+          idea.updated_at = this.timestamp();
+          await tx.put('ideas', idea);
+          const tickets = [];
+          if (data.action === 'promote') {
+            for (const ticket of await this.createTickets(tx, project, actor, data.tickets)) {
+              const link = {
+                id: `${idea.id}:${ticket.id}`,
+                project_id: project.id,
+                idea_id: idea.id,
+                idea_revision: idea.revision,
+                ticket_id: ticket.id,
+                ...(data.spike_ids?.length ? { spike_ids: [...new Set(data.spike_ids)] } : {}),
+              };
+              await tx.put('idea_tickets', link);
+              tickets.push(link);
+            }
+          }
+          await this.event(tx, project, actor, 'idea.triaged', idea.id, {
+            status: idea.status,
+            rationale: idea.rationale,
+            revision: idea.revision,
+            ticket_ids: tickets.map((ticket) => ticket.ticket_id),
+          });
+          return { idea, tickets };
+        }
         case 'run_cancel': {
           ensure(
             this.storage.executionRuns && tx.compareExecutionRun && tx.lockExecutionController,
@@ -2985,44 +3293,10 @@ export class Application {
           await this.event(tx, project, actor, 'member.updated', input.actor_id, { role: input.role });
           return member;
         }
-        case 'tickets_create': {
-          const created = [];
-          for (const item of (input as Input<'tickets_create'>).tickets) {
-            if (item.assignee_id)
-              await this.access(tx, await this.actor(item.assignee_id, tx), project.id, [
-                'contributor',
-                'admin',
-              ]);
-            const parent = item.parent_id ? await this.ticket(tx, project.id, item.parent_id) : null;
-            const ticket: Ticket = {
-              id: randomUUID(),
-              project_id: project.id,
-              key: `${project.key}-${++project.ticket_seq}`,
-              title: item.title,
-              description: item.description,
-              ...(item.execution_hints ? { execution_hints: item.execution_hints } : {}),
-              status: item.status,
-              priority: item.priority,
-              labels: item.labels,
-              capabilities: item.capabilities,
-              assignee_id: item.assignee_id,
-              parent_id: parent?.id ?? null,
-              revision: 1,
-              requirements_revision: 1,
-              created_by: actor.id,
-              approved_submission_id: null,
-              created_at: this.timestamp(),
-              updated_at: this.timestamp(),
-            };
-            await tx.put('tickets', ticket);
-            await this.replaceCriteria(tx, ticket, item.criteria);
-            await this.queue(tx, ticket, 'ticket');
-            await this.event(tx, project, actor, 'ticket.created', ticket.id, { key: ticket.key });
-            if (parent) await this.invalidate(tx, project, actor, parent, 'A child ticket was added.');
-            created.push(ticket);
-          }
-          return { tickets: created };
-        }
+        case 'tickets_create':
+          return {
+            tickets: await this.createTickets(tx, project, actor, (input as Input<'tickets_create'>).tickets),
+          };
         case 'ticket_link':
           return this.link(tx, project, actor, input);
         case 'knowledge_write': {
@@ -3236,23 +3510,35 @@ export class Application {
           }
           return this.promotionReceipt(promotion);
         }
+        case 'spike_claim':
         case 'work_claim': {
+          const research = operation === 'spike_claim';
+          const claimInput = research
+            ? { ...input, ticket_id: input.spike_id, capabilities: [], labels: [] }
+            : input;
+          const spike = research ? await getSpike(tx, project.id, input.spike_id) : null;
+          if (spike)
+            ensure(
+              !spike.completed_at && !spikeBudget(spike, this.timestamp()).exhausted,
+              'SPIKE_BUDGET_EXHAUSTED',
+              'Research is completed or its elapsed time budget is exhausted.',
+            );
           ensure(
-            !input.client_id || this.clientCapabilities,
+            !claimInput.client_id || this.clientCapabilities,
             'CLIENT_REGISTRY_REQUIRED',
             'Ask the operator to configure CLIENT_CAPABILITIES_FILE before selecting a client.',
           );
-          const ticket = input.ticket_id
-            ? await this.ticket(tx, project.id, input.ticket_id)
+          const ticket = claimInput.ticket_id
+            ? await this.ticket(tx, project.id, claimInput.ticket_id)
             : (
                 await this.candidates(
                   tx,
                   project,
                   actor,
-                  input.capabilities,
-                  input.labels,
+                  claimInput.capabilities,
+                  claimInput.labels,
                   1,
-                  input.client_id,
+                  claimInput.client_id,
                 )
               )[0];
           if (!ticket && this.clientCapabilities) {
@@ -3263,7 +3549,7 @@ export class Application {
                 requirements_revision: 1,
                 tools: [],
                 hints: project.execution_hints ?? undefined,
-                client_id: input.client_id,
+                client_id: claimInput.client_id,
               },
               this.now().getTime(),
             );
@@ -3281,17 +3567,17 @@ export class Application {
               ? 'No eligible work matches registered capabilities. Select a ticket_id to retrieve its exact execution mismatch.'
               : 'No eligible work is currently available.',
           );
-          const handoff = input.handoff_checkpoint_id
-            ? await this.acceptHandoff(tx, project, ticket, actor, input.handoff_checkpoint_id)
+          const handoff = claimInput.handoff_checkpoint_id
+            ? await this.acceptHandoff(tx, project, ticket, actor, claimInput.handoff_checkpoint_id)
             : undefined;
-          const matched = this.matchClient(project, ticket, actor, input.client_id);
+          const matched = this.matchClient(project, ticket, actor, claimInput.client_id);
           ensure(
             matched.selection !== null,
             'UNSUPPORTED_EXECUTION',
             'No authorized fresh client supports the requested execution choices. Resolve the reported mismatch or ask the operator to update registration.',
             { reasons: matched.reasons },
           );
-          if (input.ticket_id) {
+          if (claimInput.ticket_id) {
             const blockers = await this.blockers(tx, ticket);
             ensure(
               !blockers.length,
@@ -3304,12 +3590,24 @@ export class Application {
                 tx,
                 ticket,
                 actor,
-                this.availableCapabilities(project, actor, input.capabilities),
-                input.labels,
+                this.availableCapabilities(project, actor, claimInput.capabilities),
+                claimInput.labels,
+                this.timestamp(),
+                research,
               ),
               'NOT_CLAIMABLE',
               'Ticket is claimed, not ready, assigned elsewhere, or requires other capabilities.',
             );
+          }
+          if (spike)
+            ensure(
+              !spikeBudget(spike, this.timestamp()).exhausted,
+              'SPIKE_BUDGET_EXHAUSTED',
+              'Research elapsed time budget is exhausted.',
+            );
+          if (spike && !spike.first_claimed_at) {
+            spike.first_claimed_at = this.timestamp();
+            await tx.put('research_spikes', spike);
           }
           const claim = {
             id: ticket.id,
@@ -3329,14 +3627,19 @@ export class Application {
             claim,
             ...(handoff ? { handoff } : {}),
           }) as Record<string, unknown>;
-          if (!input.include_context) return { ...receipt, context_omitted: 'requested' };
+          if (!claimInput.include_context) return { ...receipt, context_omitted: 'requested' };
           return {
             ...receipt,
             context: await this.context(
               tx,
               actor,
               project,
-              { project_id: project.id, ticket_id: ticket.id, detail: 'brief', max_tokens: input.max_tokens },
+              {
+                project_id: project.id,
+                ticket_id: ticket.id,
+                detail: 'brief',
+                max_tokens: claimInput.max_tokens,
+              },
               receipt,
             ),
           };
@@ -3345,6 +3648,47 @@ export class Application {
           return this.mutateTicket(tx, project, actor, operation, input);
       }
     });
+  }
+  private async createTickets(
+    tx: Transaction,
+    project: Project,
+    actor: Actor,
+    items: Input<'tickets_create'>['tickets'],
+  ) {
+    const created: Ticket[] = [];
+    for (const item of items) {
+      if (item.assignee_id)
+        await this.access(tx, await this.actor(item.assignee_id, tx), project.id, ['contributor', 'admin']);
+      const parent = item.parent_id ? await this.ticket(tx, project.id, item.parent_id) : null;
+      if (parent) deliveryOnly(parent);
+      const ticket: Ticket = {
+        id: randomUUID(),
+        project_id: project.id,
+        key: `${project.key}-${++project.ticket_seq}`,
+        title: item.title,
+        description: item.description,
+        ...(item.execution_hints ? { execution_hints: item.execution_hints } : {}),
+        status: item.status,
+        priority: item.priority,
+        labels: item.labels,
+        capabilities: item.capabilities,
+        assignee_id: item.assignee_id,
+        parent_id: parent?.id ?? null,
+        revision: 1,
+        requirements_revision: 1,
+        created_by: actor.id,
+        approved_submission_id: null,
+        created_at: this.timestamp(),
+        updated_at: this.timestamp(),
+      };
+      await tx.put('tickets', ticket);
+      await this.replaceCriteria(tx, ticket, item.criteria);
+      await this.queue(tx, ticket, 'ticket');
+      await this.event(tx, project, actor, 'ticket.created', ticket.id, { key: ticket.key });
+      if (parent) await this.invalidate(tx, project, actor, parent, 'A child ticket was added.');
+      created.push(ticket);
+    }
+    return created;
   }
   private async replaceCriteria(tx: Transaction, ticket: Ticket, texts: string[]) {
     for (const previous of await tx.find('criteria', {
@@ -3363,6 +3707,8 @@ export class Application {
   private async link(tx: Transaction, project: Project, actor: Actor, input: Input<'ticket_link'>) {
     const source = await this.ticket(tx, project.id, input.source_id);
     const target = await this.ticket(tx, project.id, input.target_id);
+    deliveryOnly(source);
+    deliveryOnly(target);
     ensure(source.id !== target.id, 'DEPENDENCY_CYCLE', 'A ticket cannot reference itself.');
     const id = `${source.id}:${target.id}:${input.kind}`;
     if (input.action === 'add' && input.kind === 'blocks')
@@ -3395,8 +3741,15 @@ export class Application {
     input: any,
   ): Promise<unknown> {
     const ticket = await this.ticket(tx, project.id, input.ticket_id);
+    if (['ticket_update', 'ticket_transition', 'ticket_submit', 'ticket_review'].includes(operation))
+      deliveryOnly(ticket);
     switch (operation) {
       case 'run_submit': {
+        ensure(
+          await researchAdmission(tx, ticket, () => this.timestamp()),
+          'SPIKE_BUDGET_EXHAUSTED',
+          'Research elapsed time budget is exhausted.',
+        );
         ensure(
           this.storage.executionRuns && tx.compareExecutionRun,
           'UNSUPPORTED_EXECUTION_RUNS',
@@ -3450,6 +3803,11 @@ export class Application {
           error_code: null,
           created_at: createdAt,
         };
+        ensure(
+          await researchAdmission(tx, ticket, () => this.timestamp()),
+          'SPIKE_BUDGET_EXHAUSTED',
+          'Research elapsed time budget is exhausted.',
+        );
         await tx.put('execution_jobs', run);
         const continuation: Continuation = {
           id: continuationId,
@@ -3495,7 +3853,9 @@ export class Application {
           ]);
         const oldParent = ticket.parent_id;
         if (input.parent_id !== undefined) {
-          const parent = input.parent_id ? (await this.ticket(tx, project.id, input.parent_id)).id : null;
+          const parentTicket = input.parent_id ? await this.ticket(tx, project.id, input.parent_id) : null;
+          if (parentTicket) deliveryOnly(parentTicket);
+          const parent = parentTicket?.id ?? null;
           await this.checkParent(tx, ticket, parent);
           ticket.parent_id = parent;
         }
@@ -4004,6 +4364,16 @@ export class Application {
     viewerProfile?: McpProfile,
     bindContext = false,
   ): Promise<unknown> {
+    if (operation === 'milestone_list' || operation === 'milestone_get')
+      return this.storage.readSnapshot(async (reader) => {
+        await this.access(reader, await this.actor(actorId, reader), input.project_id);
+        ensure(
+          this.storage.milestones && reader.milestoneProgress,
+          'UNSUPPORTED_MILESTONES',
+          'Storage does not support milestones.',
+        );
+        return operation === 'milestone_list' ? listMilestones(reader, input) : readMilestone(reader, input);
+      });
     if (operation === 'run_wait') {
       const deadline = performance.now() + input.timeout_ms;
       for (;;) {
@@ -4280,6 +4650,7 @@ export class Application {
           tickets: await this.storage.find('tickets', {
             where: {
               project_id: project.id,
+              ...(this.storage.researchSpikes ? { work_kind: 'delivery' as const } : {}),
               ...(input.parent_id
                 ? { parent_id: (await this.ticket(this.storage, project.id, input.parent_id)).id }
                 : {}),
@@ -4293,13 +4664,96 @@ export class Application {
             offset: input.offset,
           }),
         };
-      case 'ticket_get':
-        return this.details(
-          this.storage,
-          project,
-          await this.ticket(this.storage, project.id, input.ticket_id),
-          actor,
-        );
+      case 'spike_list':
+        return this.storage.readSnapshot(async (reader) => {
+          await this.access(reader, await this.actor(actorId, reader), project.id);
+          const rows = await reader.find('research_spikes', {
+            where: { project_id: project.id, ...(input.idea_id ? { idea_id: input.idea_id } : {}) },
+            order: [{ field: 'id', direction: 'asc' }],
+            limit: input.limit,
+            offset: input.offset,
+          });
+          return {
+            spikes: await Promise.all(
+              rows.map(async (spike) => {
+                const ticket = await this.ticket(reader, project.id, spike.id);
+                return {
+                  id: spike.id,
+                  project_id: project.id,
+                  idea_id: spike.idea_id,
+                  revision: ticket.revision,
+                  assignee_id: ticket.assignee_id,
+                  status: spike.completed_at ? 'completed' : spike.first_claimed_at ? 'active' : 'scheduled',
+                  budget: spikeBudget(spike, this.timestamp()),
+                };
+              }),
+            ),
+          };
+        });
+      case 'spike_get':
+        return this.storage.readSnapshot(async (reader) => {
+          const actor = await this.actor(actorId, reader);
+          await this.access(reader, actor, project.id);
+          const spike = await getSpike(reader, project.id, input.spike_id);
+          const details = await this.details(
+            reader,
+            project,
+            await this.ticket(reader, project.id, spike.id),
+            actor,
+          );
+          return {
+            spike,
+            ticket: details.ticket,
+            claim: details.claim,
+            budget: spikeBudget(spike, this.timestamp()),
+          };
+        });
+      case 'idea_list':
+        return this.storage.readSnapshot(async (reader) => {
+          await this.access(reader, await this.actor(actorId, reader), project.id);
+          return {
+            ideas: await reader.find('ideas', {
+              where: { project_id: project.id, ...(input.status ? { status: input.status } : {}) },
+              order: [
+                { field: 'created_at', direction: 'desc' },
+                { field: 'id', direction: 'asc' },
+              ],
+              limit: input.limit,
+              offset: input.offset,
+            }),
+          };
+        });
+      case 'idea_get':
+        return this.storage.readSnapshot(async (reader) => {
+          await this.access(reader, await this.actor(actorId, reader), project.id);
+          return {
+            idea: await this.idea(reader, project.id, input.idea_id),
+            tickets: await reader.find('idea_tickets', {
+              where: { project_id: project.id, idea_id: input.idea_id },
+              order: [{ field: 'ticket_id', direction: 'asc' }],
+              limit: 50,
+            }),
+          };
+        });
+      case 'ticket_get': {
+        const ticket = await this.ticket(this.storage, project.id, input.ticket_id);
+        const [source] = this.storage.ideaIntake
+          ? await this.storage.find('idea_tickets', {
+              where: { project_id: project.id, ticket_id: ticket.id },
+              limit: 1,
+            })
+          : [];
+        return {
+          ...(await this.details(this.storage, project, ticket, actor)),
+          ...(source ? { source_idea: source } : {}),
+          ...(this.storage.milestones
+            ? {
+                milestone_id:
+                  (await this.storage.get('milestone_memberships', ticket.id))?.milestone_id ?? null,
+              }
+            : {}),
+        };
+      }
       case 'ticket_history': {
         if (['checkpoints', 'executions', 'changes'].includes(input.kind))
           return this.storage.readSnapshot(async (reader) => {
@@ -4328,7 +4782,11 @@ export class Application {
         let offset = 0;
         while (tickets.length < input.limit) {
           const page = await this.storage.find('tickets', {
-            where: { project_id: project.id, status: 'in_review' },
+            where: {
+              project_id: project.id,
+              status: 'in_review',
+              ...(this.storage.researchSpikes ? { work_kind: 'delivery' as const } : {}),
+            },
             order: [
               { field: 'priority', direction: 'asc' },
               { field: 'created_at', direction: 'asc' },
@@ -4433,7 +4891,7 @@ export class Application {
       const note = await reader.get('notes', id);
       if (!note || note.kind !== 'checkpoint') return null;
       const parent = await reader.get('tickets', note.ticket_id);
-      if (!parent) return null;
+      if (!parent || parent.work_kind === 'research') return null;
       return {
         id: note.id,
         project_id: note.project_id,
@@ -4467,7 +4925,7 @@ export class Application {
         : null;
     }
     const ticket = await reader.get('tickets', id);
-    if (!ticket) return null;
+    if (!ticket || ticket.work_kind === 'research') return null;
     const criteria = await reader.find('criteria', {
       where: { project_id: ticket.project_id, ticket_id: id },
       order: [{ field: 'position', direction: 'asc' }],
@@ -4731,7 +5189,7 @@ export class Application {
               limit: 10001,
             })
           : [],
-        resumable && viewerProfile !== 'reviewer'
+        this.storage.executionRuns && resumable && viewerProfile !== 'reviewer'
           ? reader.find('execution_jobs', {
               where: { project_id: project.id, ticket_id: ticket.id },
               order: [

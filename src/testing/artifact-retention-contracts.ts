@@ -216,6 +216,44 @@ export function registerArtifactRetentionContracts(name: string, factory: () => 
       hasCode('FORBIDDEN'),
     );
   });
+  check('rejects new idea citations after an artifact retirement decision', async (f) => {
+    if (!f.storage.ideaIntake) return;
+    const fields = { title: 'Proposal', problem: 'Problem', proposal: 'Improvement', why: 'Value' };
+    const idea = (await f.call(f.worker.id, 'idea_create', fields)) as { id: string };
+    await f.finish();
+    await f.storage.transaction(f.project.id, (tx) =>
+      tx.put('artifact_retirements', {
+        id: f.refs[0]!,
+        project_id: f.project.id,
+        run_id: f.run.id,
+        attempt_id: f.attempt.id,
+        ticket_id: f.ticket.id,
+        checkpoint_id: f.run.checkpoint_id,
+        actor_id: f.admin.id,
+        requested_at: f.clock.now.toISOString(),
+        expires_at: new Date(f.journal.finished_at + 1000).toISOString(),
+        size_bytes: f.bytes.length,
+        sha256: createHash('sha256').update(f.bytes).digest('hex'),
+        root_identity: 'previous-root',
+        file_identity: 'previous-file',
+      }),
+    );
+    for (const field of Object.keys(fields))
+      await assert.rejects(
+        f.call(f.worker.id, 'idea_create', { ...fields, [field]: f.refs[0] }),
+        hasCode('ARTIFACT_RETIRED'),
+      );
+    await assert.rejects(
+      f.call(f.worker.id, 'idea_triage', {
+        idea_id: idea.id,
+        expected_revision: 1,
+        action: 'park',
+        rationale: f.refs[0],
+      }),
+      hasCode('ARTIFACT_RETIRED'),
+    );
+    assert.equal((await f.storage.get('ideas', idea.id))?.revision, 1);
+  });
   check('keeps memory provenance pinned even after archival and unrelated edits', async (f) => {
     await f.finish();
     const checkpoint = (await f.storage.get('notes', f.run.checkpoint_id))!;

@@ -7,6 +7,8 @@ Headless ticketing built for agents: find useful work, claim it safely, recover 
 ## What agents get
 
 - Structured tickets with acceptance criteria, priorities, capabilities, parents, and blocking dependencies.
+- Project idea intake and triage, with atomic promotion into delivery tickets and source provenance.
+- [Time-boxed research](docs/research.md) with separate claims, durable findings and evidence-linked delivery decisions.
 - Atomic ten-minute claims, heartbeat renewal, stale-worker fencing, and retry-safe mutations.
 - Optional [GitHub CI evidence](docs/mcp.md#github-evidence), [durable signed notifications](docs/operations.md#durable-signed-notifications), and [deterministic unblocking scheduling](docs/mcp.md#scheduling).
 - Durable checkpoints, blocking questions, decisions, and artifact references.
@@ -81,6 +83,8 @@ For other CLI commands, set `STORAGE_ADAPTER=sqlite`, `SQLITE_PATH`, and `EMBEDD
 Projects and tickets accept optional `execution_hints` with `model` and `effort` strings. Ticket fields override the corresponding project defaults; `ticket_get` and context expose `effective_execution_hints` only when configured. A provided object replaces the local hints; an omitted object leaves them unchanged. Null, an empty object, or empty/null fields clear local choices so project defaults can apply. Model/effort hints never execute a provider, configure embeddings, grant permissions, or guarantee a model is accepted by the consuming client.
 
 Optional [registered client capabilities](docs/client-capabilities.md) enforce supported model/effort pairs, operating systems, tools and execution environments before matching and admission. Operator records bind support to authorized identities/projects and expire; requests can pin `client_id`, `operating_system` and `environment` through the same hints. Existing claims remain compatible when registration is not configured.
+
+[Milestones](docs/mcp.md#milestones) group same-project tickets by an intended outcome and exit criteria. Planner tools manage optional membership, page compact progress, and explicitly confirm completion after current member requirements are accepted. Grouping does not affect claims, scheduling or dependencies.
 
 ## Extending the system
 

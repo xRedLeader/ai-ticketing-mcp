@@ -26,6 +26,7 @@ import {
 } from '../contracts.js';
 import { MAX_INDEX_JOB_ATTEMPTS } from './index-job-policy.js';
 import { artifactPinSql } from './artifact-pins.js';
+import { milestoneProgress, milestoneProgressSql } from './milestones.js';
 
 const knowledgeColumns = [
   'id',
@@ -45,6 +46,48 @@ const knowledgeColumns = [
   'updated_at',
 ];
 const columns: Record<Table, string[]> = {
+  research_spikes: [
+    'id',
+    'project_id',
+    'idea_id',
+    'question',
+    'time_budget_ms',
+    'first_claimed_at',
+    'findings',
+    'evidence',
+    'recommendation',
+    'completed_at',
+    'completed_by',
+  ],
+  ideas: [
+    'id',
+    'project_id',
+    'title',
+    'problem',
+    'proposal',
+    'why',
+    'status',
+    'revision',
+    'created_by',
+    'decided_by',
+    'rationale',
+    'created_at',
+    'updated_at',
+  ],
+  milestones: [
+    'id',
+    'project_id',
+    'name',
+    'outcome',
+    'exit_criteria',
+    'revision',
+    'created_at',
+    'updated_at',
+    'completed_at',
+    'completed_by',
+  ],
+  milestone_memberships: ['id', 'project_id', 'milestone_id'],
+  idea_tickets: ['id', 'project_id', 'idea_id', 'idea_revision', 'ticket_id', 'spike_ids'],
   claim_handoffs: [
     'id',
     'project_id',
@@ -173,6 +216,7 @@ const columns: Record<Table, string[]> = {
   ],
   members: ['id', 'project_id', 'actor_id', 'role'],
   tickets: [
+    'work_kind',
     'id',
     'project_id',
     'key',
@@ -291,6 +335,8 @@ const columns: Record<Table, string[]> = {
   ],
 };
 const json = new Set([
+  'exit_criteria',
+  'spike_ids',
   'condition',
   'observed',
   'pending',
@@ -330,11 +376,13 @@ function encode(key: string, value: unknown): SQLInputValue {
 function decode(row: Record<string, unknown>) {
   return Object.fromEntries(
     Object.entries(row).flatMap(([key, value]) =>
-      (key === 'execution_hints' ||
+      (key === 'work_kind' && value === 'delivery') ||
+      (key === 'spike_ids' && value === '[]') ||
+      ((key === 'execution_hints' ||
         key === 'execution' ||
         key === 'github_pull_request' ||
         key === 'scheduling_policy') &&
-      value === null
+        value === null)
         ? []
         : [
             [
@@ -378,11 +426,21 @@ function repository(db: DatabaseSync): Transaction {
       // The caller's BEGIN IMMEDIATE already serializes reference writes and physical reads.
     },
     async artifactPinned(query) {
+      const tables = db
+        .prepare(
+          "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('ideas','milestones','research_spikes')",
+        )
+        .all()
+        .map((row) => String(row.name));
       const values: string[] = [];
-      const sql = artifactPinSql(query, (value) => {
-        values.push(value);
-        return '?';
-      });
+      const sql = artifactPinSql(
+        query,
+        (value) => {
+          values.push(value);
+          return '?';
+        },
+        tables,
+      );
       return (db.prepare(sql).get(...values) as { pinned: number }).pinned === 1;
     },
     async lockExecutionController() {
@@ -420,6 +478,9 @@ function repository(db: DatabaseSync): Transaction {
             previous.locked_until,
           ).changes === 1
       );
+    },
+    async milestoneProgress(projectId, milestoneId) {
+      return milestoneProgress(db.prepare(milestoneProgressSql('?', '?')).get(projectId, milestoneId)!);
     },
     async get<K extends Table>(table: K, id: string) {
       return (await this.find(table, { where: { id } as Query<Tables[K]>['where'], limit: 1 }))[0] ?? null;
@@ -485,7 +546,7 @@ function repository(db: DatabaseSync): Transaction {
           : 't.priority,t.created_at,t.id';
       return db
         .prepare(
-          `SELECT t.* FROM tickets t WHERE t.project_id=? AND t.status IN ('ready','in_progress') AND (t.assignee_id IS NULL OR t.assignee_id=?) AND NOT EXISTS(SELECT 1 FROM json_each(t.capabilities) c WHERE c.value NOT IN (SELECT value FROM json_each(?))) AND NOT EXISTS(SELECT 1 FROM json_each(?) l WHERE l.value NOT IN (SELECT value FROM json_each(t.labels))) AND NOT EXISTS(SELECT 1 FROM claims c WHERE c.ticket_id=t.id AND c.expires_at>?) AND NOT EXISTS(SELECT 1 FROM links l JOIN tickets p ON p.id=l.source_id WHERE l.project_id=t.project_id AND l.target_id=t.id AND l.kind='blocks' AND p.status<>'done') AND NOT EXISTS(SELECT 1 FROM notes q WHERE q.project_id=t.project_id AND q.ticket_id=t.id AND q.kind='question' AND q.blocking=1 AND NOT EXISTS(SELECT 1 FROM notes a WHERE a.project_id=q.project_id AND a.ticket_id=q.ticket_id AND a.answer_to=q.id AND a.kind='answer')) ORDER BY ${order} LIMIT ? OFFSET ?`,
+          `SELECT t.* FROM tickets t WHERE t.project_id=? AND t.work_kind='delivery' AND t.status IN ('ready','in_progress') AND (t.assignee_id IS NULL OR t.assignee_id=?) AND NOT EXISTS(SELECT 1 FROM json_each(t.capabilities) c WHERE c.value NOT IN (SELECT value FROM json_each(?))) AND NOT EXISTS(SELECT 1 FROM json_each(?) l WHERE l.value NOT IN (SELECT value FROM json_each(t.labels))) AND NOT EXISTS(SELECT 1 FROM claims c WHERE c.ticket_id=t.id AND c.expires_at>?) AND NOT EXISTS(SELECT 1 FROM links l JOIN tickets p ON p.id=l.source_id WHERE l.project_id=t.project_id AND l.target_id=t.id AND l.kind='blocks' AND p.status<>'done') AND NOT EXISTS(SELECT 1 FROM notes q WHERE q.project_id=t.project_id AND q.ticket_id=t.id AND q.kind='question' AND q.blocking=1 AND NOT EXISTS(SELECT 1 FROM notes a WHERE a.project_id=q.project_id AND a.ticket_id=q.ticket_id AND a.answer_to=q.id AND a.kind='answer')) ORDER BY ${order} LIMIT ? OFFSET ?`,
         )
         .all(
           projectId,
@@ -501,14 +562,17 @@ function repository(db: DatabaseSync): Transaction {
     },
     async put<K extends Table>(table: K, value: Tables[K]) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
-      const keys = columns[table];
       const record = value as unknown as Record<string, unknown>;
+      const keys = columns[table].filter(
+        (key) => (key !== 'work_kind' && key !== 'spike_ids') || record[key] !== undefined,
+      );
       ensure(
         typeof record.id === 'string' && record.id.length > 0,
         'INVALID_REFERENCE',
         'A record ID is required.',
       );
       const conflict =
+        table === 'idea_tickets' ||
         table === 'claim_handoffs' ||
         table === 'artifact_retirements' ||
         table === 'github_evidence' ||
@@ -663,6 +727,13 @@ class Handle {
   }
 }
 class SqliteStorage extends Handle implements StorageAdapter {
+  readonly researchSpikes = true as const;
+  readonly ideaIntake = true as const;
+  readonly milestones = true as const;
+  milestoneProgress(projectId: string, milestoneId: string) {
+    this.open();
+    return repository(this.db).milestoneProgress!(projectId, milestoneId);
+  }
   readonly artifactRetention = true as const;
   readonly wakeDecisions = true;
   readonly executionRuns = true as const;
@@ -715,8 +786,8 @@ class SqliteStorage extends Handle implements StorageAdapter {
       try {
         db.exec('BEGIN');
         db.prepare('SELECT name FROM sqlite_schema LIMIT 1').get();
-        const { get, find, unansweredQuestions, workCandidates } = repository(db);
-        const result = await work({ get, find, unansweredQuestions, workCandidates });
+        const { get, find, unansweredQuestions, workCandidates, milestoneProgress } = repository(db);
+        const result = await work({ get, find, unansweredQuestions, workCandidates, milestoneProgress });
         db.exec('COMMIT');
         return result;
       } finally {
