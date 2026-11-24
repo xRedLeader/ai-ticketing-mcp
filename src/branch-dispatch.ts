@@ -65,7 +65,7 @@ export class BranchDispatcher {
     const results: BranchDispatchResult[] = [];
     for (const input of requests) {
       const queue = queueId(input);
-      let budgetSnapshot: string;
+      const start: { invocation?: ContinuationInvocation; called?: boolean } = {};
       try {
         const previous = await application.getBranchDispatch(
           actor,
@@ -149,15 +149,12 @@ export class BranchDispatcher {
                 code: attention ? (reason ?? 'BUDGET_NEEDS_ATTENTION') : 'HOST_CAPACITY',
               };
             }
-            budgetSnapshot = JSON.stringify(capacity.report(input.budget_run_id));
-            return {
-              state: 'starting',
-              invocation: {
-                host_id: host,
-                queue_id: queue,
-                execution_token: admitted.request.execution_token!,
-              },
+            start.invocation = {
+              host_id: host,
+              queue_id: queue,
+              execution_token: admitted.request.execution_token!,
             };
+            return { state: 'starting', invocation: start.invocation };
           },
           ({ execution, join }, invocation) => {
             const entry = capacity
@@ -173,11 +170,20 @@ export class BranchDispatcher {
               'Branch capacity ownership changed.',
             );
             capacity.heartbeat(entry.lease);
+            const budget = capacity.report(input.budget_run_id);
             ensure(
-              JSON.stringify(capacity.report(input.budget_run_id)) === budgetSnapshot,
+              budget.attempts.some(
+                (attempt) =>
+                  attempt.attempt_id === queue &&
+                  attempt.actor_id === actor &&
+                  attempt.ticket_id === input.ticket_id &&
+                  attempt.requirements_revision === join.requirements_revision &&
+                  !attempt.settlement,
+              ) && !budget.reasons.some((reason) => /^(?:overrun|unknown|overdue):/.test(reason)),
               'BUDGET_CHANGED',
-              'Budget changed before launch.',
+              'Branch reservation is no longer eligible to launch.',
             );
+            start.called = true;
             return this.options.launch(
               {
                 actor_id: actor,
@@ -221,6 +227,30 @@ export class BranchDispatcher {
           },
           input.join_identity,
         );
+        const invocation = dispatch.invocation;
+        if (
+          dispatch.state === 'needs_attention' &&
+          invocation &&
+          invocation.execution_token === start.invocation?.execution_token &&
+          !start.called
+        ) {
+          await this.reconcile(invocation, {
+            source: 'branch-dispatch-before-launch',
+            execution_token: invocation.execution_token,
+            observed_at: Date.now(),
+            state: 'never_started',
+            settlement: {
+              outcome: 'cancelled',
+              runtime_ms: 0,
+              usage_source: 'branch-dispatch-before-launch',
+              usage: { input_tokens: 0, output_tokens: 0 },
+              cost_usd_micros: 0,
+              cost_source: 'branch-dispatch-before-launch',
+            },
+          });
+          results.push({ ticket_id: input.ticket_id, state: 'settled', code: dispatch.code, invocation });
+          continue;
+        }
         results.push({
           ticket_id: input.ticket_id,
           state:
@@ -268,14 +298,13 @@ export class BranchDispatcher {
         entry?.kind === 'agent' &&
         entry.project_id === project &&
         entry.admission?.ticket_id === ticket &&
-        entry.admission.actor_id === actor &&
         entry.lease &&
         entry.execution_token === invocation.execution_token &&
         observation.execution_token === invocation.execution_token,
       'CONFLICT',
       'Exit proof belongs to another branch invocation.',
     );
-    capacity.reconcile(entry.lease, observation);
+    const lease = entry.lease;
     return application.completeBranchExecution(
       actor,
       project,
@@ -283,19 +312,21 @@ export class BranchDispatcher {
       token,
       { capacity_id: capacity.identity, host_id: host, budget_run_id: entry.run_id },
       (record) => {
-        const settled = capacity
-          .inspect(host)
-          .entries.find((candidate) => candidate.queue_id === invocation.queue_id);
-        const outcome = settled?.observation?.settlement?.outcome;
-        return settled?.state === 'settled' &&
-          settled.execution_token === invocation.execution_token &&
-          settled.admission?.actor_id === record.actor_id &&
-          settled.admission.requirements_revision === record.requirements_revision &&
-          settled.admission.ticket_id === record.id &&
-          settled.run_id === record.budget_run_id &&
-          outcome
-          ? { invocation, outcome }
-          : null;
+        const outcome = observation.settlement?.outcome;
+        const previous = record.dispatch.invocation;
+        if (
+          entry.admission?.actor_id !== record.actor_id ||
+          entry.admission.requirements_revision !== record.requirements_revision ||
+          entry.admission.attempt_id !== invocation.queue_id ||
+          (previous &&
+            (previous.execution_token !== invocation.execution_token ||
+              previous.host_id !== invocation.host_id ||
+              previous.queue_id !== invocation.queue_id)) ||
+          !outcome
+        )
+          return null;
+        capacity.reconcile(lease, observation);
+        return { invocation, outcome };
       },
     );
   }

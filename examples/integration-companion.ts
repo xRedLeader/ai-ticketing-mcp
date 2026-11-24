@@ -1,17 +1,17 @@
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, realpathSync, unlinkSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { z } from 'zod';
 import type { Application } from '../src/application.js';
-import { DomainError, ensure, type DependencyJoin } from '../src/contracts.js';
+import { DomainError, ensure } from '../src/contracts.js';
 import { durableExecutionFile, readExecutionFile } from '../src/execution-journal.js';
 import {
   fileSha256,
   pipelineIdentityError,
   type VerificationPipeline,
 } from '../src/verification-pipeline.js';
-import { runVerificationPipeline, type VerificationReport } from '../src/verification-runner.js';
+import { runLocalVerificationPipeline, type VerificationReport } from '../src/verification-runner.js';
 import {
   createWorktree,
   verifyWorktree,
@@ -89,13 +89,18 @@ export interface IntegrationCompanionOptions {
   pipeline: (worktree: WorktreeRecord, commit: string) => VerificationPipeline;
 }
 interface Intent {
-  version: 1;
+  version: 2;
   input_hash: string;
   request: IntegrationRequest;
   target_commit: string;
-  join: DependencyJoin;
+  join_identity: string;
   git_sha256: string;
 }
+interface TargetOwner {
+  operation: string;
+  acquisition?: string;
+}
+const MAX_JOURNAL_BYTES = 2 * 1024 * 1024;
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const failureCode = (error: unknown) =>
   error instanceof DomainError ? error.code : 'INTEGRATION_UNRESOLVED';
@@ -158,7 +163,17 @@ export class IntegrationCompanion {
       'JOURNAL_CHANGED',
       'Journal is not an owned plain file.',
     );
-    return readExecutionFile(path, 2 * 1024 * 1024) as T;
+    return readExecutionFile(path, MAX_JOURNAL_BYTES) as T;
+  }
+  private readIntent(path: string): Intent {
+    const intent = this.read<
+      | Intent
+      | (Omit<Intent, 'version' | 'join_identity'> & {
+          version: 1;
+          join: { identity: string };
+        })
+    >(path);
+    return intent.version === 1 ? { ...intent, version: 2, join_identity: intent.join.identity } : intent;
   }
   private directory(path: string) {
     try {
@@ -260,7 +275,7 @@ export class IntegrationCompanion {
       'Integration Git executable changed.',
     );
     ensure(
-      (await this.join(intent.request)).identity === intent.join.identity,
+      (await this.join(intent.request)).identity === intent.join_identity,
       'JOIN_CHANGED',
       'Accepted join changed; revalidation is required.',
     );
@@ -295,28 +310,71 @@ export class IntegrationCompanion {
       project_id: this.options.project_id,
       target_ref: this.options.target_ref,
       target_commit: intent.target_commit,
-      join_identity: intent.join.identity,
+      join_identity: intent.join_identity,
       sources: intent.request.sources,
       journal_path: journal,
       cleanup_verified: false,
     };
   }
-  private release(path: string, key: string, journal: string, recovery = false) {
+  private release(path: string, owner: TargetOwner, journal: string, recovery = false) {
+    const grant = recovery ? 'reconciliation-release' : 'release';
+    ensure(
+      owner.acquisition === undefined || z.uuid().safeParse(owner.acquisition).success,
+      'INTERLOCK_CHANGED',
+      'Invalid target acquisition identity.',
+    );
     try {
-      durableExecutionFile(join(journal, recovery ? 'reconciliation-release.json' : 'release.json'), {
-        operation: key,
-      });
+      durableExecutionFile(
+        join(journal, owner.acquisition ? `${grant}-${owner.acquisition}.json` : `${grant}.json`),
+        owner,
+      );
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') return;
       throw error;
     }
     if (!existsSync(path)) return;
+    const current = this.read<TargetOwner>(path);
     ensure(
-      this.read<{ operation: string }>(path).operation === key,
+      current.operation === owner.operation && current.acquisition === owner.acquisition,
       'INTERLOCK_CHANGED',
       'Target interlock ownership changed.',
     );
     unlinkSync(path);
+  }
+
+  private previousReceipt(journal: string) {
+    for (const name of ['reconciliation.json', 'result.json']) {
+      const path = join(journal, name);
+      if (existsSync(path)) return this.read<IntegrationReceipt>(path);
+    }
+  }
+
+  private async replay(intent: Intent, receipt: IntegrationReceipt): Promise<IntegrationReceipt> {
+    if (receipt.state === 'ready_for_review') {
+      try {
+        const reportPath = join(receipt.journal_path, 'verification.json');
+        ensure(
+          fileSha256(reportPath) === receipt.verification_sha256 &&
+            receipt.worktree &&
+            receipt.candidate_commit,
+          'VERIFICATION_CHANGED',
+          'Verification evidence changed.',
+        );
+        const pipeline = this.options.pipeline(receipt.worktree, receipt.candidate_commit);
+        const report = this.read<VerificationReport>(reportPath);
+        ensure(
+          report.recipe_fingerprint === pipeline.fingerprint &&
+            report.status === 'passed' &&
+            report.cleanup_verified,
+          'VERIFICATION_CHANGED',
+          'Verification recipe/evidence changed.',
+        );
+        await this.validate(intent, receipt.worktree, pipeline);
+      } catch (error) {
+        return { ...receipt, state: 'revalidation_required', code: failureCode(error) };
+      }
+    }
+    return receipt;
   }
 
   async prepare(raw: IntegrationRequest): Promise<IntegrationReceipt> {
@@ -340,7 +398,7 @@ export class IntegrationCompanion {
     ]);
     let intent: Intent;
     if (existsSync(intentPath)) {
-      intent = this.read<Intent>(intentPath);
+      intent = this.readIntent(intentPath);
       ensure(
         intent.input_hash === inputHash,
         'IDEMPOTENCY_CONFLICT',
@@ -348,18 +406,23 @@ export class IntegrationCompanion {
       );
     } else {
       intent = {
-        version: 1,
+        version: 2,
         input_hash: inputHash,
         request,
         target_commit: this.target(),
-        join: await this.join(request),
+        join_identity: (await this.join(request)).identity,
         git_sha256: fileSha256(this.options.git_executable),
       };
+      ensure(
+        Buffer.byteLength(JSON.stringify(intent) + '\n') <= MAX_JOURNAL_BYTES,
+        'JOURNAL_LIMIT',
+        'Integration intent exceeds the journal size limit.',
+      );
       try {
         durableExecutionFile(intentPath, intent);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        intent = this.read<Intent>(intentPath);
+        intent = this.readIntent(intentPath);
         ensure(
           intent.input_hash === inputHash,
           'IDEMPOTENCY_CONFLICT',
@@ -368,50 +431,40 @@ export class IntegrationCompanion {
       }
     }
     const base = this.base(intent, paths.journal);
-    if (existsSync(join(paths.journal, 'reconciliation.json')))
-      return this.read<IntegrationReceipt>(join(paths.journal, 'reconciliation.json'));
-    if (existsSync(resultPath)) {
-      const receipt = this.read<IntegrationReceipt>(resultPath);
-      if (receipt.state === 'ready_for_review') {
+    const owner = { operation: paths.key, acquisition: randomUUID() };
+    for (;;) {
+      const previous = this.previousReceipt(paths.journal);
+      if (previous) return this.replay(intent, previous);
+      try {
+        durableExecutionFile(paths.lock, { ...owner, input_hash: inputHash, journal_path: paths.journal });
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        let current: TargetOwner;
         try {
-          const reportPath = join(paths.journal, 'verification.json');
-          ensure(
-            fileSha256(reportPath) === receipt.verification_sha256 &&
-              receipt.worktree &&
-              receipt.candidate_commit,
-            'VERIFICATION_CHANGED',
-            'Verification evidence changed.',
-          );
-          const pipeline = this.options.pipeline(receipt.worktree, receipt.candidate_commit);
-          const report = this.read<VerificationReport>(reportPath);
-          ensure(
-            report.recipe_fingerprint === pipeline.fingerprint &&
-              report.status === 'passed' &&
-              report.cleanup_verified,
-            'VERIFICATION_CHANGED',
-            'Verification recipe/evidence changed.',
-          );
-          await this.validate(intent, receipt.worktree, pipeline);
-        } catch (error) {
-          return { ...receipt, state: 'revalidation_required', code: failureCode(error) };
+          current = this.read<TargetOwner>(paths.lock);
+        } catch (readError) {
+          if ((readError as NodeJS.ErrnoException).code === 'ENOENT') continue;
+          throw readError;
         }
+        return {
+          ...base,
+          state: current.operation === paths.key ? 'needs_attention' : 'busy',
+          code: current.operation === paths.key ? 'NATIVE_UNRESOLVED' : 'TARGET_INTERLOCKED',
+        };
       }
-      return receipt;
     }
+    let previous: IntegrationReceipt | undefined;
     try {
-      durableExecutionFile(paths.lock, {
-        operation: paths.key,
-        input_hash: inputHash,
-        journal_path: paths.journal,
-      });
+      previous = this.previousReceipt(paths.journal);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      const owner = this.read<{ operation: string }>(paths.lock);
-      return {
-        ...base,
-        state: owner.operation === paths.key ? 'needs_attention' : 'busy',
-        code: owner.operation === paths.key ? 'NATIVE_UNRESOLVED' : 'TARGET_INTERLOCKED',
-      };
+      this.release(paths.lock, owner, paths.journal);
+      throw error;
+    }
+    // A replay can acquire the lock just after the original owner publishes and releases it.
+    if (previous) {
+      this.release(paths.lock, owner, paths.journal);
+      return this.replay(intent, previous);
     }
     let nativeStarted = false,
       cleanupVerified = true,
@@ -510,7 +563,7 @@ export class IntegrationCompanion {
         recipe_fingerprint: pipeline.fingerprint,
       });
       cleanupVerified = false;
-      const report = await runVerificationPipeline(
+      const report = await runLocalVerificationPipeline(
         pipeline,
         Date.now() + pipeline.timeout_ms,
         join(paths.journal, 'verification.json'),
@@ -558,8 +611,7 @@ export class IntegrationCompanion {
       finalized = true;
       return receipt;
     } finally {
-      if (finalized && (!nativeStarted || cleanupVerified))
-        this.release(paths.lock, paths.key, paths.journal);
+      if (finalized && (!nativeStarted || cleanupVerified)) this.release(paths.lock, owner, paths.journal);
     }
   }
 
@@ -580,7 +632,7 @@ export class IntegrationCompanion {
       this.options.project_id,
       request.ticket_id,
     );
-    const intent = this.read<Intent>(join(paths.journal, 'intent.json'));
+    const intent = this.readIntent(join(paths.journal, 'intent.json'));
     ensure(
       intent.input_hash ===
         digest([
@@ -599,9 +651,9 @@ export class IntegrationCompanion {
     );
     if (existsSync(join(paths.journal, 'reconciliation.json')))
       return this.read<IntegrationReceipt>(join(paths.journal, 'reconciliation.json'));
+    const owner = this.read<TargetOwner>(paths.lock);
     ensure(
-      this.read<{ operation: string }>(paths.lock).operation === paths.key &&
-        proof.stopped(paths.journal) === true,
+      owner.operation === paths.key && proof.stopped(paths.journal) === true,
       'NATIVE_UNRESOLVED',
       'Exact native termination/cleanup proof is required.',
     );
@@ -621,7 +673,7 @@ export class IntegrationCompanion {
         return this.read<IntegrationReceipt>(join(paths.journal, 'reconciliation.json'));
       throw error;
     }
-    this.release(paths.lock, paths.key, paths.journal, true);
+    this.release(paths.lock, owner, paths.journal, true);
     return receipt;
   }
 }

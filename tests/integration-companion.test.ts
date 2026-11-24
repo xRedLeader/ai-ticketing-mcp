@@ -393,35 +393,136 @@ it('grants only one release owner when cleanup paths race and preserves the repl
   const originalUnlink = fs.unlinkSync;
   try {
     const companion = f.companion() as unknown as {
-      release(path: string, key: string, journal: string): void;
+      release(path: string, owner: { operation: string; acquisition: string }, journal: string): void;
     };
     const lock = join(f.directory, 'race-lock.json'),
       journal = join(f.directory, 'race-journal');
     mkdirSync(journal);
-    writeFileSync(lock, JSON.stringify({ operation: 'old-operation' }));
+    const owner = { operation: 'same-operation', acquisition: randomUUID() };
+    const replacement = { ...owner, acquisition: randomUUID() };
+    writeFileSync(lock, JSON.stringify(owner));
     let deletions = 0;
     fs.unlinkSync = (path) => {
       if (path !== lock) return originalUnlink(path);
       deletions++;
       if (deletions === 1) {
         // A second cleanup runs after the first owner's lock check, before its native unlink.
-        companion.release(lock, 'old-operation', journal);
-        if (!existsSync(lock)) writeFileSync(lock, JSON.stringify({ operation: 'replacement-operation' }));
+        companion.release(lock, owner, journal);
+        if (!existsSync(lock)) writeFileSync(lock, JSON.stringify(replacement));
       }
       originalUnlink(path);
     };
     syncBuiltinESMExports();
-    companion.release(lock, 'old-operation', journal);
+    companion.release(lock, owner, journal);
     assert.equal(deletions, 1);
-    writeFileSync(lock, JSON.stringify({ operation: 'replacement-operation' }));
-    companion.release(lock, 'old-operation', journal);
-    assert.equal(JSON.parse(readFileSync(lock, 'utf8')).operation, 'replacement-operation');
+    writeFileSync(lock, JSON.stringify(replacement));
+    companion.release(lock, owner, journal);
+    assert.deepEqual(JSON.parse(readFileSync(lock, 'utf8')), replacement);
   } finally {
     fs.unlinkSync = originalUnlink;
     syncBuiltinESMExports();
     f.dispose();
   }
 });
+
+it('releases a retry acquisition when the original finishes before the lock is acquired', async () => {
+  const f = fixture();
+  const originalExists = fs.existsSync;
+  try {
+    const companion = f.companion();
+    const completed = await companion.prepare(f.request);
+    assert.equal(completed.state, 'ready_for_review');
+    const resultPath = join(completed.journal_path, 'result.json');
+    let missed = false;
+    fs.existsSync = (path) => {
+      if (!missed && path === resultPath) {
+        missed = true;
+        return false;
+      }
+      return originalExists(path);
+    };
+    syncBuiltinESMExports();
+    assert.deepEqual(await companion.prepare(f.request), completed);
+    assert.ok(missed);
+    assert.equal(readFileSync(f.calls, 'utf8'), 'verified\n');
+    assert.equal(
+      (await companion.prepare({ ...f.request, operation_id: randomUUID() })).state,
+      'ready_for_review',
+    );
+  } finally {
+    fs.existsSync = originalExists;
+    syncBuiltinESMExports();
+    f.dispose();
+  }
+});
+
+it('keeps large accepted joins readable on retry without copying their evidence into the intent', async () => {
+  const f = fixture();
+  try {
+    const snapshot = f.getSnapshot();
+    for (const branch of snapshot.branches)
+      branch.evidence = Array.from({ length: 50 }, () => ({
+        criterion_id: randomUUID(),
+        result: 'pass',
+        summary: 'a'.repeat(4000),
+        references: Array.from(
+          { length: 20 },
+          (_, index) => `https://example.test/${index}/${'b'.repeat(1950)}`,
+        ),
+      }));
+    assert.ok(Buffer.byteLength(JSON.stringify(snapshot)) > 2 * 1024 * 1024);
+    f.setSnapshot(snapshot);
+    const receipt = await f.companion().prepare(f.request);
+    assert.equal(receipt.state, 'ready_for_review');
+    const intent = JSON.parse(readFileSync(join(receipt.journal_path, 'intent.json'), 'utf8'));
+    assert.equal(intent.join_identity, snapshot.identity);
+    assert.equal(intent.join, undefined);
+    assert.deepEqual(await f.companion().prepare(f.request), receipt);
+  } finally {
+    f.dispose();
+  }
+});
+
+it(
+  'terminates the local verification group and its descendants on Linux timeout',
+  {
+    skip: process.platform !== 'linux',
+  },
+  async () => {
+    const f = fixture();
+    try {
+      const marker = join(f.directory, 'child-started.txt');
+      const late = join(f.directory, 'child-still-running.txt');
+      const descendant = `const fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(marker)}, 'started'); setTimeout(() => fs.writeFileSync(${JSON.stringify(late)}, 'late'), 2200);`;
+      const body = `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: 'inherit' });`;
+      const companion = new IntegrationCompanion({
+        ...f.options,
+        pipeline(record, commit) {
+          const config = f.configuration(record, commit, body);
+          config.recipes[1]!.timeout_ms = 1000;
+          const registry = new ExecutionRecipeRegistry(config);
+          const metadata = registry.metadata().find((item) => item.id === 'integration-checks')!;
+          const recipe = registry.get(metadata.id, metadata.fingerprint, f.project);
+          assert.ok('kind' in recipe);
+          return recipe;
+        },
+      });
+      const result = await companion.prepare(f.request);
+      await delay(2300);
+      assert.ok(existsSync(marker));
+      assert.equal(existsSync(late), false);
+      assert.equal(result.state, 'failed');
+      assert.equal(result.code, 'TIMEOUT');
+      assert.equal(result.cleanup_verified, true);
+      assert.equal(
+        (await f.companion().prepare({ ...f.request, operation_id: randomUUID() })).state,
+        'ready_for_review',
+      );
+    } finally {
+      f.dispose();
+    }
+  },
+);
 
 it('retains an interrupted release grant until explicit recovery and authorizes historical result access', async () => {
   const f = fixture();

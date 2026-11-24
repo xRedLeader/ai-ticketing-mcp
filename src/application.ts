@@ -1191,8 +1191,10 @@ export class Application {
       const actor = await this.actor(actorId, tx);
       await this.access(tx, actor, projectId, ['contributor', 'admin']);
       const row = await tx.get('branch_dispatches', ticketId);
+      const member = await tx.get('members', `${projectId}:${actorId}`);
       ensure(
-        row?.project_id === projectId && (row.actor_id === actorId || actor.system_admin),
+        row?.project_id === projectId &&
+          (row.actor_id === actorId || member?.role === 'admin' || actor.system_admin),
         'FORBIDDEN',
         'Branch belongs to another worker.',
       );

@@ -658,12 +658,78 @@ export function registerBranchDispatchContractTests(name: string, factory: () =>
         const result = (await f.dispatcher().runOnce([f.requests[0]!]))[0]!;
         assert.equal(result.code, change === 'claim' ? 'CLAIM_EXPIRED' : 'BUDGET_CHANGED');
         assert.equal(f.calls.length, 0);
-        assert.equal(f.capacity.inspect('host').occupied.agent, 1);
+        assert.equal(result.state, 'settled');
         assert.ok(result.invocation);
+        assert.equal(f.capacity.inspect('host').occupied.agent, 0);
+        const fence = await f.storage.get('branch_dispatches', f.tickets[0]!.id);
+        assert.equal(fence?.dispatch.state, 'completed');
       } finally {
         f.storage.transaction = original;
         await f.dispose();
       }
+    }
+  });
+
+  it(`${name}: launches independently reserved tickets sharing one budget`, async () => {
+    const f = await setup();
+    const peer = new HostCapacity(f.capacityFile, f.clients);
+    try {
+      const results = await Promise.all([
+        f.dispatcher().runOnce([f.requests[0]!]),
+        f.dispatcher(peer).runOnce([f.requests[1]!]),
+      ]);
+      assert.deepEqual(
+        results.flat().map(({ state }) => state),
+        ['running', 'running'],
+      );
+      assert.equal(f.calls.length, 2);
+      assert.equal(f.capacity.inspect('host').occupied.agent, 2);
+    } finally {
+      peer.close();
+      await f.dispose();
+    }
+  });
+
+  it(`${name}: allows a project admin to reconcile exact exit after worker access is revoked`, async () => {
+    const f = await setup();
+    try {
+      const [result] = await f.dispatcher().runOnce([f.requests[0]!]);
+      assert.equal(result?.state, 'running');
+      const invocation = result.invocation!;
+      await f.call(f.admin.id, 'member_set', { actor_id: f.worker.id, role: 'none' });
+      await assert.rejects(f.settle(invocation), hasCode('FORBIDDEN'));
+      assert.equal(f.capacity.inspect('host').occupied.agent, 1);
+      const admin = new BranchDispatcher({
+        application: f.app,
+        capacity: f.capacity,
+        actor_id: f.admin.id,
+        project_id: f.project.id,
+        host_id: 'host',
+        launch: () => undefined,
+      });
+      const observation = {
+        source: 'fixture',
+        execution_token: invocation.execution_token,
+        observed_at: Date.now(),
+        state: 'terminated' as const,
+        settlement: {
+          outcome: 'succeeded' as const,
+          runtime_ms: 1,
+          usage_source: 'fixture',
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      };
+      await assert.rejects(
+        admin.reconcile(invocation, { ...observation, execution_token: randomUUID() }),
+        hasCode('CONFLICT'),
+      );
+      assert.equal(await admin.reconcile(invocation, observation), true);
+      assert.equal(await admin.reconcile(invocation, observation), true);
+      assert.equal(f.capacity.inspect('host').occupied.agent, 0);
+      const fence = await f.storage.get('branch_dispatches', f.tickets[0]!.id);
+      assert.equal(fence?.dispatch.state, 'completed');
+    } finally {
+      await f.dispose();
     }
   });
 }

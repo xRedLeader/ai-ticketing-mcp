@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { ensure } from '../src/contracts.js';
 import { pipelineIdentityError, type VerificationPipeline } from '../src/verification-pipeline.js';
-import { runVerificationPipeline } from '../src/verification-runner.js';
+import { runLocalVerificationPipeline } from '../src/verification-runner.js';
 import {
   readRepositoryAnalysis,
   type RepositoryAnalysis,
@@ -189,7 +189,11 @@ export async function runSelectedValidation(
           steps: Object.freeze(pipeline.steps.filter(({ id }) => selection.selected_step_ids.includes(id))),
         })
       : pipeline;
-  const report = await runVerificationPipeline(selectedPipeline, options.deadline_at, options.report_path);
+  const report = await runLocalVerificationPipeline(
+    selectedPipeline,
+    options.deadline_at,
+    options.report_path,
+  );
   if (selection.scope === 'narrow_local') {
     try {
       const after = readRepositoryAnalysis(identity, {
