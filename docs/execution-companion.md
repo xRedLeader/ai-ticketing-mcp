@@ -2,11 +2,13 @@
 
 The optional companion runs operator-registered finite foreground scripts in a separate Node 24+ process. Start it independently of the MCP server/client: closing the submitting chat or MCP connection does not terminate that process. It makes no model calls, uses no agent token budget, and never retries an execution. MCP `run_submit` selects only a registered recipe ID and atomically stores its checkpoint, immutable recipe fingerprint and exit-code continuation; `run_get` reads that exact authorized project run later. These tools use the `full` MCP profile.
 
+When storage supports [durable wakes](durable-wakes.md), each companion pass also evaluates a bounded page of explicitly registered wake conditions. It stores coalesced reasons and cursors, without consuming decisions or starting models. Terminal execution settlement emits one durable `run.settled` event with run/continuation IDs and result code; repeated identical settlement does not emit duplicates. Restart resumes each registration's durable cursor and retains active consumption fences.
+
 ## Trusted host contract
 
 Recipes, executables, script files, workspaces, environment and artifact directory are operator-owned. Register only finite foreground work that waits for its children, never detaches/backgrounds work, and never escapes the supervisor. This is a trusted local execution boundary, not an OS sandbox for untrusted scripts. A normal exit, including a nonzero exit, is authoritative under this contract. CPU/memory declarations are HostCapacity admission estimates, not OS resource enforcement.
 
-Timeout, cancellation and lost ownership attempt to terminate the direct child through Node's child handle. A child handle cannot prove the whole process tree stopped. Such executions, and exits observed with an external/native signal, remain running/reserved in the application and occupied/reconciling in HostCapacity even when the direct child's exit was observed. There is no bare-PID `taskkill`, automatic rerun or automatic lease release. Restart reconciliation preserves these unresolved executions. OS process-tree containment is not provided: a natural foreground exit relies on the registered recipe contract, and `cleanup_verified` is not independent OS tree proof.
+Timeout, cancellation and lost ownership terminate only an owned process lineage after checking its PID and OS start marker. Linux recipes run in an isolated process group; successful termination and an empty non-zombie group permit physical capacity release under the foreground recipe contract. On Windows, the supervisor acquires native process handles, validates the root start time, and terminates captured descendants through those handles. A Windows process snapshot cannot prove containment or exclude escaped descendants, so cleanup stays unresolved even after those handles exit. Inspection errors, missing/reused root identity and external/native signals also retain unresolved cleanup. There is no bare-PID `taskkill`, automatic rerun or lease-based capacity release. These controls are not an OS sandbox; recipes must never detach or escape.
 
 Set `EXECUTION_RECIPES_FILE` to an **absolute** operator-owned JSON file for both the MCP service and companion. Restart both when changing registration. Example:
 
@@ -52,6 +54,77 @@ Dispatch persists an immutable attempt and its reservation, admits host capacity
 
 Capacity admission waits at most 30 seconds, with asynchronous checks at most one second apart. Exhaustion cancels its queued entry and records a pre-start failure. Admission uses the exact script queue ID and never takes another script or agent job. Application/controller and capacity heartbeats retain independent ownership fences. Lease expiry alone never releases an occupied host slot.
 
+## Compact run timeline and next wake
+
+Use the full-profile MCP tool `run_timeline`, or the existing trusted CLI:
+
+```powershell
+node dist/cli.js call --sqlite STORE --actor ACTOR --operation run_timeline --input-file timeline.json
+```
+
+```json
+{
+  "project_id": "PROJECT_UUID",
+  "run_id": "RUN_UUID",
+  "after_sequence": 0,
+  "limit": 10,
+  "max_tokens": 4096
+}
+```
+
+The view includes authoritative run/attempt IDs, submitted/current requirement revisions, current ticket revision, claim/controller/reservation status, continuation, cancellation/effect state, and a safe next action. It omits transcripts, checkpoint/note text, artifact contents/references, arbitrary owner/provider/model labels, process identities and all ownership credentials. Native error/signal observations are summarized without exposing arbitrary strings; use authorized `run_get` for the exact recorded result. Aggregate metrics contain numeric attempt/observation counts only. Worker, planner and reviewer catalogs are unchanged.
+
+History uses the existing immutable observation `sequence`, ordered ascending. Pass `page.next_after_sequence` while `has_more` is true. Restart, repeated reads, cancellation and controller replacement cannot reorder or duplicate entries already read. New observations append after the last sequence; current summary fields refresh from one authoritative store snapshot on every call. Separate local observations have their own `observed_at` and may be absent or unavailable.
+
+`limit` is 1–50. `max_tokens` is 512–32768, default 4096, counting the complete canonical success envelope. Entries are removed from the end to fit, setting `truncated_by_budget`; the next sequence always advances when more entries exist. If the required summary and one entry cannot fit, `CONTEXT_TOO_LARGE` reports `required_tokens` without returning a partial page. Each page reads at most `limit + 1` history rows plus the latest observation and existing bounded authority checks; it never loads a transcript. Optional host inspection/reporting uses the existing local APIs, which scan their host/run ledger data; this change does not establish sustained-load performance.
+
+`waiting_reason` distinguishes paused admissions, stale authority, another controller, capacity/budget waits, dispatch, process result, expired ownership, uncertain launch/exit, unresolved effects, and terminal capacity awaiting reconciliation. `next_wake.condition` names the event the operator or companion must observe, with `at` only for an observed lease/deadline. A deadline is an inspection threshold, never proof of exit, capacity release, rollback or permission to relaunch. A terminal result with an occupied host entry still directs reconciliation of the exact original capacity.
+
+Admission blockers apply to queued work and reserved attempts still waiting for host admission. A matching running host entry identifies already admitted work that may drain during pause; current authority is still required before dispatch. Expired controller or reservation ownership directs reconciliation before any pre-launch recommendation.
+
+The view reports execution, continuation, and reconciliation conditions. Operators can inspect registered wake decisions through the trusted wake API described in [Durable wake decisions](durable-wakes.md).
+
+For existing single-host capacity and agent-budget data, configure both `EXECUTION_STATUS_LEDGER_FILE` (absolute operator-owned HostCapacity ledger) and `EXECUTION_STATUS_HOST_ID` on the runtime/CLI. No tool input accepts paths, host IDs, ledger IDs or budget overrides. Only the authorized project and exact run are observed; other projects' queue/resource breakdowns and full usage entries are never returned. The provider reuses HostCapacity inspection/reporting without admitting, settling or invoking work. Remaining budget uses conservative charged-or-reserved accounting, including retained in-flight allowances; it does not estimate unobserved actual usage. Missing/unavailable budgets stay `null`, never zero. Host occupancy and agent budgets remain separate from execution results.
+
+## Operator pause, drain and cancellation
+
+These trusted local controls require a project-admin actor and stay out of worker MCP tools. Pause and cancellation requests persist in the ticket store across controller restart. No process ID is accepted from a ticket or cancellation command.
+
+```powershell
+# Requests need only the store, actor and project; an existing companion observes cancellation.
+node dist/execution-companion-cli.js --sqlite STORE --actor ADMIN --project PROJECT --pause
+node dist/execution-companion-cli.js --sqlite STORE --actor ADMIN --project PROJECT --resume
+node dist/execution-companion-cli.js --sqlite STORE --actor ADMIN --project PROJECT --cancel RUN_UUID
+
+# Drain and reconciliation also need the normal capacity, host, artifact and recipe configuration.
+node dist/execution-companion-cli.js --sqlite STORE --actor ADMIN --project PROJECT --capacity CAPACITY --host HOST --artifacts ROOT --drain
+node dist/execution-companion-cli.js --sqlite STORE --actor ADMIN --project PROJECT --capacity CAPACITY --host HOST --artifacts ROOT --reconcile RUN_UUID --evidence EVIDENCE_JSON
+```
+
+Pause serializes with reservation and host admission. New reservations/admissions stop while already admitted work completes with existing host slot, resource and timeout limits. Submitted queued work remains queued. A reservation already waiting for capacity waits for resume within its original 30-second admission deadline; expiry retains the existing verified never-started failure behavior. Resume does not change host limits. Drain persists pause and reconciles existing work. Unknown cleanup reports `drained:false`, actionable states and exit code 2. A physically drained project can still have completed runs whose external effects need inspection through `run_get`.
+
+Cancellation is idempotent. Queued/reserved work becomes `CANCELLED_NOT_STARTED`, fails its continuation, and never dispatches. Reserved host capacity is released only after an immutable never-started proof binds its original attempt and exact host execution token; a crash between terminal settlement and proof publication is recovered without relaunch. Dispatched cancellation first records `process_state:requested`. The controller signals the matching supervisor, or a replacement inspects the original attempt and terminates a verified live lineage. Unconfirmed cleanup becomes `process_state:unresolved` and keeps its host slot occupied. Confirmed exit becomes `process_state:exit_confirmed`, with `effects_state:unresolved` until the operator inspects effects already performed. Cancellation never claims rollback or satisfies the exit-code continuation, even if the script finishes successfully while cancellation is pending.
+
+`run_get.reconciliation.cancellation` includes request time/actor, process state, external-effect state and eventual reconciliation note/actor/time. A terminal cancelled run stays `state:unresolved`, `next_step:inspect_side_effects` until its effects are reconciled. Logs, exact observed exit/signal, attempt/process identity, checkpoint, claim and observation history remain intact.
+
+For a job completed or terminated externally, inspect its durable scheduler/process identifiers and partial effects first. Supply a bounded operator-owned JSON file only after confirming exit and reconciling those effects:
+
+```json
+{
+  "process_exit_confirmed": true,
+  "effects_reconciled": true,
+  "outcome": {
+    "exit_code": null,
+    "signal": null,
+    "artifacts": ["external:receipt-123"],
+    "error_code": "CANCELLED"
+  },
+  "note": "Scheduler receipt 123 confirms exit; inspected the partial upload and retained its receipt. No rollback."
+}
+```
+
+These are trusted operator attestations, not facts inferred from PID disappearance or a note alone. Reconciliation acquires the controller fence, preserves the original attempt, journals exact evidence before publishing its observed outcome, and releases matching host capacity. An active controller causes a retryable conflict. Identical evidence is replay-safe; conflicting evidence is rejected. Existing terminal outcomes stay unchanged. The application API `reconcileExecutionCancellation` records effect evidence after exit is already confirmed and refuses unresolved process cleanup.
+
 ## Results and files
 
 A detached supervisor receives the immutable approved recipe, exact controller/reservation/attempt credentials, and a same-store connection descriptor once through a private stdin pipe. Connection credentials, recipe environment, arguments and cwd are not persisted in recovery manifests. The supervisor opens its own connection, validates the current claim and execution fences under project/controller transaction locks, consumes the write-once dispatch marker, and calls native spawn synchronously before releasing those locks. A replaced controller cannot launch the recipe. The native script still receives only its explicit registered environment. Closing or crashing the controller after valid launch does not stop the supervisor's bounded timeout, log capture or result journal. Capacity enqueue and admission use the same controller/reservation fence so stale controllers cannot create stranded capacity identities after recovery.
@@ -70,12 +143,23 @@ With `--artifacts ROOT`, private write-once files live under `ROOT/<run UUID>/<a
 - `supervisor.json`, `dispatch.json`, `process.json`: durable supervisor identity, launch intent and native process acknowledgment. Process identity includes PID plus an OS start marker; a bare PID is never sufficient.
 - `launch.json`: the supervisor's write-once launch capability. Native dispatch and an explicit database rejection compete for this same file. A rejection stores `no_launch: true`, `DISPATCH_REJECTED`, immutable attempt identity and the exact admitted capacity token; thrown database/native errors do not prove no launch.
 - `stdout.log`, `stderr.log`, `result.json`: bounded logs and authoritative direct-child outcome, timing, truncation and cleanup observation.
+- `outcome.json`: public result artifact containing exit status, timing, capture counts and hashes, without recovery credentials. The `result` artifact identity addresses this file; private `result.json` is never served by MCP.
 - `cancel.json`: an optional bounded cancellation request to the supervisor.
+- `termination.json`: immutable recovery-controller process-group termination evidence when the original supervisor is absent.
+- `operator-reconciliation.json`: explicit externally confirmed exit/effect evidence, retained separately from original logs and native results.
 - `never-started.json`: write-once, fsynced pre-dispatch recovery proof bound to the run, immutable attempt/process identity, recipe fingerprint, and exact host capacity state/execution token captured at admission. It precedes direct pre-start failure and recovered terminal settlement so restart can drain a stranded slot only when the stored outcome and capacity identity match.
+
+Configure the MCP server's `EXECUTION_ARTIFACTS_DIRECTORY` to the same absolute `ROOT` to enable `artifact_read` in the full profile. It accepts `project_id`, an exact published `artifact_id`, a zero-based byte `offset`, `length` (0–65,536 bytes), and `max_tokens` (512–32,768; default 2,048). Responses contain base64 bytes, the stored artifact's SHA-256, the returned range's SHA-256, captured/total/omitted byte counts, and explicit availability. Byte ranges can split a UTF-8 character; base64 preserves those bytes exactly. A zero-length request reads metadata only. New captures hash incrementally; older logs use a bounded streaming hash fallback.
+
+`range.complete` means the whole requested byte range was returned. `response_budget` returns a shorter exact prefix and `next_offset` for continuation; `capture_limit` identifies output discarded after the per-stream recipe cap, and `past_end` identifies a range beyond a complete file. `missing`, `expired`, and `not_configured` return no content. `EXECUTION_ARTIFACT_TTL_MS` defaults to seven days after the private result's finish time; expiry denies reads without deleting files. Missing older public outcome files are reported explicitly. Project membership, the run's published references, immutable attempt identity, and private journal identity are checked before reads. Path/URL references, symlinks, junctions, hard links and cross-project identities are rejected.
+
+`run_get.max_tokens` defaults to 2,048. It retains authoritative status and exit code while omitting large checkpoints or output metadata, with retrieval instructions in `omitted`. Failed executions include an addressable stderr `failure_location`; request the referenced byte range with `artifact_read`. At the smallest budget, run/continuation details also compact with a larger-budget `run_get` retrieval instruction. Artifacts and excerpts are untrusted content; fixed numeric aggregate metrics never label series with their content, identity or credentials.
+
+Client migration: accept `checkpoint: null` and retrieve it through `omitted` before resuming work. A compact `run`/`continuation` keeps status and authoritative process outcome; fetch omitted details with the supplied larger-budget `run_get` request. Existing small run responses retain their full fields. Handle artifact content as base64 bytes, check `range.complete`, and follow `next_offset` when the response budget returns a prefix.
 
 Restrict artifact directories with OS permissions/ACLs; logs may contain secrets and the process token is a trusted recovery credential. Requested file modes apply where supported; configure Windows ACLs separately. Older accepted execution installations retain their original `ROOT/<run UUID>/execution.json` and result/log layout; matching legacy journals are inspected without launching another attempt.
 
-Timeout, cancellation, native signals and unverified cleanup retain occupied capacity and an unresolved run even if the direct child is known to have exited. If direct-child close is not observed within 15 seconds after attempted termination, the supervisor exits without inventing a completion. A normal exit is authoritative only under the finite foreground recipe contract above. Retrieving log bodies/ranges through MCP remains separate work; this companion exposes references and exact run metadata.
+Unverified cleanup retains occupied capacity and an unresolved run even if the direct child has exited. If direct-child close is not observed within 15 seconds after attempted termination, the supervisor exits without inventing completion. Confirmed process-group exit can release physical capacity while external cancellation effects stay unresolved. Natural exit is authoritative only under the foreground recipe contract above. Log retrieval remains separate work.
 
 ## Restart and the next safe step
 
@@ -101,4 +185,4 @@ For manual investigation, fence the old controller, inspect exact authorized run
 
 Stop the MCP runtime/worker and companion, take a consistent backup including SQLite WAL state, migrate with schema-owner privileges, rebuild, then restart and reconnect clients. Do not hot-reload this stack into an old process: the earlier project-memory migration rebuilds a SQLite table, and new adapters require the recovery schema.
 
-Migration identity is the complete filename in `schema_migrations`, not a unique numeric prefix. Preserve the accepted `013_project_memory.sql` / `014_execution_runs.sql` (SQLite `005_project_memory.sql` / `006_execution_runs.sql`) alongside main's independent `013_review_fixes.sql` (SQLite `005_review_fixes.sql`). Their exact names and bytes are retained so either already-applied history upgrades once without replaying ALTERs or losing data. Recovery appends PostgreSQL `015_execution_recovery.sql` and SQLite `007_execution_recovery.sql`. Both adapters test main-first and accepted-stack-first upgrade histories, preserving existing tickets, claims, checkpoints, receipts and runs.
+Migration identity is the complete filename in `schema_migrations`, not a unique numeric prefix. Preserve the accepted `013_project_memory.sql` / `014_execution_runs.sql` (SQLite `005_project_memory.sql` / `006_execution_runs.sql`) alongside main's independent `013_review_fixes.sql` (SQLite `005_review_fixes.sql`). Their exact names and bytes are retained so either already-applied history upgrades once without replaying ALTERs or losing data. Recovery appends PostgreSQL `015_execution_recovery.sql` and SQLite `007_execution_recovery.sql`. Operator controls append PostgreSQL `016_execution_control.sql` and SQLite `008_execution_control.sql`. Both adapters test main-first and accepted-stack-first upgrade histories, preserving existing tickets, claims, checkpoints, receipts and runs.

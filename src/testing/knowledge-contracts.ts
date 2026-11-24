@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { fixture, hasCode, type ContractAdapters, testEmbeddings } from './contracts.js';
+import { createApplication } from '../application.js';
 
 /** The same memory authorization, provenance and immutability contract for every backend. */
 export function registerKnowledgeContractTests(name: string, factory: () => Promise<ContractAdapters>) {
@@ -22,7 +23,7 @@ export function registerKnowledgeContractTests(name: string, factory: () => Prom
       evidence: 'Read the cited revision and checked its supporting evidence.',
     };
     const content = { title: 'Database convention', body: 'Use database transactions.', kind: 'convention' };
-    const source = (id: string, revision: number) => ({ kind: 'ticket', id, revision });
+    const source = (id: string, revision: number) => ({ kind: 'ticket' as const, id, revision });
     const read = (
       f: Awaited<ReturnType<typeof fixture>>,
       id: string,
@@ -34,6 +35,359 @@ export function registerKnowledgeContractTests(name: string, factory: () => Prom
         knowledge_id: id,
         ...(revision ? { revision } : {}),
       }) as Promise<any>;
+    const acceptFact = async (
+      f: Awaited<ReturnType<typeof fixture>>,
+      input: Record<string, unknown> = {},
+    ) => {
+      const ticket = await f.ticket();
+      const proposed = (await f.call(f.worker.id, 'knowledge_write', {
+        ...content,
+        fact: { key: 'database.transactions', value: 'required' },
+        sources: [source(ticket.id, ticket.requirements_revision)],
+        ...input,
+      })) as any;
+      const accepted = (await f.call(f.reviewer.id, 'knowledge_write', {
+        ...content,
+        ...input,
+        knowledge_id: proposed.id,
+        expected_revision: proposed.revision,
+        status: 'accepted',
+        verification: evidence,
+      })) as any;
+      return { ticket, accepted, document: await read(f, accepted.id) };
+    };
+
+    check('invalidates changed, missing and transitively stale evidence before reuse', async (f) => {
+      const a = await acceptFact(f);
+      assert.equal(a.document.trusted_reuse, true);
+      assert.equal((await read(f, a.accepted.id, a.accepted.revision)).trusted_reuse, true);
+      const b = await acceptFact(f, {
+        fact: { key: 'database.savepoints', value: 'required' },
+        sources: [{ kind: 'knowledge', id: a.accepted.id, revision: a.accepted.revision }],
+      });
+      assert.equal(b.document.trusted_reuse, true);
+      await f.app.indexOnce(1000);
+      await f.call(f.worker.id, 'ticket_update', {
+        ticket_id: a.ticket.id,
+        expected_revision: a.ticket.revision,
+        description: 'Current changed requirement.',
+      });
+      for (const id of [a.accepted.id, b.accepted.id]) {
+        const current = await read(f, id);
+        assert.equal(current.validity, 'stale');
+        assert.equal(current.trusted_reuse, false);
+      }
+      const results = (await f.app.execute(f.worker.id, 'search', {
+        project_id: f.project.id,
+        query: 'database',
+        kind: 'knowledge',
+      })) as any;
+      assert.equal(
+        results.results.some((hit: any) => [a.accepted.id, b.accepted.id].includes(hit.id)),
+        false,
+      );
+      const missing = await acceptFact(f, { fact: { key: 'missing', value: 'source' } });
+      await f.storage.transaction(f.project.id, async (tx) => {
+        const stored = (await tx.get('knowledge', missing.accepted.id))!;
+        await tx.put('knowledge', { ...stored, sources: [source(randomUUID(), 1)] });
+      });
+      assert.equal((await read(f, missing.accepted.id)).trusted_reuse, false);
+    });
+
+    check('retains expiry and supersession across application restart and immutable history', async (f) => {
+      const expires_at = new Date(f.clock.now.getTime() + 1000).toISOString();
+      const expiring = await acceptFact(f, { expires_at });
+      assert.equal(expiring.document.trusted_reuse, true);
+      const original = await acceptFact(f, { fact: { key: 'database.mode', value: 'old' } });
+      const replacement = await acceptFact(f, {
+        fact: { key: 'database.mode', value: 'new' },
+        supersedes: [{ id: original.accepted.id, revision: original.accepted.revision }],
+      });
+      assert.equal(replacement.document.trusted_reuse, true);
+      f.clock.now = new Date(f.clock.now.getTime() + 1000);
+      const restarted = createApplication({ storage: f.storage, search: f.search, now: () => f.clock.now });
+      const reread = (id: string) =>
+        restarted.execute(f.worker.id, 'knowledge_get', {
+          project_id: f.project.id,
+          knowledge_id: id,
+        }) as Promise<any>;
+      assert.equal((await reread(expiring.accepted.id)).validity, 'expired');
+      assert.equal((await reread(expiring.accepted.id)).expires_at, expires_at);
+      assert.equal((await reread(original.accepted.id)).validity, 'superseded');
+      await f.call(f.worker.id, 'knowledge_write', {
+        ...content,
+        knowledge_id: replacement.accepted.id,
+        expected_revision: replacement.accepted.revision,
+        archived: true,
+      });
+      assert.equal((await reread(original.accepted.id)).validity, 'superseded');
+      assert.equal((await reread(original.accepted.id)).trusted_reuse, false);
+      assert.deepEqual((await read(f, replacement.accepted.id, replacement.accepted.revision)).supersedes, [
+        { id: original.accepted.id, revision: original.accepted.revision },
+      ]);
+    });
+
+    check(
+      'returns supported contradictions with both provenances and never silently chooses a winner',
+      async (f) => {
+        const a = await acceptFact(f);
+        const b = await acceptFact(f, { fact: { key: 'database.transactions', value: 'forbidden' } });
+        for (const [left, right] of [
+          [a, b],
+          [b, a],
+        ]) {
+          const document = await read(f, left!.accepted.id, left!.accepted.revision);
+          assert.equal(document.validity, 'disputed');
+          assert.equal(document.trusted_reuse, false);
+          assert.deepEqual(document.contradictions, [
+            {
+              knowledge_id: right!.accepted.id,
+              revision: right!.accepted.revision,
+              fact: right!.document.fact,
+              sources: right!.document.sources,
+            },
+          ]);
+          assert.deepEqual(document.sources, left!.document.sources);
+        }
+        await f.app.indexOnce(1000);
+        const search = (await f.app.execute(f.worker.id, 'search', {
+          project_id: f.project.id,
+          query: 'database',
+          kind: 'knowledge',
+        })) as any;
+        for (const hit of search.results) {
+          assert.equal(hit.memory.validity, 'disputed');
+          assert.equal(hit.memory.contradiction_count, 1);
+          assert.equal(hit.memory.trusted_reuse, false);
+        }
+        assert.equal(search.results.length, 2);
+        await f.call(f.worker.id, 'ticket_transition', {
+          ticket_id: b.ticket.id,
+          expected_revision: b.ticket.revision,
+          status: 'cancelled',
+          reason: 'Source withdrawn.',
+        });
+        const remaining = await read(f, a.accepted.id);
+        assert.equal(remaining.trusted_reuse, true);
+        assert.deepEqual(remaining.contradictions, []);
+      },
+    );
+
+    check(
+      'hides archived support from search and enforces revoked access and current requirements',
+      async (f) => {
+        const a = await acceptFact(f);
+        const b = await acceptFact(f, {
+          fact: { key: 'dependent', value: 'database secret' },
+          sources: [{ kind: 'knowledge', id: a.accepted.id, revision: a.accepted.revision }],
+        });
+        const c = await acceptFact(f, { fact: { key: 'dependent', value: 'public' } });
+        assert.equal((await read(f, c.accepted.id)).validity, 'disputed');
+        const contextInput = { project_id: f.project.id, ticket_id: a.ticket.id };
+        const before = (await f.app.execute(f.worker.id, 'ticket_context', contextInput)) as any;
+        await f.app.indexOnce(1000);
+        await f.call(f.worker.id, 'knowledge_write', {
+          ...content,
+          knowledge_id: a.accepted.id,
+          expected_revision: a.accepted.revision,
+          archived: true,
+        });
+        assert.equal((await read(f, b.accepted.id)).trusted_reuse, false);
+        const searchInput = { project_id: f.project.id, query: 'database', kind: 'knowledge' };
+        const hits = ((await f.app.execute(f.worker.id, 'search', searchInput)) as any).results;
+        assert.deepEqual(
+          hits.map((hit: any) => hit.id),
+          [c.accepted.id],
+        );
+        const publicFact = await read(f, c.accepted.id);
+        assert.equal(publicFact.trusted_reuse, true);
+        assert.deepEqual(publicFact.contradictions, []);
+        assert.equal(JSON.stringify(publicFact).includes('database secret'), false);
+        const after = (await f.app.execute(f.worker.id, 'ticket_context', contextInput)) as any;
+        for (const field of ['ticket', 'criteria', 'project_instructions'])
+          assert.deepEqual(after[field], before[field]);
+        assert.equal('memory' in after, false);
+        await f.call(f.admin.id, 'member_set', { actor_id: f.worker.id, role: 'none' });
+        await assert.rejects(read(f, b.accepted.id), hasCode('FORBIDDEN'));
+        await assert.rejects(read(f, a.accepted.id, a.accepted.revision), hasCode('FORBIDDEN'));
+        await assert.rejects(f.app.execute(f.worker.id, 'search', searchInput), hasCode('FORBIDDEN'));
+      },
+    );
+
+    check('rechecks revoked access after a delayed search provider returns candidates', async (f) => {
+      const a = await acceptFact(f);
+      await f.app.indexOnce(1000);
+      const search = new Proxy(f.search, {
+        get(target, key) {
+          const value = Reflect.get(target, key);
+          if (key === 'search')
+            return async (...args: any[]) => {
+              const candidates = await value.apply(target, args);
+              await f.call(f.admin.id, 'member_set', { actor_id: f.worker.id, role: 'none' });
+              return candidates;
+            };
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      const app = createApplication({ storage: f.storage, search, embeddings: testEmbeddings });
+      await assert.rejects(
+        app.execute(f.worker.id, 'search', {
+          project_id: f.project.id,
+          query: 'database',
+          kind: 'knowledge',
+        }),
+        hasCode('FORBIDDEN'),
+      );
+      await assert.rejects(read(f, a.accepted.id), hasCode('FORBIDDEN'));
+    });
+
+    check('keeps ticket-only and empty searches free of memory scans and project write locks', async (f) => {
+      await f.ticket();
+      await f.app.indexOnce(1000);
+      const storage = new Proxy(f.storage, {
+        get(target, key) {
+          if (key === 'transaction')
+            return () => {
+              throw new Error('Search acquired the project write lock.');
+            };
+          if (key === 'readSnapshot')
+            return (work: any) =>
+              target.readSnapshot((reader) =>
+                work(
+                  new Proxy(reader, {
+                    get(source, field) {
+                      const value = Reflect.get(source, field);
+                      if (field === 'find')
+                        return (table: string, ...args: any[]) => {
+                          assert.notEqual(table, 'knowledge');
+                          assert.notEqual(table, 'knowledge_revisions');
+                          return value.call(source, table, ...args);
+                        };
+                      return typeof value === 'function' ? value.bind(source) : value;
+                    },
+                  }),
+                ),
+              );
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      const app = createApplication({ storage, search: f.search });
+      const ticketOnly = (await app.execute(f.worker.id, 'search', {
+        project_id: f.project.id,
+        query: 'database',
+        kind: 'ticket',
+      })) as any;
+      assert.equal(ticketOnly.results.length, 1);
+      assert.deepEqual(
+        (
+          (await app.execute(f.worker.id, 'search', {
+            project_id: f.project.id,
+            query: 'no-such-symbol-abcdef',
+          })) as any
+        ).results,
+        [],
+      );
+    });
+
+    check(
+      'validates supersession references and requires current reviewed replacement support',
+      async (f) => {
+        const original = await acceptFact(f);
+        const other = await fixture({ storage: f.storage, search: f.search });
+        const foreign = await acceptFact(other);
+        for (const [target, code] of [
+          [{ id: foreign.accepted.id, revision: foreign.accepted.revision }, 'INVALID_REFERENCE'],
+          [{ id: original.accepted.id, revision: original.accepted.revision + 1 }, 'VERSION_CONFLICT'],
+        ] as const)
+          await assert.rejects(
+            f.call(f.worker.id, 'knowledge_write', {
+              ...content,
+              fact: { key: 'replacement', value: 'yes' },
+              supersedes: [target],
+            }),
+            hasCode(code),
+          );
+        await assert.rejects(
+          f.call(f.worker.id, 'knowledge_write', {
+            ...content,
+            knowledge_id: original.accepted.id,
+            expected_revision: original.accepted.revision,
+            supersedes: [{ id: original.accepted.id, revision: original.accepted.revision }],
+          }),
+          hasCode('INVALID_REFERENCE'),
+        );
+        const proposal = (await f.call(f.worker.id, 'knowledge_write', {
+          ...content,
+          sources: original.document.sources,
+          fact: { key: 'replacement', value: 'yes' },
+          expires_at: new Date(f.clock.now.getTime() - 1000).toISOString(),
+          supersedes: [{ id: original.accepted.id, revision: original.accepted.revision }],
+        })) as any;
+        assert.equal((await read(f, original.accepted.id)).trusted_reuse, true);
+        await assert.rejects(
+          f.call(f.reviewer.id, 'knowledge_write', {
+            ...content,
+            knowledge_id: proposal.id,
+            expected_revision: proposal.revision,
+            status: 'accepted',
+            verification: evidence,
+          }),
+          hasCode('INVALID_REFERENCE'),
+        );
+        assert.equal((await read(f, original.accepted.id)).trusted_reuse, true);
+        assert.equal((await read(f, proposal.id)).revision, proposal.revision);
+      },
+    );
+
+    check('invalidates checkpoint-derived facts when the parent requirements change', async (f) => {
+      const ticket = await f.ticket();
+      const claim = await f.claim(ticket.id);
+      const result = (await f.call(f.worker.id, 'ticket_checkpoint', {
+        ticket_id: ticket.id,
+        claim_token: claim.claim.token,
+        progress: 'Checked current database requirements.',
+      })) as any;
+      const a = await acceptFact(f, {
+        sources: [
+          { kind: 'checkpoint', id: result.checkpoint.id, revision: result.checkpoint.ticket_revision },
+        ],
+      });
+      assert.equal(a.document.trusted_reuse, true);
+      await f.call(f.worker.id, 'ticket_update', {
+        ticket_id: ticket.id,
+        expected_revision: result.ticket.revision,
+        criteria: ['New requirements must be verified.'],
+      });
+      assert.equal((await read(f, a.accepted.id)).validity, 'stale');
+    });
+
+    check(
+      'requires evidence for every current ticket criterion even when supported memory matches',
+      async (f) => {
+        const a = await acceptFact(f);
+        const claim = await f.claim(a.ticket.id);
+        assert.equal((await read(f, a.accepted.id)).trusted_reuse, true);
+        await assert.rejects(
+          f.call(f.worker.id, 'ticket_submit', {
+            ticket_id: a.ticket.id,
+            claim_token: claim.claim.token,
+            expected_revision: claim.ticket.revision,
+            summary: 'A matching memory fact exists.',
+            evidence: [
+              {
+                criterion_id: randomUUID(),
+                result: 'pass',
+                summary: 'Memory matches.',
+                references: ['memory:matched'],
+              },
+            ],
+          }),
+          hasCode('EVIDENCE_INCOMPLETE'),
+        );
+        assert.equal((await f.read(a.ticket.id)).ticket.status, 'in_progress');
+      },
+    );
 
     check('keeps proposals distinct from verification and explicit authorized acceptance', async (f) => {
       const ticket = await f.ticket();

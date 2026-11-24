@@ -5,8 +5,15 @@ import { createApplication } from './application.js';
 import { GitHubClient } from './github.js';
 import { SignedWebhook } from './webhook.js';
 import { loadExecutionRecipes } from './execution-recipes.js';
+import { loadClientCapabilities } from './client-capabilities.js';
+import { createExecutionStatusProvider } from './execution-status.js';
 import { ensure, type StorageAdapter, type SearchAdapter, type EmbeddingProvider } from './contracts.js';
 export function createRuntime(env: NodeJS.ProcessEnv = process.env) {
+  ensure(
+    Boolean(env.EXECUTION_STATUS_LEDGER_FILE) === Boolean(env.EXECUTION_STATUS_HOST_ID),
+    'INVALID_CONFIG',
+    'Configure both EXECUTION_STATUS_LEDGER_FILE and EXECUTION_STATUS_HOST_ID.',
+  );
   ensure(
     Boolean(env.TICKETING_WEBHOOK_URL) === Boolean(env.TICKETING_WEBHOOK_SECRET),
     'INVALID_CONFIG',
@@ -62,10 +69,24 @@ export function createRuntime(env: NodeJS.ProcessEnv = process.env) {
     search,
     embeddings,
     webhook,
+    executionStatus: env.EXECUTION_STATUS_LEDGER_FILE
+      ? createExecutionStatusProvider(env.EXECUTION_STATUS_LEDGER_FILE, env.EXECUTION_STATUS_HOST_ID!)
+      : undefined,
     executionRecipes: env.EXECUTION_RECIPES_FILE
       ? loadExecutionRecipes(env.EXECUTION_RECIPES_FILE).metadata()
       : [],
     referenceTokenMetrics: env.REFERENCE_TOKEN_METRICS === 'true',
+    ...(env.EXECUTION_ARTIFACTS_DIRECTORY
+      ? {
+          executionArtifacts: {
+            directory: env.EXECUTION_ARTIFACTS_DIRECTORY,
+            ...(env.EXECUTION_ARTIFACT_TTL_MS ? { ttl_ms: Number(env.EXECUTION_ARTIFACT_TTL_MS) } : {}),
+          },
+        }
+      : {}),
+    ...(env.CLIENT_CAPABILITIES_FILE
+      ? { clientCapabilities: loadClientCapabilities(env.CLIENT_CAPABILITIES_FILE) }
+      : {}),
     ...(env.TICKETING_GITHUB_REPOSITORY
       ? {
           github: {

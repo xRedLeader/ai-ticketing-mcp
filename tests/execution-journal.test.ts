@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { it } from 'node:test';
-import { durableExecutionFile, readExecutionFile } from '../src/execution-journal.js';
+import {
+  durableExecutionFile,
+  readExecutionFile,
+  windowsExecutionTerminationScript,
+} from '../src/execution-journal.js';
 
 it('publishes a complete immutable journal after repeated crashes during staging', () => {
   const directory = mkdtempSync(join(tmpdir(), 'ticketing-journal-'));
@@ -40,3 +44,59 @@ it('publishes a complete immutable journal after repeated crashes during staging
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+it(
+  'Windows binds descendant handles to the exact snapshot before terminating any mocked process',
+  { skip: process.platform !== 'win32' },
+  () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ticketing-process-snapshot-'));
+    try {
+      const killed = join(directory, 'killed.txt');
+      const rootTicks = (621355968000000000n + BigInt(Date.UTC(2026, 0, 1)) * 10000n).toString();
+      for (const scenario of ['matching', 'replacement', 'missing_creation', 'missing_process']) {
+        writeFileSync(killed, '');
+        const mocks = `
+$script:killed='${killed.replaceAll("'", "''")}'
+function New-FakeProcess($id, $start) {
+  $item=[PSCustomObject]@{Id=$id;Handle=0;StartTime=$start;HasExited=$false;ExitTime=$start.AddSeconds(5)}
+  $item | Add-Member ScriptMethod Kill { [IO.File]::AppendAllText($script:killed, $this.Id.ToString()+[Environment]::NewLine); $this.HasExited=$true }
+  $item | Add-Member ScriptMethod WaitForExit { param($timeout) return $this.HasExited }
+  $item | Add-Member ScriptMethod Dispose {}
+  return $item
+}
+$start=[DateTime]::Parse('2026-01-01T00:00:00Z').ToUniversalTime()
+$script:root=New-FakeProcess 101 $start
+$script:child=New-FakeProcess 202 $start.AddSeconds(${scenario === 'replacement' ? 2 : 1})
+function Get-Process {
+  [CmdletBinding()]param([int]$Id)
+  if ($Id -eq 101) { return $script:root }
+  if ($Id -eq 202) { ${scenario === 'missing_process' ? 'return $null' : 'return $script:child'} }
+  throw 'Unexpected process lookup'
+}
+function Get-CimInstance {
+  param($ClassName)
+  return [PSCustomObject]@{ProcessId=202;ParentProcessId=101;CreationDate=${scenario === 'missing_creation' ? '$null' : '$start.AddSeconds(1)'}}
+}
+`;
+        const result = spawnSync(
+          `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            mocks + windowsExecutionTerminationScript({ pid: 101, start_marker: rootTicks }),
+          ],
+          { encoding: 'utf8', windowsHide: true, timeout: 5000 },
+        );
+        assert.equal(result.status, scenario === 'matching' ? 0 : 7, `${scenario}: ${result.stderr}`);
+        assert.deepEqual(
+          readFileSync(killed, 'utf8').trim().split(/\r?\n/).filter(Boolean).sort(),
+          scenario === 'matching' ? ['101', '202'] : [],
+          scenario,
+        );
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);

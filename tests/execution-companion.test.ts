@@ -1,6 +1,6 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -22,6 +22,7 @@ import { ExecutionCompanion, type ExecutionApplication } from '../src/execution-
 import { HostCapacity } from '../src/host-capacity.js';
 import { createSqliteAdapters } from '../src/adapters/sqlite.js';
 import { createApplication } from '../src/application.js';
+import { ExecutionArtifacts } from '../src/execution-artifacts.js';
 import { fixture as contractFixture } from '../src/testing/contracts.js';
 
 async function fixture(script: string, extra: Record<string, unknown> = {}) {
@@ -76,7 +77,10 @@ async function fixture(script: string, extra: Record<string, unknown> = {}) {
     next_step: observed?.next_step ?? (job.status === 'reserved' ? 'dispatch' : 'inspect_launch'),
   });
   const app: ExecutionApplication = {
+    cancelExecutionRun: registered.cancelExecutionRun.bind(registered),
+    reconcileExecutionCancellation: registered.reconcileExecutionCancellation.bind(registered),
     storage: adapters.storage,
+    evaluateWakeConditions: registered.evaluateWakeConditions.bind(registered),
     async acquireExecutionController(_actor, _project, owner, lease) {
       if (controller) return null;
       const acquired = await registered.acquireExecutionController(actor, project, owner, lease);
@@ -291,6 +295,22 @@ it('executes once with exact environment, bounded separate logs and authentic ex
     assert.equal(result.exit_code, 7);
     assert.equal(result.cleanup_verified, true);
     assert.deepEqual(result.truncated, { stdout: true, stderr: true });
+    assert.deepEqual(result.total_bytes, { stdout: 100016, stderr: 100000 });
+    const publicResult = JSON.parse(await readFile(join(directory, 'outcome.json'), 'utf8'));
+    assert.equal(publicResult.exit_code, 7);
+    assert.equal(publicResult.process_token, undefined);
+    assert.equal(
+      result.sha256.stdout,
+      createHash('sha256')
+        .update(await readFile(join(directory, 'stdout.log')))
+        .digest('hex'),
+    );
+    assert.equal(
+      result.sha256.result,
+      createHash('sha256')
+        .update(await readFile(join(directory, 'outcome.json')))
+        .digest('hex'),
+    );
     assert.equal(await new ExecutionCompanion(f.options).runOnce(), false);
   } finally {
     delete process.env[inherited];
@@ -298,20 +318,85 @@ it('executes once with exact environment, bounded separate logs and authentic ex
   }
 });
 
-it('fails closed on unverified timeout, retaining the direct-child observation and occupied slot without rerun', async () => {
+it('streams large Unicode output through bounded capture without losing its exit status', async () => {
+  const f = await fixture(
+    `
+    const { once } = require('node:events');
+    (async () => {
+      const chunk = '🧪漢'.repeat(8192);
+      for (let i = 0; i < 512; i++) if (!process.stdout.write(chunk)) await once(process.stdout, 'drain');
+      process.stderr.write('fixture.ts:7: failed\\n');
+      process.exitCode = 23;
+    })();`,
+    { max_log_bytes: 127 },
+  );
+  try {
+    assert.equal(await new ExecutionCompanion(f.options).runOnce(), true);
+    assert.equal(f.job().exit_code, 23);
+    const directory = f.artifactDirectory(),
+      result = JSON.parse(await readFile(join(directory, 'result.json'), 'utf8'));
+    assert.equal(result.total_bytes.stdout, 7 * 8192 * 512);
+    assert.equal(result.bytes.stdout, 127);
+    assert.equal((await stat(join(directory, 'stdout.log'))).size, 127);
+    assert.equal(
+      result.sha256.stdout,
+      createHash('sha256')
+        .update(await readFile(join(directory, 'stdout.log')))
+        .digest('hex'),
+    );
+    assert.equal(result.truncated.stdout, true);
+  } finally {
+    await f.dispose();
+  }
+});
+
+it('preserves the authoritative exit journal when the public outcome artifact cannot be published', async () => {
+  const f = await fixture(`
+    const fs = require('node:fs'), path = require('node:path');
+    const root = path.join(process.cwd(), 'artifacts');
+    const run = path.join(root, fs.readdirSync(root)[0]);
+    fs.writeFileSync(path.join(run, fs.readdirSync(run)[0], 'outcome.json'), 'untrusted collision');
+    process.exitCode = 19;`);
+  try {
+    assert.equal(await new ExecutionCompanion(f.options).runOnce(), true);
+    assert.equal(f.job().exit_code, 19);
+    const result = JSON.parse(await readFile(join(f.artifactDirectory(), 'result.json'), 'utf8'));
+    assert.equal(result.exit_code, 19);
+    assert.deepEqual(result.artifact_errors, ['OUTCOME_WRITE_FAILED']);
+    assert.equal(result.sha256.result, null);
+    const artifact = new ExecutionArtifacts(f.options.artifacts_directory).read(
+      f.job().artifacts[2]!,
+      {
+        run_id: f.job().id,
+        attempt_id: f.attempt.id,
+        process_token: f.attempt.process_token,
+        recipe_fingerprint: f.job().recipe_fingerprint,
+      },
+      0,
+      1024,
+      Date.now(),
+    );
+    assert.equal(artifact.status, 'missing');
+  } finally {
+    await f.dispose();
+  }
+});
+
+it('releases a verified timed-out process group and retains unverified cleanup without rerun', async () => {
   const f = await fixture(`process.stdout.write('started'); setTimeout(() => {}, 10000);`, {
     timeout_ms: 200,
   });
   try {
     assert.equal(await new ExecutionCompanion(f.options).runOnce(), true);
-    assert.equal(f.job().status, 'running');
-    assert.equal(f.capacity.inspect('host').occupied.script, 1);
+    const verified = process.platform === 'linux';
+    assert.equal(f.job().status, verified ? 'failed' : 'running');
+    assert.equal(f.capacity.inspect('host').occupied.script, verified ? 0 : 1);
     const result = JSON.parse(await readFile(join(f.artifactDirectory(), 'result.json'), 'utf8'));
     assert.equal(result.error_code, 'TIMEOUT');
-    assert.equal(result.cleanup_verified, false);
+    assert.equal(result.cleanup_verified, verified);
     assert.ok(result.signal !== null || result.exit_code !== null);
     assert.equal(await new ExecutionCompanion(f.options).runOnce(), false);
-    assert.deepEqual(f.events, ['reserved', 'running']);
+    assert.deepEqual(f.events, verified ? ['reserved', 'running', 'settled'] : ['reserved', 'running']);
   } finally {
     await f.dispose();
   }

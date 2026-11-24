@@ -17,6 +17,7 @@ import {
   type SearchDocument,
   type Submission,
   type ExecutionHints,
+  type ClientSelection,
   type GitHubConfiguration,
   type GitHubProvider,
   type GitHubEvidence,
@@ -33,13 +34,24 @@ import {
   type ExecutionObservation,
   type ExecutionProcessIdentity,
   type ExecutionReconciliation,
+  type ExecutionCancellation,
+  type ExecutionStatusProvider,
   type Continuation,
   validateGitHubConfiguration,
 } from './contracts.js';
 import { resultSchemas, githubEvidenceSchema } from './result-schemas.js';
+import { inspectMemory } from './memory.js';
 import { serializeSuccessEnvelope } from './envelope.js';
+import { registerWake, evaluateWakes, wakeRegistration, claimWake, finishWake } from './wake-events.js';
 import { countReferenceTokens, queryExcerpt } from './tokens.js';
 import { CachedEmbeddings } from './query-embeddings.js';
+import {
+  artifactIdentity,
+  ExecutionArtifacts,
+  packArtifactRange,
+  unavailableArtifact,
+} from './execution-artifacts.js';
+import { ClientCapabilities } from './client-capabilities.js';
 
 export interface ApplicationOptions {
   storage: StorageAdapter;
@@ -51,6 +63,9 @@ export interface ApplicationOptions {
   github?: GitHubConfiguration & { provider: GitHubProvider };
   webhook?: WebhookTarget;
   executionRecipes?: readonly ExecutionRecipeRegistration[];
+  executionArtifacts?: { directory: string; ttl_ms?: number };
+  clientCapabilities?: ClientCapabilities;
+  executionStatus?: ExecutionStatusProvider;
 }
 const LEASE_MS = 600_000;
 const webhookEvents = new Set([
@@ -89,6 +104,9 @@ export class Application {
   private readonly github?: GitHubConfiguration & { provider: GitHubProvider };
   private readonly webhook?: WebhookTarget;
   private readonly executionRecipes = new Map<string, ExecutionRecipeRegistration>();
+  private readonly executionArtifacts?: ExecutionArtifacts;
+  private readonly clientCapabilities?: ClientCapabilities;
+  private readonly executionStatus?: ExecutionStatusProvider;
   readonly metrics = {
     requests: 0,
     errors: 0,
@@ -117,6 +135,7 @@ export class Application {
       );
     }
     this.storage = options.storage;
+    this.executionStatus = options.executionStatus;
     this.searchAdapter = options.search;
     this.embeddings = options.embeddings
       ? options.embeddings instanceof CachedEmbeddings
@@ -126,6 +145,12 @@ export class Application {
     this.now = options.now ?? (() => new Date());
     this.countTokens = options.countReferenceTokens ?? countReferenceTokens;
     this.referenceTokenMetrics = options.referenceTokenMetrics === true;
+    if (options.executionArtifacts)
+      this.executionArtifacts = new ExecutionArtifacts(
+        options.executionArtifacts.directory,
+        options.executionArtifacts.ttl_ms,
+      );
+    this.clientCapabilities = options.clientCapabilities;
     if (options.webhook) {
       ensure(
         options.storage.leaseDeliveries &&
@@ -642,10 +667,12 @@ export class Application {
     capabilities: string[],
     labels: string[],
     limit: number,
+    clientId?: string,
   ) {
     const policy = this.schedulingPolicy(project);
     const at = this.timestamp();
     const result: Ticket[] = [];
+    capabilities = this.availableCapabilities(project, actor, capabilities);
     let offset = 0;
     while (result.length < limit) {
       const page = await reader.workCandidates(
@@ -659,13 +686,85 @@ export class Application {
         policy,
       );
       for (const ticket of page) {
-        if (await this.eligible(reader, ticket, actor, capabilities, labels, at)) result.push(ticket);
+        if (
+          (await this.eligible(reader, ticket, actor, capabilities, labels, at)) &&
+          this.matchClient(project, ticket, actor, clientId).selection !== null
+        )
+          result.push(ticket);
         if (result.length === limit) break;
       }
       if (page.length < limit) break;
       offset += page.length;
     }
     return result;
+  }
+  private availableCapabilities(project: Project, actor: Actor, advertised: string[]) {
+    if (!this.clientCapabilities) return advertised;
+    const tools = this.clientCapabilities.tools(actor.id, project.id, this.now().getTime());
+    return advertised.length ? tools.filter((tool) => advertised.includes(tool)) : tools;
+  }
+  private matchClient(project: Project, ticket: Ticket, actor: Actor, clientId?: string) {
+    const hints = this.executionHints(project, ticket);
+    if (!this.clientCapabilities) {
+      const required = clientId || hints?.client_id || hints?.operating_system || hints?.environment;
+      return {
+        selection: required ? null : undefined,
+        reasons: required
+          ? [
+              {
+                code: 'CLIENT_REGISTRY_REQUIRED',
+                message:
+                  'Ask the operator to configure CLIENT_CAPABILITIES_FILE before requesting a client or execution environment.',
+              },
+            ]
+          : [],
+      };
+    }
+    return this.clientCapabilities.match(
+      {
+        actor_id: actor.id,
+        project_id: project.id,
+        requirements_revision: ticket.requirements_revision,
+        tools: ticket.capabilities,
+        hints,
+        client_id: clientId,
+      },
+      this.now().getTime(),
+    );
+  }
+  /** Keep authorization locked through synchronous host admission/launch, as with script dispatch. */
+  async dispatchClientExecution(
+    actorId: string,
+    projectId: string,
+    ticketId: string,
+    token: string,
+    dispatch: (selection: ClientSelection) => undefined,
+  ) {
+    return this.storage.transaction(projectId, async (reader) => {
+      const actor = await this.actor(actorId, reader),
+        project = await this.access(reader, actor, projectId, ['contributor', 'admin']);
+      const ticket = await this.ticket(reader, projectId, ticketId),
+        claim = await this.liveClaim(reader, ticket, actor, token);
+      ensure(
+        ticket.status === 'in_progress' && (!ticket.assignee_id || ticket.assignee_id === actor.id),
+        'NOT_CLAIMABLE',
+        'Agent dispatch requires in-progress work assigned to this worker or unassigned.',
+      );
+      ensure(
+        !(await this.blockers(reader, ticket)).length,
+        'DEPENDENCY_BLOCKED',
+        'Resolve blockers before dispatch.',
+      );
+      const matched = this.matchClient(project, ticket, actor, claim.execution?.client_id);
+      ensure(
+        matched.selection && claim.execution && digest(matched.selection) === digest(claim.execution),
+        'CLIENT_SELECTION_CHANGED',
+        'Reclaim work and match again; its client, requirements or requested choices changed.',
+        { reasons: matched.reasons },
+      );
+      dispatch(claim.execution);
+      return claim.execution;
+    });
   }
   private async liveClaim(tx: Reader, ticket: Ticket, actor: Actor, token: string) {
     const claim = await tx.get('claims', ticket.id);
@@ -727,7 +826,7 @@ export class Application {
       const run = await tx.get('execution_jobs', runId);
       ensure(run?.project_id === projectId, 'NOT_FOUND', 'Execution run not found.');
       ensure(
-        tx.compareExecutionRun,
+        tx.compareExecutionRun && tx.lockExecutionController,
         'UNSUPPORTED_EXECUTION_RUNS',
         'Storage does not support execution ownership fencing.',
       );
@@ -741,6 +840,151 @@ export class Application {
       'Execution lease must be 1000–3600000 milliseconds.',
     );
     return new Date(this.now().getTime() + leaseMs).toISOString();
+  }
+  async setExecutionAdmissions(actorId: string, projectId: string, paused: boolean) {
+    ensure(typeof paused === 'boolean', 'INVALID_INPUT', 'Provide a boolean admission state.');
+    return this.storage.transaction(projectId, async (tx) => {
+      await this.access(tx, await this.actor(actorId, tx), projectId, ['admin']);
+      ensure(
+        tx.lockExecutionController,
+        'UNSUPPORTED_EXECUTION_RUNS',
+        'Storage must fence execution controls.',
+      );
+      await tx.lockExecutionController();
+      const previous = await tx.get('execution_admissions', projectId);
+      if (previous?.paused === paused) return previous;
+      const next = { id: projectId, paused, actor_id: actorId, updated_at: this.timestamp() };
+      await tx.put('execution_admissions', next);
+      return next;
+    });
+  }
+  async cancelExecutionRun(
+    actorId: string,
+    projectId: string,
+    runId: string,
+  ): Promise<ExecutionCancellation> {
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      await tx.lockExecutionController!();
+      const previous = await tx.get('execution_cancellations', runId);
+      if (previous) return previous;
+      const neverStarted = ['queued', 'reserved'].includes(run.status);
+      const cancellation: ExecutionCancellation = {
+        id: runId,
+        project_id: projectId,
+        requested_by: actorId,
+        requested_at: this.timestamp(),
+        process_state: neverStarted
+          ? 'never_started'
+          : ['succeeded', 'failed'].includes(run.status)
+            ? 'exit_confirmed'
+            : 'requested',
+        effects_state: neverStarted ? 'not_started' : 'unresolved',
+        reconciliation_note: null,
+        reconciled_by: null,
+        reconciled_at: null,
+      };
+      await tx.put('execution_cancellations', cancellation);
+      if (neverStarted)
+        ensure(
+          await this.finishExecutionRun(tx, run, actorId, {
+            exit_code: null,
+            signal: null,
+            artifacts: [],
+            error_code: 'CANCELLED_NOT_STARTED',
+          }),
+          'CONFLICT',
+          'Cancellation could not acquire the execution fence.',
+        );
+      return cancellation;
+    });
+  }
+  async reconcileExecutionCancellation(actorId: string, projectId: string, runId: string, note: string) {
+    ensure(
+      typeof note === 'string' && note.trim().length > 0 && note.length <= 4000,
+      'INVALID_INPUT',
+      'Provide bounded external-effect reconciliation evidence.',
+    );
+    return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
+      await tx.lockExecutionController!();
+      const cancellation = await tx.get('execution_cancellations', runId);
+      ensure(cancellation, 'INVALID_REFERENCE', 'Request cancellation before reconciliation.');
+      if (cancellation.effects_state === 'reconciled') {
+        ensure(
+          cancellation.reconciliation_note === note,
+          'CONFLICT',
+          'Reconciliation evidence is already recorded.',
+        );
+        return cancellation;
+      }
+      ensure(
+        ['succeeded', 'failed'].includes(run.status) &&
+          ['never_started', 'exit_confirmed'].includes(cancellation.process_state),
+        'CONFLICT',
+        'Confirm execution exit before reconciling external effects.',
+      );
+      const next: ExecutionCancellation = {
+        ...cancellation,
+        effects_state: 'reconciled',
+        reconciliation_note: note,
+        reconciled_by: actorId,
+        reconciled_at: this.timestamp(),
+      };
+      await tx.put('execution_cancellations', next);
+      return next;
+    });
+  }
+
+  private async wakeTransaction<T>(
+    actorId: string,
+    projectId: string,
+    work: (tx: Transaction, project: Project, actor: Actor) => Promise<T>,
+  ) {
+    ensure(
+      this.storage.wakeDecisions,
+      'UNSUPPORTED_WAKE_DECISIONS',
+      'Storage does not support durable wake decisions.',
+    );
+    return this.storage.transaction(projectId, async (tx) => {
+      const actor = await this.actor(actorId, tx);
+      const project = await this.access(tx, actor, projectId, ['admin']);
+      return work(tx, project, actor);
+    });
+  }
+  /** Trusted deterministic companion API; no model launch or MCP exposure. */
+  async registerWakeCondition(actorId: string, projectId: string, input: unknown) {
+    return this.wakeTransaction(actorId, projectId, (tx, project) =>
+      registerWake(tx, project, actorId, input, this.timestamp()),
+    );
+  }
+  async evaluateWakeConditions(actorId: string, projectId: string, input: unknown = {}) {
+    return this.wakeTransaction(actorId, projectId, (tx, project) =>
+      evaluateWakes(tx, project, input, this.timestamp()),
+    );
+  }
+  async getWakeCondition(actorId: string, projectId: string, ticketId: string) {
+    return this.wakeTransaction(actorId, projectId, (tx) => wakeRegistration(tx, projectId, ticketId));
+  }
+  async claimWakeDecision(actorId: string, projectId: string, input: unknown) {
+    return this.wakeTransaction(actorId, projectId, async (tx, project, actor) => {
+      const decision = await claimWake(tx, project, input, this.timestamp());
+      if (decision)
+        await this.event(tx, project, actor, 'wake.claimed', (input as { ticket_id: string }).ticket_id, {
+          generation: decision.generation,
+          through_cursor: decision.through_cursor,
+          reasons: decision.reasons,
+        });
+      return decision;
+    });
+  }
+  async finishWakeDecision(actorId: string, projectId: string, input: unknown) {
+    return this.wakeTransaction(actorId, projectId, async (tx, project, actor) => {
+      const result = await finishWake(tx, projectId, input, this.timestamp());
+      if (result.changed)
+        await this.event(tx, project, actor, 'wake.finished', result.ticket_id, {
+          generation: result.generation,
+        });
+      return result.completed;
+    });
   }
   /** Trusted companion API; these methods are deliberately absent from the MCP catalog. */
   async acquireExecutionController(
@@ -876,23 +1120,294 @@ export class Application {
   private async executionReconciliation(reader: Reader, run: ExecutionJob): Promise<ExecutionReconciliation> {
     const attempt = await this.executionAttempt(reader, run.id);
     const observation = attempt ? await this.latestExecutionObservation(reader, attempt) : null;
+    const cancellation = await reader.get('execution_cancellations', run.id);
+    const needsInspection = cancellation?.effects_state === 'unresolved';
     const completed = ['succeeded', 'failed'].includes(run.status);
-    const state = completed
-      ? 'completed'
-      : run.status === 'queued'
-        ? 'queued'
-        : observation?.kind === 'running'
-          ? 'running'
-          : 'unresolved';
+    const state =
+      needsInspection && completed
+        ? 'unresolved'
+        : completed
+          ? 'completed'
+          : run.status === 'queued'
+            ? 'queued'
+            : observation?.kind === 'running'
+              ? 'running'
+              : 'unresolved';
     return {
       run,
       attempt,
       observation,
+      cancellation,
       state,
-      next_step: completed
-        ? 'none'
-        : (observation?.next_step ?? (run.status === 'queued' ? 'dispatch' : 'inspect_launch')),
+      next_step:
+        needsInspection && completed
+          ? 'inspect_side_effects'
+          : completed
+            ? 'none'
+            : (observation?.next_step ?? (run.status === 'queued' ? 'dispatch' : 'inspect_launch')),
     };
+  }
+  private async executionTimeline(actorId: string, input: Input<'run_timeline'>) {
+    return this.storage.readSnapshot(async (reader) => {
+      await this.access(reader, await this.actor(actorId, reader), input.project_id);
+      ensure(
+        this.storage.executionRuns,
+        'UNSUPPORTED_EXECUTION_RUNS',
+        'Storage does not support execution runs.',
+      );
+      const run = await reader.get('execution_jobs', input.run_id);
+      ensure(run?.project_id === input.project_id, 'NOT_FOUND', 'Execution run not found.');
+      const ticket = await reader.get('tickets', run.ticket_id);
+      const continuation = await reader.get('continuations', run.continuation_id);
+      ensure(
+        ticket?.project_id === input.project_id &&
+          continuation?.run_id === run.id &&
+          continuation.project_id === input.project_id,
+        'INVALID_REFERENCE',
+        'Execution ticket or continuation is missing.',
+      );
+      const state = await this.executionReconciliation(reader, run);
+      const controller = await reader.get('execution_controllers', 'execution');
+      const claim = await reader.get('claims', run.ticket_id);
+      const now = this.timestamp(),
+        claimCurrent = await this.executionClaimCurrent(reader, run);
+      const authority = await this.executionAuthority(reader, run);
+      const paused = (await reader.get('execution_admissions', input.project_id))?.paused ?? false;
+      const local = this.executionStatus?.observe(input.project_id, run.id) ?? null;
+      const controllerActive =
+        !!controller && controller.owner_id !== 'unclaimed' && controller.expires_at > now;
+      const reservationCurrent = !!run.locked_until && run.locked_until > now;
+      const wake = (reason: string, condition: string, action: string, at: string | null = null) => ({
+        reason,
+        next: { condition, at, action },
+      });
+      const cancellation = state.cancellation;
+      const waiting = (() => {
+        if (cancellation?.process_state === 'requested')
+          return wake(
+            'cancellation_requested',
+            'process_result_or_timeout',
+            'Wait for the matching supervisor to confirm exit; cancellation does not roll back effects.',
+          );
+        if (cancellation?.process_state === 'unresolved')
+          return wake(
+            'process_exit_unconfirmed',
+            'operator_reconciliation',
+            'Inspect the original attempt and external effects; provide authoritative exit evidence before releasing capacity.',
+          );
+        if (cancellation?.effects_state === 'unresolved')
+          return wake(
+            'effects_unresolved',
+            'operator_reconciliation',
+            'Inspect effects already performed and record external-effect reconciliation evidence; do not rerun this attempt.',
+          );
+        if (
+          local?.capacity &&
+          (local.capacity.state === 'reconciling' ||
+            (['succeeded', 'failed'].includes(run.status) && local.capacity.state === 'running'))
+        )
+          return wake(
+            'capacity_reconciliation',
+            'companion_reconciliation',
+            'Let a fenced companion replay matching exit evidence and reconcile exact host capacity; neither terminal status nor lease expiry permits release alone.',
+          );
+        if (['succeeded', 'failed'].includes(run.status))
+          return wake(
+            'completed',
+            'none',
+            'Read the recorded outcome and continuation; no automatic execution retry is scheduled.',
+          );
+        if (run.status !== 'queued' && (!reservationCurrent || !controllerActive))
+          return wake(
+            'lease_expired',
+            'companion_reconciliation',
+            'Let a fenced companion inspect and adopt the original attempt; expired ownership never proves exit or permits relaunch.',
+            controllerActive ? controller!.expires_at : null,
+          );
+        const admitted = run.status === 'reserved' && local?.capacity?.state === 'running';
+        if (run.status === 'queued' || (run.status === 'reserved' && state.next_step === 'dispatch')) {
+          if (!authority)
+            return wake(
+              'stale_authority',
+              'authority_change',
+              'Inspect the current claim and requirements; cancel stale work before any explicit replacement submission.',
+            );
+          if (paused && !admitted)
+            return wake(
+              'admissions_paused',
+              'admissions_resume',
+              'Resume project admissions when the operator is ready.',
+            );
+          if (
+            !admitted &&
+            (local?.budget?.status === 'needs_attention' ||
+              local?.capacity?.reason === 'budget_needs_attention')
+          )
+            return wake(
+              'budget_attention',
+              'budget_attention',
+              'Reconcile observed usage and budget attention before another admission.',
+            );
+          if (
+            !admitted &&
+            local?.capacity?.state === 'queued' &&
+            ['capacity', 'fair_capacity_wait'].includes(local.capacity.reason ?? '')
+          )
+            return wake(
+              'capacity_wait',
+              'capacity_change',
+              'Wait for eligible host capacity; do not bypass configured limits.',
+            );
+          if (run.status === 'queued' && controllerActive)
+            return wake(
+              'controller_busy',
+              'controller_available',
+              'Wait for the current controller to release or expire, then let the companion reconcile.',
+              controller!.expires_at,
+            );
+          return wake(
+            'awaiting_dispatch',
+            'dispatch',
+            admitted
+              ? 'Let the owning companion dispatch already admitted work after its final authority check; pause drains this admission.'
+              : 'Let the configured companion recheck authority and finish host admission before dispatch; do not launch this attempt independently.',
+          );
+        }
+        if (state.observation?.kind === 'running')
+          return wake(
+            'awaiting_process_result',
+            'process_result_or_timeout',
+            'Wait for the durable process result; timeout triggers inspection, never automatic capacity release.',
+            local?.capacity?.timeout_at ?? null,
+          );
+        return wake(
+          'launch_uncertain',
+          'companion_reconciliation',
+          'Inspect the original launch journal, process identity and effects; missing acknowledgment does not authorize relaunch.',
+        );
+      })();
+      const rows = state.attempt
+        ? await reader.find('execution_observations', {
+            where: { attempt_id: state.attempt.id, sequence: { gt: input.after_sequence } },
+            order: [{ field: 'sequence', direction: 'asc' }],
+            limit: input.limit + 1,
+          })
+        : [];
+      const {
+        id,
+        project_id,
+        ticket_id,
+        actor_id,
+        requirements_revision,
+        status,
+        checkpoint_id,
+        continuation_id,
+        created_at,
+        started_at,
+        finished_at,
+        exit_code,
+      } = run;
+      const result = {
+        observed_at: now,
+        run: {
+          id,
+          project_id,
+          ticket_id,
+          actor_id,
+          requirements_revision,
+          status,
+          checkpoint_id,
+          continuation_id,
+          created_at,
+          started_at,
+          finished_at,
+          exit_code,
+        },
+        current_revision: { ticket: ticket.revision, requirements: ticket.requirements_revision },
+        authority_current: authority,
+        admissions_paused: paused,
+        attempt: state.attempt
+          ? {
+              id: state.attempt.id,
+              ordinal: state.attempt.ordinal,
+              previous_attempt_id: state.attempt.previous_attempt_id,
+              created_at: state.attempt.created_at,
+            }
+          : null,
+        ownership: {
+          claim_actor_id: claim?.actor_id ?? null,
+          claim_current: claimCurrent,
+          controller_generation: controller?.generation ?? 0,
+          observation_generation: state.observation?.controller_generation ?? null,
+          controller_active: controllerActive,
+          controller_expires_at: controller?.expires_at ?? null,
+          reservation_current: reservationCurrent,
+          reservation_expires_at: run.locked_until,
+        },
+        state: state.state,
+        continuation: {
+          id: continuation.id,
+          status: continuation.status,
+          settled_at: continuation.settled_at,
+        },
+        cancellation: cancellation
+          ? {
+              requested_at: cancellation.requested_at,
+              process_state: cancellation.process_state,
+              effects_state: cancellation.effects_state,
+              reconciled_at: cancellation.reconciled_at,
+            }
+          : null,
+        waiting_reason: waiting.reason,
+        next_wake: waiting.next,
+        local_status: local,
+        entries: rows.slice(0, input.limit).map((entry) => ({
+          sequence: entry.sequence,
+          kind: entry.kind,
+          controller_generation: entry.controller_generation,
+          next_step: entry.next_step,
+          process_observed: entry.process_identity !== null,
+          created_at: entry.created_at,
+          outcome: entry.outcome
+            ? {
+                exit_code: entry.outcome.exit_code,
+                signal_observed: entry.outcome.signal !== null,
+                error_observed: entry.outcome.error_code !== null,
+              }
+            : null,
+        })),
+        page: {
+          after_sequence: input.after_sequence,
+          next_after_sequence: input.after_sequence,
+          has_more: rows.length > input.limit,
+          truncated_by_budget: false,
+        },
+        metrics: {
+          attempts: state.attempt ? 1 : 0,
+          latest_sequence: state.observation?.sequence ?? 0,
+          entries_returned: 0,
+        },
+      };
+      const updatePage = () => {
+        result.page.next_after_sequence = result.entries.at(-1)?.sequence ?? input.after_sequence;
+        result.metrics.entries_returned = result.entries.length;
+      };
+      updatePage();
+      while (result.entries.length > 1 && this.responseTokens(result) > input.max_tokens) {
+        result.entries.pop();
+        result.page.has_more = true;
+        result.page.truncated_by_budget = true;
+        updatePage();
+      }
+      const required = this.responseTokens(result);
+      ensure(
+        required <= input.max_tokens,
+        'CONTEXT_TOO_LARGE',
+        'Run state and one timeline entry exceed max_tokens; increase the budget before retrying.',
+        { required_tokens: required, max_tokens: input.max_tokens },
+      );
+      return result;
+    });
   }
   async listExecutionReconciliations(
     actorId: string,
@@ -1001,6 +1516,9 @@ export class Application {
       )
         return false;
       const previous = await this.latestExecutionObservation(tx, attempt);
+      const cancellation = await tx.get('execution_cancellations', runId);
+      if (cancellation && state === 'unresolved' && cancellation.process_state === 'requested')
+        await tx.put('execution_cancellations', { ...cancellation, process_state: 'unresolved' });
       if (previous?.kind === state && digest(previous.process_identity) === digest(identity)) return true;
       await this.observeExecution(
         tx,
@@ -1077,6 +1595,8 @@ export class Application {
       if (
         !(await this.currentExecutionController(tx, controller)) ||
         run.status !== 'queued' ||
+        (await tx.get('execution_admissions', projectId))?.paused ||
+        (await tx.get('execution_cancellations', runId)) ||
         !(await this.executionAuthority(tx, run))
       )
         return null;
@@ -1114,6 +1634,7 @@ export class Application {
       if (
         !(await this.currentExecutionController(tx, controller)) ||
         run.status !== 'reserved' ||
+        (await tx.get('execution_cancellations', runId)) ||
         run.reservation_token !== token ||
         !run.locked_until ||
         run.locked_until <= this.timestamp() ||
@@ -1148,6 +1669,8 @@ export class Application {
     return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
       if (
         !(await this.currentExecutionController(tx, controller)) ||
+        (await tx.get('execution_admissions', projectId))?.paused ||
+        (await tx.get('execution_cancellations', runId)) ||
         run.status !== 'reserved' ||
         run.reservation_token !== token ||
         !run.locked_until ||
@@ -1178,6 +1701,7 @@ export class Application {
     return this.executionTransaction(actorId, projectId, runId, async (tx, run) => {
       if (
         !(await this.currentExecutionController(tx, controller)) ||
+        (await tx.get('execution_cancellations', runId)) ||
         run.status !== 'running' ||
         run.reservation_token !== token ||
         !run.locked_until ||
@@ -1290,41 +1814,78 @@ export class Application {
         )
           return false;
       }
-      const finishedAt = this.timestamp();
-      const next: ExecutionJob = {
-        ...run,
-        ...result,
-        status: result.exit_code === 0 && !result.signal && !result.error_code ? 'succeeded' : 'failed',
-        finished_at: finishedAt,
-      };
-      if (!(await tx.compareExecutionRun!(run, next))) return false;
-      const attempt = await this.executionAttempt(tx, runId);
-      if (attempt)
-        await this.observeExecution(tx, next, attempt, controller, 'completed', 'none', undefined, result);
-      const continuation = await tx.get('continuations', run.continuation_id);
-      ensure(
-        continuation?.project_id === projectId && continuation.run_id === run.id,
-        'INVALID_REFERENCE',
-        'Execution continuation is missing.',
-      );
-      const current = await this.executionAuthority(tx, run);
-      const satisfied =
-        current &&
-        !result.error_code &&
-        !result.signal &&
-        result.exit_code === continuation.completion_condition.exit_code;
-      await tx.put('continuations', {
-        ...continuation,
-        status: satisfied ? 'satisfied' : 'failed',
-        failure_reason: satisfied
-          ? null
-          : current
-            ? (result.error_code ?? 'EXIT_CONDITION_FAILED')
-            : 'STALE_AUTHORITY',
-        settled_at: finishedAt,
-      });
-      return true;
+      return this.finishExecutionRun(tx, run, actorId, result, controller);
     });
+  }
+  private async finishExecutionRun(
+    tx: Transaction,
+    run: ExecutionJob,
+    actorId: string,
+    result: ExecutionOutcome,
+    controller?: ExecutionControllerFence,
+  ) {
+    const projectId = run.project_id,
+      runId = run.id;
+    const finishedAt = this.timestamp();
+    const next: ExecutionJob = {
+      ...run,
+      ...result,
+      status: result.exit_code === 0 && !result.signal && !result.error_code ? 'succeeded' : 'failed',
+      finished_at: finishedAt,
+    };
+    if (!(await tx.compareExecutionRun!(run, next))) return false;
+    const attempt = await this.executionAttempt(tx, runId);
+    if (attempt)
+      await this.observeExecution(tx, next, attempt, controller, 'completed', 'none', undefined, result);
+    const cancellation = await tx.get('execution_cancellations', runId);
+    if (cancellation && cancellation.process_state !== 'never_started') {
+      const neverStarted = [
+        'CANCELLED_NOT_STARTED',
+        'RECOVERED_NOT_DISPATCHED',
+        'DISPATCH_REJECTED',
+        'SPAWN_FAILED',
+        'NOT_STARTED',
+        'RECIPE_UNAVAILABLE',
+      ].includes(result.error_code ?? '');
+      await tx.put('execution_cancellations', {
+        ...cancellation,
+        process_state: neverStarted ? 'never_started' : 'exit_confirmed',
+        effects_state: neverStarted ? 'not_started' : cancellation.effects_state,
+      });
+    }
+    const continuation = await tx.get('continuations', run.continuation_id);
+    ensure(
+      continuation?.project_id === projectId && continuation.run_id === run.id,
+      'INVALID_REFERENCE',
+      'Execution continuation is missing.',
+    );
+    const current = await this.executionAuthority(tx, run);
+    const satisfied =
+      !cancellation &&
+      current &&
+      !result.error_code &&
+      !result.signal &&
+      result.exit_code === continuation.completion_condition.exit_code;
+    const failureReason = satisfied
+      ? null
+      : current
+        ? (result.error_code ?? 'EXIT_CONDITION_FAILED')
+        : 'STALE_AUTHORITY';
+    await tx.put('continuations', {
+      ...continuation,
+      status: satisfied ? 'satisfied' : 'failed',
+      failure_reason: failureReason,
+      settled_at: finishedAt,
+    });
+    const project = await tx.get('projects', projectId);
+    ensure(project, 'NOT_FOUND', 'Project not found.');
+    await this.event(tx, project, await this.actor(actorId, tx), 'run.settled', run.ticket_id, {
+      run_id: run.id,
+      continuation_id: continuation.id,
+      status: satisfied ? 'satisfied' : 'failed',
+      code: failureReason ?? 'CONTINUATION_SATISFIED',
+    });
+    return true;
   }
   private async childrenDone(tx: Reader, ticket: Ticket) {
     const children = await tx.find('tickets', {
@@ -1563,10 +2124,22 @@ export class Application {
           if (input.kind === 'policy' || previous?.kind === 'policy')
             await this.access(tx, actor, project.id, ['admin']);
           const sources: Knowledge['sources'] = input.sources ?? previous?.sources ?? [];
+          const fact: Knowledge['fact'] = input.fact === undefined ? (previous?.fact ?? null) : input.fact;
+          const expires_at =
+            input.expires_at === undefined ? (previous?.expires_at ?? null) : input.expires_at;
+          const supersedes: Knowledge['supersedes'] = input.supersedes ?? previous?.supersedes ?? [];
           const changed =
             !previous ||
-            digest([input.title, input.body, input.kind, sources]) !==
-              digest([previous.title, previous.body, previous.kind, previous.sources]);
+            digest([input.title, input.body, input.kind, sources, fact, expires_at, supersedes]) !==
+              digest([
+                previous.title,
+                previous.body,
+                previous.kind,
+                previous.sources,
+                previous.fact,
+                previous.expires_at,
+                previous.supersedes,
+              ]);
           if (changed || input.archived !== previous?.archived)
             await this.access(tx, actor, project.id, ['contributor', 'admin']);
           let verification: Knowledge['verification'] = changed
@@ -1633,6 +2206,16 @@ export class Application {
               'Acceptance requires explicitly verified supporting evidence.',
             );
           }
+          if (input.supersedes !== undefined || input.status === 'accepted')
+            for (const target of supersedes) {
+              const current = await tx.get('knowledge', target.id);
+              ensure(
+                current && current.project_id === project.id && current.id !== previous?.id,
+                'INVALID_REFERENCE',
+                'Supersession must identify another same-project knowledge revision.',
+              );
+              this.version(current, target.revision);
+            }
           const document: Knowledge = {
             id: previous?.id ?? randomUUID(),
             project_id: project.id,
@@ -1640,6 +2223,9 @@ export class Application {
             body: input.body,
             kind: input.kind,
             sources,
+            fact,
+            expires_at,
+            supersedes,
             status,
             verification,
             revision: (previous?.revision ?? 0) + 1,
@@ -1660,13 +2246,73 @@ export class Application {
             status: document.status,
             verification_state: document.verification.state,
           });
-          return { ...document, verification_state: document.verification.state };
+          if (input.status === 'accepted' && supersedes.length) {
+            const assessment = await (await inspectMemory(tx, project.id, this.timestamp()))(document);
+            ensure(
+              ['current', 'disputed'].includes(assessment.validity),
+              'INVALID_REFERENCE',
+              'Supersession requires a current supported structured fact.',
+            );
+          }
+          // Durable mutation receipts describe the write; only a fresh read can authorize reuse.
+          return {
+            ...document,
+            trusted_reuse: false,
+            verification_state: document.verification.state,
+          };
         }
         case 'work_claim': {
+          ensure(
+            !input.client_id || this.clientCapabilities,
+            'CLIENT_REGISTRY_REQUIRED',
+            'Ask the operator to configure CLIENT_CAPABILITIES_FILE before selecting a client.',
+          );
           const ticket = input.ticket_id
             ? await this.ticket(tx, project.id, input.ticket_id)
-            : (await this.candidates(tx, project, actor, input.capabilities, input.labels, 1))[0];
-          ensure(ticket, 'NO_ELIGIBLE_WORK', 'No eligible work is currently available.');
+            : (
+                await this.candidates(
+                  tx,
+                  project,
+                  actor,
+                  input.capabilities,
+                  input.labels,
+                  1,
+                  input.client_id,
+                )
+              )[0];
+          if (!ticket && this.clientCapabilities) {
+            const available = this.clientCapabilities.match(
+              {
+                actor_id: actor.id,
+                project_id: project.id,
+                requirements_revision: 1,
+                tools: [],
+                hints: project.execution_hints ?? undefined,
+                client_id: input.client_id,
+              },
+              this.now().getTime(),
+            );
+            ensure(
+              available.selection,
+              'UNSUPPORTED_EXECUTION',
+              'No authorized fresh client supports the requested execution choices.',
+              { reasons: available.reasons },
+            );
+          }
+          ensure(
+            ticket,
+            'NO_ELIGIBLE_WORK',
+            this.clientCapabilities
+              ? 'No eligible work matches registered capabilities. Select a ticket_id to retrieve its exact execution mismatch.'
+              : 'No eligible work is currently available.',
+          );
+          const matched = this.matchClient(project, ticket, actor, input.client_id);
+          ensure(
+            matched.selection !== null,
+            'UNSUPPORTED_EXECUTION',
+            'No authorized fresh client supports the requested execution choices. Resolve the reported mismatch or ask the operator to update registration.',
+            { reasons: matched.reasons },
+          );
           if (input.ticket_id) {
             const blockers = await this.blockers(tx, ticket);
             ensure(
@@ -1676,7 +2322,13 @@ export class Application {
               { blockers },
             );
             ensure(
-              await this.eligible(tx, ticket, actor, input.capabilities, input.labels),
+              await this.eligible(
+                tx,
+                ticket,
+                actor,
+                this.availableCapabilities(project, actor, input.capabilities),
+                input.labels,
+              ),
               'NOT_CLAIMABLE',
               'Ticket is claimed, not ready, assigned elsewhere, or requires other capabilities.',
             );
@@ -1688,6 +2340,7 @@ export class Application {
             actor_id: actor.id,
             token: randomUUID(),
             expires_at: new Date(this.now().getTime() + LEASE_MS).toISOString(),
+            ...(matched.selection ? { execution: matched.selection } : {}),
           };
           await tx.put('claims', claim);
           ticket.status = 'in_progress';
@@ -1784,6 +2437,7 @@ export class Application {
             remaining: input.checkpoint.remaining,
             decisions: input.checkpoint.decisions,
             references: input.checkpoint.references,
+            requirements_revision: ticket.requirements_revision,
           },
         });
         await this.touch(tx, ticket);
@@ -1936,7 +2590,12 @@ export class Application {
       case 'ticket_checkpoint': {
         await this.liveClaim(tx, ticket, actor, input.claim_token);
         const note = await this.note(tx, actor, ticket, 'checkpoint', input.progress, {
-          metadata: { remaining: input.remaining, decisions: input.decisions, references: input.references },
+          metadata: {
+            remaining: input.remaining,
+            decisions: input.decisions,
+            references: input.references,
+            requirements_revision: ticket.requirements_revision,
+          },
         });
         await this.touch(tx, ticket);
         await this.queue(tx, note, 'checkpoint');
@@ -2132,13 +2791,63 @@ export class Application {
             actor_id: claim.actor_id,
             expires_at: claim.expires_at,
             expired: claim.expires_at <= at,
-            ...(claim.actor_id === actor.id ? { token: claim.token } : {}),
+            ...(claim.actor_id === actor.id
+              ? { token: claim.token, ...(claim.execution ? { execution: claim.execution } : {}) }
+              : {}),
           }
         : null,
       blockers,
     };
   }
+  private async readArtifact(
+    reader: Reader,
+    projectId: string,
+    artifactId: string,
+    offset: number,
+    length: number,
+  ) {
+    const identity = artifactIdentity.exec(artifactId);
+    ensure(identity, 'INVALID_REFERENCE', 'Artifact identity is invalid.');
+    const run = await reader.get('execution_jobs', identity[1]!);
+    ensure(run && run.project_id === projectId, 'NOT_FOUND', 'Execution artifact not found.');
+    const attempt = await reader.get('execution_attempts', identity[2]!);
+    ensure(
+      attempt &&
+        attempt.project_id === projectId &&
+        attempt.run_id === run.id &&
+        run.artifacts.includes(artifactId),
+      'INVALID_REFERENCE',
+      'Artifact is not published by this execution attempt.',
+    );
+    return this.executionArtifacts
+      ? this.executionArtifacts.read(
+          artifactId,
+          {
+            run_id: run.id,
+            attempt_id: attempt.id,
+            process_token: attempt.process_token,
+            recipe_fingerprint: run.recipe_fingerprint,
+          },
+          offset,
+          length,
+          this.now().getTime(),
+        )
+      : unavailableArtifact(artifactId, offset, length, 'not_configured');
+  }
   private async read(actorId: string, operation: Operation, input: any): Promise<unknown> {
+    if (operation === 'artifact_read')
+      return this.storage.readSnapshot(async (reader) => {
+        await this.access(reader, await this.actor(actorId, reader), input.project_id);
+        const artifact = await this.readArtifact(
+          reader,
+          input.project_id,
+          input.artifact_id,
+          input.offset,
+          input.length,
+        );
+        return packArtifactRange(artifact, input.max_tokens, (value) => this.responseTokens(value));
+      });
+    if (operation === 'run_timeline') return this.executionTimeline(actorId, input);
     if (operation === 'run_get')
       return this.storage.readSnapshot(async (reader) => {
         await this.access(reader, await this.actor(actorId, reader), input.project_id);
@@ -2162,17 +2871,98 @@ export class Application {
           'Execution checkpoint or continuation is missing.',
         );
         const recovery = await this.executionReconciliation(reader, run);
-        return {
+        const output = await Promise.all(
+          run.artifacts
+            .filter((id) => artifactIdentity.test(id))
+            .map((id) => this.readArtifact(reader, input.project_id, id, 0, 0)),
+        );
+        const stderr = output.find((artifact) => artifact.artifact_id.endsWith(':stderr'));
+        const response = {
           run,
           continuation,
-          checkpoint,
+          checkpoint: checkpoint as Note | null,
+          output,
+          failure_location:
+            run.status === 'failed' && stderr
+              ? {
+                  tool: 'artifact_read',
+                  arguments: {
+                    project_id: input.project_id,
+                    artifact_id: stderr.artifact_id,
+                    offset: 0,
+                    length: Math.min(stderr.size_bytes ?? 4096, 4096),
+                  },
+                }
+              : null,
+          omitted: [] as {
+            section: string;
+            retrieve_with: string;
+            arguments: Record<string, string | number>;
+          }[],
           stale: !(await this.executionAuthority(reader, run)),
           reconciliation: {
             state: recovery.state,
             next_step: recovery.next_step,
             attempt_id: recovery.attempt?.id ?? null,
+            cancellation: recovery.cancellation,
           },
         };
+        const tokens = () => this.responseTokens(this.result('run_get', response));
+        if (Buffer.byteLength(JSON.stringify(checkpoint)) > input.max_tokens || tokens() > input.max_tokens) {
+          response.checkpoint = null;
+          response.omitted.push({
+            section: 'checkpoint',
+            retrieve_with: 'checkpoint_get',
+            arguments: { project_id: input.project_id, checkpoint_id: run.checkpoint_id },
+          });
+        }
+        if (tokens() > input.max_tokens && response.output.length) {
+          response.output = [];
+          response.omitted.push({
+            section: 'output',
+            retrieve_with: 'artifact_read',
+            arguments: {
+              project_id: input.project_id,
+              artifact_id: stderr?.artifact_id ?? output[0]!.artifact_id,
+              length: 0,
+            },
+          });
+        }
+        if (tokens() > input.max_tokens) {
+          const compact = {
+            ...response,
+            run: {
+              id: run.id,
+              project_id: run.project_id,
+              status: run.status,
+              exit_code: run.exit_code,
+              signal: run.signal,
+              error_code: run.error_code,
+              artifacts: [],
+            },
+            continuation: {
+              id: continuation.id,
+              status: continuation.status,
+              failure_reason: continuation.failure_reason,
+            },
+            output: [],
+            checkpoint: null,
+            omitted: [
+              {
+                section: 'run_details',
+                retrieve_with: 'run_get',
+                arguments: { project_id: input.project_id, run_id: run.id, max_tokens: 32768 },
+              },
+            ],
+          };
+          ensure(
+            this.responseTokens(this.result('run_get', compact)) <= input.max_tokens,
+            'RESPONSE_BUDGET_TOO_SMALL',
+            'Execution status metadata exceeds the response budget. Increase max_tokens.',
+          );
+          return compact;
+        }
+        return response;
       });
     if (operation === 'ticket_context') {
       const snapshot = await this.storage.readSnapshot(async (reader) => {
@@ -2300,6 +3090,7 @@ export class Application {
               input.capabilities,
               input.labels,
               input.limit,
+              input.client_id,
             ),
           };
         }
@@ -2352,12 +3143,39 @@ export class Application {
         return note;
       }
       case 'knowledge_get': {
-        const document =
-          input.revision === undefined
-            ? await this.storage.get('knowledge', input.knowledge_id)
-            : await this.storage.get('knowledge_revisions', `${input.knowledge_id}:${input.revision}`);
-        ensure(document && document.project_id === project.id, 'NOT_FOUND', 'Knowledge document not found.');
-        return { ...document, id: input.knowledge_id };
+        return this.storage.transaction(project.id, async (tx) => {
+          await this.access(tx, await this.actor(actorId, tx), project.id);
+          const document =
+            input.revision === undefined
+              ? await tx.get('knowledge', input.knowledge_id)
+              : await tx.get('knowledge_revisions', `${input.knowledge_id}:${input.revision}`);
+          ensure(
+            document && document.project_id === project.id,
+            'NOT_FOUND',
+            'Knowledge document not found.',
+          );
+          if (!document.fact) {
+            const current =
+              input.revision === undefined ? document : await tx.get('knowledge', input.knowledge_id);
+            const validity =
+              document.archived || current?.archived
+                ? 'archived'
+                : current?.revision !== document.revision
+                  ? 'stale'
+                  : document.expires_at && Date.parse(document.expires_at) <= this.now().getTime()
+                    ? 'expired'
+                    : 'unsupported';
+            return {
+              ...document,
+              id: input.knowledge_id,
+              validity,
+              trusted_reuse: false,
+              contradictions: [],
+            };
+          }
+          const inspect = await inspectMemory(tx, project.id, this.timestamp());
+          return { ...document, id: input.knowledge_id, ...(await inspect(document)) };
+        });
       }
       case 'changes_since': {
         const events = await this.storage.find('events', {
@@ -2413,6 +3231,8 @@ export class Application {
               status: item.status,
               verification_state: item.verification.state,
               trusted_reuse: false,
+              validity: 'unsupported',
+              contradiction_count: 0,
             },
           }
         : null;
@@ -2451,59 +3271,86 @@ export class Application {
       Math.min(100, input.limit * 3),
       semantic,
     );
-    const results = [];
-    for (const hit of hits) {
-      if (input.kind && input.kind !== hit.kind) continue;
-      const source = await this.sourceDocument(this.storage, hit.kind, hit.id);
-      if (
-        !source ||
-        source.project_id !== input.project_id ||
-        source.archived ||
-        source.revision !== hit.revision
-      )
-        continue;
-      if (hit.kind === 'ticket' || hit.kind === 'checkpoint') {
-        const ticket = await this.storage.get('tickets', source.ticket_id ?? hit.id);
-        if (ticket?.status === 'cancelled') continue;
+    const results = await this.storage.readSnapshot(async (tx) => {
+      await this.access(tx, await this.actor(actor.id, tx), input.project_id);
+      let inspect: Awaited<ReturnType<typeof inspectMemory>> | undefined;
+      const results = [];
+      for (const hit of hits) {
+        if (input.kind && input.kind !== hit.kind) continue;
+        const source = await this.sourceDocument(tx, hit.kind, hit.id);
         if (
-          (input.status && ticket?.status !== input.status) ||
-          !input.labels.every((label) => ticket?.labels.includes(label))
+          !source ||
+          source.project_id !== input.project_id ||
+          source.archived ||
+          source.revision !== hit.revision
         )
           continue;
-      } else if (input.status || input.labels.length) continue;
-      results.push({
-        id: source.id,
-        kind: source.kind,
-        title: source.title,
-        revision: source.revision,
-        excerpt: queryExcerpt(source.text, input.query, this.countTokens),
-        score: hit.score,
-        resource_uri: `ticketing://${hit.kind}/${source.project_id}/${source.id}`,
-        retrieval: {
-          tool:
-            hit.kind === 'ticket'
-              ? 'ticket_get'
-              : hit.kind === 'checkpoint'
-                ? 'checkpoint_get'
-                : 'knowledge_get',
-          arguments: {
-            project_id: source.project_id,
-            [hit.kind === 'ticket'
-              ? 'ticket_id'
-              : hit.kind === 'checkpoint'
-                ? 'checkpoint_id'
-                : 'knowledge_id']: source.id,
-            ...(hit.kind === 'knowledge' ? { revision: source.revision } : {}),
+        if (hit.kind === 'knowledge') {
+          const document = (await tx.get('knowledge', hit.id))!;
+          const uncited =
+            !document.fact && !document.sources.length && !document.expires_at && !document.supersedes.length;
+          if (!uncited) inspect ??= await inspectMemory(tx, input.project_id, this.timestamp());
+          const assessment = uncited
+            ? { validity: 'unsupported' as const, trusted_reuse: false, contradictions: [] }
+            : await inspect!(document);
+          if (assessment.validity === 'unavailable') {
+            degraded =
+              'Memory validity is unavailable above 1,000 project records or accepted revisions; knowledge results are withheld.';
+            continue;
+          }
+          if (['stale', 'expired', 'superseded', 'archived'].includes(assessment.validity)) continue;
+          source.memory = {
+            status: document.status,
+            verification_state: document.verification.state,
+            validity: assessment.validity,
+            trusted_reuse: assessment.trusted_reuse,
+            contradiction_count: assessment.contradictions.length,
+          };
+        }
+        if (hit.kind === 'ticket' || hit.kind === 'checkpoint') {
+          const ticket = await tx.get('tickets', source.ticket_id ?? hit.id);
+          if (ticket?.status === 'cancelled') continue;
+          if (
+            (input.status && ticket?.status !== input.status) ||
+            !input.labels.every((label) => ticket?.labels.includes(label))
+          )
+            continue;
+        } else if (input.status || input.labels.length) continue;
+        results.push({
+          id: source.id,
+          kind: source.kind,
+          title: source.title,
+          revision: source.revision,
+          excerpt: queryExcerpt(source.text, input.query, this.countTokens),
+          score: hit.score,
+          resource_uri: `ticketing://${hit.kind}/${source.project_id}/${source.id}`,
+          retrieval: {
+            tool:
+              hit.kind === 'ticket'
+                ? 'ticket_get'
+                : hit.kind === 'checkpoint'
+                  ? 'checkpoint_get'
+                  : 'knowledge_get',
+            arguments: {
+              project_id: source.project_id,
+              [hit.kind === 'ticket'
+                ? 'ticket_id'
+                : hit.kind === 'checkpoint'
+                  ? 'checkpoint_id'
+                  : 'knowledge_id']: source.id,
+              ...(hit.kind === 'knowledge' ? { revision: source.revision } : {}),
+            },
           },
-        },
-        untrusted_content: true,
-        ...(source.memory ? { memory: source.memory } : {}),
-      });
-      if (results.length === input.limit) break;
-    }
-    // Recheck grants after provider/network calls so a revoked identity cannot receive cached candidates.
-    await this.access(this.storage, actor, input.project_id);
+          untrusted_content: true,
+          ...(source.memory ? { memory: source.memory } : {}),
+        });
+        if (results.length === input.limit) break;
+      }
+      return results;
+    });
     const coverage = await this.searchAdapter.coverage(input.project_id, embeddings?.profile);
+    // Recheck live grants after providers and the authorized snapshot complete.
+    await this.access(this.storage, await this.actor(actor.id), input.project_id);
     if (!degraded && coverage.embedded < coverage.documents)
       degraded = 'Semantic indexing is incomplete; full-text results remain available.';
     return { results, degraded, coverage, index_consistency: 'eventual' };

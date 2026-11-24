@@ -6,7 +6,10 @@ import pg from 'pg';
 import { PostgresStorage, PostgresSearch } from '../../src/adapters/postgres.js';
 import { createApplication } from '../../src/application.js';
 import { fixture, testEmbeddings } from '../../src/testing/contracts.js';
-import { registerExecutionUpgradeContractTests } from '../../src/testing/execution-upgrade-contracts.js';
+import {
+  registerExecutionUpgradeContractTests,
+  seedLegacyExecutionClaim,
+} from '../../src/testing/execution-upgrade-contracts.js';
 registerExecutionUpgradeContractTests('PostgreSQL', 'postgres', async () => {
   assert.ok(process.env.TEST_DATABASE_URL, 'TEST_DATABASE_URL required.');
   const bootstrap = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
@@ -53,12 +56,21 @@ it('adds PostgreSQL execution storage without changing existing checkpoints, cla
     await search.configure(testEmbeddings.profile);
     const f = await fixture({ storage, search });
     const ticket = await f.ticket();
-    const claimed = await f.claim(ticket.id);
-    await f.call(f.worker.id, 'ticket_checkpoint', {
+    const claimed = await seedLegacyExecutionClaim(
+      (text) => storage.pool.query(text),
+      f.project.id,
+      ticket.id,
+      f.worker.id,
+      f.clock.now,
+    );
+    const checkpointInput = {
+      project_id: f.project.id,
       ticket_id: ticket.id,
       claim_token: claimed.claim.token,
+      idempotency_key: randomUUID(),
       progress: 'Existing progress.',
-    });
+    };
+    const checkpointReceipt = await f.app.execute(f.worker.id, 'ticket_checkpoint', checkpointInput);
     const original = {
       notes: await storage.find('notes'),
       receipts: await storage.find('receipts'),
@@ -68,6 +80,10 @@ it('adds PostgreSQL execution storage without changing existing checkpoints, cla
     await storage.migrate();
     await storage.migrate();
     assert.deepEqual(
+      (await storage.pool.query('SELECT execution FROM claims WHERE id=$1', [ticket.id])).rows,
+      [{ execution: null }],
+    );
+    assert.deepEqual(
       {
         notes: await storage.find('notes'),
         receipts: await storage.find('receipts'),
@@ -75,6 +91,10 @@ it('adds PostgreSQL execution storage without changing existing checkpoints, cla
         tickets: await storage.find('tickets'),
       },
       original,
+    );
+    assert.deepEqual(
+      await f.app.execute(f.worker.id, 'ticket_checkpoint', checkpointInput),
+      checkpointReceipt,
     );
     assert.deepEqual(await storage.find('execution_jobs'), []);
     assert.deepEqual(await storage.find('continuations'), []);

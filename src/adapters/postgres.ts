@@ -30,6 +30,9 @@ const knowledgeColumns = [
   'body',
   'kind',
   'sources',
+  'fact',
+  'expires_at',
+  'supersedes',
   'status',
   'verification',
   'revision',
@@ -38,6 +41,35 @@ const knowledgeColumns = [
   'updated_at',
 ];
 const columns: Record<Table, string[]> = {
+  execution_admissions: ['id', 'paused', 'actor_id', 'updated_at'],
+  execution_cancellations: [
+    'id',
+    'project_id',
+    'requested_by',
+    'requested_at',
+    'process_state',
+    'effects_state',
+    'reconciliation_note',
+    'reconciled_by',
+    'reconciled_at',
+  ],
+  wake_conditions: [
+    'id',
+    'project_id',
+    'ticket_id',
+    'actor_id',
+    'condition',
+    'deadline',
+    'cursor',
+    'revision',
+    'generation',
+    'observed',
+    'deadline_fired',
+    'pending',
+    'active',
+    'finished_token',
+    'updated_at',
+  ],
   execution_controllers: ['id', 'owner_id', 'token', 'generation', 'expires_at'],
   execution_attempts: [
     'id',
@@ -176,7 +208,7 @@ const columns: Record<Table, string[]> = {
     'ticket_revision',
     'created_at',
   ],
-  claims: ['id', 'project_id', 'ticket_id', 'actor_id', 'token', 'expires_at'],
+  claims: ['id', 'project_id', 'ticket_id', 'actor_id', 'token', 'expires_at', 'execution'],
   submissions: [
     'id',
     'project_id',
@@ -218,6 +250,10 @@ const columns: Record<Table, string[]> = {
   ],
 };
 const jsonColumns = new Set([
+  'condition',
+  'observed',
+  'pending',
+  'active',
   'process_identity',
   'outcome',
   'artifacts',
@@ -228,9 +264,12 @@ const jsonColumns = new Set([
   'result',
   'requirements_snapshot',
   'execution_hints',
+  'execution',
   'github_pull_request',
   'checks',
   'sources',
+  'fact',
+  'supersedes',
   'verification',
 ]);
 type Executor = Pick<pg.Pool, 'query'> | Pick<pg.PoolClient, 'query'>;
@@ -239,13 +278,17 @@ function decode(row: Record<string, unknown>) {
     Object.entries(row)
       .filter(
         ([key, value]) =>
-          !['execution_hints', 'github_pull_request', 'scheduling_policy'].includes(key) || value !== null,
+          !['execution_hints', 'execution', 'github_pull_request', 'scheduling_policy'].includes(key) ||
+          value !== null,
       )
       .map(([key, value]) => [
         key,
         value instanceof Date
           ? value.toISOString()
-          : key === 'seq' || key === 'event_seq' || (key === 'exit_code' && value !== null)
+          : key === 'seq' ||
+              key === 'event_seq' ||
+              key === 'cursor' ||
+              (key === 'exit_code' && value !== null)
             ? Number(value)
             : value,
       ]),
@@ -414,12 +457,19 @@ function repository(db: Executor): Transaction {
     async remove(table, id) {
       ensure(Object.hasOwn(columns, table), 'INVALID_QUERY', 'Unknown storage table.');
       ensure(
+        table !== 'wake_conditions',
+        'IMMUTABLE_WAKE',
+        'Durable wake cursors and consumption fences cannot be deleted.',
+      );
+      ensure(
         ![
           'execution_jobs',
           'continuations',
           'execution_attempts',
           'execution_observations',
           'execution_controllers',
+          'execution_admissions',
+          'execution_cancellations',
         ].includes(table),
         'IMMUTABLE_EXECUTION',
         'Execution history cannot be deleted.',
@@ -437,6 +487,7 @@ function repository(db: Executor): Transaction {
 }
 
 export class PostgresStorage implements StorageAdapter {
+  readonly wakeDecisions = true;
   readonly executionRuns = true as const;
   readonly executionLaunchStorage;
   readonly schedulingPolicies = Object.freeze(['priority_age', 'unblocking'] as const);
