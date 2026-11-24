@@ -4,7 +4,7 @@ The supported public entry point is [deploy/Caddyfile](../deploy/Caddyfile) with
 
 ## Operator setup
 
-Use Node 24+, Docker, and Docker Compose 2.24.4+ (`!reset`/`!override` support). Keep the same checkout directory or explicit Compose project name on every invocation so the named volumes stay attached. Run `node scripts/setup.mjs` once; it preserves an existing `.env`. Edit that private file with the actual operator-owned hostnames below. The example domains are placeholders and preflight rejects them.
+Use Node 24+, Docker, and Docker Compose 2.24.4+ (`!reset`/`!override` support). Keep the same checkout directory or explicit Compose project name on every invocation so the named volumes stay attached. Run `node scripts/setup.mjs` to generate distinct passwords. It preserves an existing `.env` and reports any remaining example passwords. Edit that private file with the actual operator-owned hostnames below. Preflight rejects example domains and weak or reused passwords. If an existing installation ever used the example credential, rotate the actual Keycloak administrator password through Keycloak and the affected database roles through PostgreSQL. Editing the Compose environment alone does not rotate existing credentials.
 
 ```dotenv
 TICKETING_DOMAIN=tickets.example.com
@@ -13,11 +13,11 @@ PUBLIC_URL=https://tickets.example.com
 OAUTH_AUDIENCE=https://tickets.example.com/mcp
 KEYCLOAK_PUBLIC_URL=https://login.example.com
 OAUTH_ISSUER=https://login.example.com/realms/ticketing
-OAUTH_JWKS_URL=http://keycloak:8080/realms/ticketing/protocol/openid-connect/certs
+OAUTH_JWKS_URL=https://login.example.com/realms/ticketing/protocol/openid-connect/certs
 ALLOWED_ORIGIN_HOSTS=tickets.example.com
 ```
 
-`PUBLIC_URL` is an origin without a trailing slash, credentials, path, query or fragment. The audience is the exact unqueried `/mcp` URL, including scheme/hostname/case; `/mcp?profile=worker` still uses that audience. The issuer is the exact external Keycloak realm URL, with no trailing slash. The private JWKS override changes key retrieval only; it does not change the token's public `iss`. Register actors with that same public issuer and the immutable Keycloak subject, then grant project memberships as described in [authentication](authentication.md#included-keycloak-setup). Migrating a local realm to a new issuer requires deliberate actor registration/grants; old local issuer identities do not automatically become public identities.
+`PUBLIC_URL` is an origin without a trailing slash, credentials, path, query or fragment. The audience is the exact unqueried `/mcp` URL, including scheme/hostname/case; `/mcp?profile=worker` still uses that audience. The issuer is the exact external Keycloak realm URL, with no trailing slash. The app resolves the login hostname to Caddy on the Compose network and fetches signing keys with normal HTTPS certificate validation. Register actors with that same public issuer and the immutable Keycloak subject, then grant project memberships as described in [authentication](authentication.md#included-keycloak-setup). Migrating a local realm to a new issuer requires deliberate actor registration/grants; old local issuer identities do not automatically become public identities.
 
 `ALLOWED_ORIGIN_HOSTS` is a comma-separated list of explicit trusted browser hostnames, including the ticketing hostname. Add only hosts actually used by trusted MCP clients. It is a hostname allowlist, not a list of URLs; do not use `*`, schemes or ports. Configure human clients' exact callback URLs in Keycloak separately. OAuth scopes and project roles are still required.
 

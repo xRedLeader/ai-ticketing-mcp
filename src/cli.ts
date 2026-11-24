@@ -339,6 +339,7 @@ async function main() {
         issuer: process.env.OAUTH_ISSUER,
         audience,
         jwksUrl: process.env.OAUTH_JWKS_URL,
+        allowLocalKeycloakJwks: process.env.OAUTH_ALLOW_LOCAL_KEYCLOAK_JWKS === 'true',
       });
       const server = createHttpServer(app, {
         publicUrl,

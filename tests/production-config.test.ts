@@ -4,7 +4,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { randomBytes } from 'node:crypto';
+import { parseEnv, promisify } from 'node:util';
 // @ts-expect-error Operator script is plain Node ESM.
 import { checkProductionConfig } from '../scripts/check-production.mjs';
 
@@ -16,14 +17,18 @@ it('checks exact production identities, assigned realm audience, private ports a
     OAUTH_AUDIENCE: 'https://tickets.acme.org/mcp',
     KEYCLOAK_PUBLIC_URL: 'https://login.acme.org',
     OAUTH_ISSUER: 'https://login.acme.org/realms/ticketing',
-    OAUTH_JWKS_URL: 'http://keycloak:8080/realms/ticketing/protocol/openid-connect/certs',
+    OAUTH_JWKS_URL: 'https://login.acme.org/realms/ticketing/protocol/openid-connect/certs',
     ALLOWED_ORIGIN_HOSTS: 'tickets.acme.org',
+    DB_PASSWORD: randomBytes(32).toString('hex'),
+    APP_DB_PASSWORD: randomBytes(32).toString('hex'),
+    KEYCLOAK_DB_PASSWORD: randomBytes(32).toString('hex'),
+    KEYCLOAK_ADMIN_PASSWORD: randomBytes(32).toString('hex'),
   };
   const realm = JSON.parse(await readFile('deploy/keycloak-realm.json', 'utf8'));
   realm.clientScopes[0].protocolMappers[0].config['included.custom.audience'] = env.OAUTH_AUDIENCE;
   const compose = {
     services: {
-      app: { environment: env },
+      app: { environment: { ...env, OAUTH_ALLOW_LOCAL_KEYCLOAK_JWKS: 'false' } },
       db: {},
       ollama: {},
       keycloak: { environment: { KC_HOSTNAME: env.KEYCLOAK_PUBLIC_URL }, command: ['start'] },
@@ -38,6 +43,30 @@ it('checks exact production identities, assigned realm audience, private ports a
   };
   assert.deepEqual(checkProductionConfig(env, compose, realm), []);
   assert.deepEqual(checkProductionConfig(env), []);
+  const example = await readFile('.env.example', 'utf8');
+  const passwordFields = [
+    'DB_PASSWORD',
+    'APP_DB_PASSWORD',
+    'KEYCLOAK_DB_PASSWORD',
+    'KEYCLOAK_ADMIN_PASSWORD',
+  ];
+  for (const invalid of [
+    { ...env, ...parseEnv(example) },
+    {
+      ...env,
+      APP_DB_PASSWORD: env.DB_PASSWORD,
+      KEYCLOAK_DB_PASSWORD: env.DB_PASSWORD,
+      KEYCLOAK_ADMIN_PASSWORD: env.DB_PASSWORD,
+    },
+  ]) {
+    const errors = checkProductionConfig(invalid);
+    for (const name of passwordFields)
+      assert.ok(
+        errors.some((message: string) => message.startsWith(`${name}:`)),
+        name,
+      );
+    assert.ok(!errors.join('\n').includes(env.DB_PASSWORD));
+  }
   assert.deepEqual(
     checkProductionConfig({ ...env, ALLOWED_ORIGIN_HOSTS: ' tickets.acme.org , console.acme.org ' }),
     [],
@@ -200,6 +229,18 @@ it('checks exact production identities, assigned realm audience, private ports a
     );
   const directory = await mkdtemp(join(tmpdir(), 'ticketing-production-check-'));
   try {
+    await mkdir(join(directory, 'scripts'));
+    await writeFile(join(directory, 'scripts', 'setup.mjs'), await readFile('scripts/setup.mjs'));
+    await writeFile(join(directory, '.env.example'), example);
+    await writeFile(join(directory, '.env'), example);
+    await assert.rejects(
+      promisify(execFile)(process.execPath, [join(directory, 'scripts', 'setup.mjs')]),
+      (error: any) =>
+        error.code === 1 &&
+        passwordFields.every((name) => error.stderr.includes(name)) &&
+        !error.stderr.includes('replace-with-generated-hex'),
+    );
+    assert.equal(await readFile(join(directory, '.env'), 'utf8'), example);
     await assert.rejects(
       promisify(execFile)(
         process.execPath,
@@ -228,7 +269,7 @@ it('checks exact production identities, assigned realm audience, private ports a
       await assert.rejects(
         promisify(execFile)(process.execPath, [resolve('scripts/check-production.mjs'), ...args], {
           cwd: directory,
-          env: { ...process.env, ...env, KEYCLOAK_ADMIN_PASSWORD: 'private-env-value' },
+          env: { ...process.env, ...env },
           windowsHide: true,
         }),
         (error: any) =>

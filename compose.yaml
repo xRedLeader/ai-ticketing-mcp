@@ -72,6 +72,7 @@ services:
       OAUTH_ISSUER: ${OAUTH_ISSUER:-http://localhost:8080/realms/ticketing}
       OAUTH_AUDIENCE: ${OAUTH_AUDIENCE:-http://localhost:3000/mcp}
       OAUTH_JWKS_URL: ${OAUTH_JWKS_URL:-http://keycloak:8080/realms/ticketing/protocol/openid-connect/certs}
+      OAUTH_ALLOW_LOCAL_KEYCLOAK_JWKS: 'true'
       ALLOWED_ORIGIN_HOSTS: ${ALLOWED_ORIGIN_HOSTS:-localhost}
     ports: ['127.0.0.1:${PORT:-3000}:3000']
     healthcheck:

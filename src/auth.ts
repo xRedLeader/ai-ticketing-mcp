@@ -6,14 +6,40 @@ export interface AuthConfig {
   issuer: string;
   audience: string;
   jwksUrl?: string;
+  allowLocalKeycloakJwks?: boolean;
 }
+
+const localKeycloakJwks = 'http://keycloak:8080/realms/ticketing/protocol/openid-connect/certs';
+const localKeycloakIssuer = 'http://localhost:8080/realms/ticketing';
+const isLoopbackHttp = (raw: string) => /^http:\/\/(?:127\.0\.0\.1|\[::1\])(?::[0-9]+)?(?:\/|$)/.test(raw);
+
+function authUrl(raw: string, allowHttp = false) {
+  const url = URL.parse(raw);
+  ensure(
+    url &&
+      !url.username &&
+      !url.password &&
+      !url.hash &&
+      (url.protocol === 'https:' || (url.protocol === 'http:' && allowHttp)),
+    'INVALID_CONFIG',
+    'OAuth issuer and signing key URLs require HTTPS outside local development.',
+  );
+  return url;
+}
+
 export async function createAuthenticator(storage: StorageAdapter, config: AuthConfig) {
-  const issuer = new URL(config.issuer);
-  ensure(['http:', 'https:'].includes(issuer.protocol), 'INVALID_CONFIG', 'OAuth issuer must use HTTP(S).');
-  let jwksUrl = config.jwksUrl;
-  if (!jwksUrl) {
+  const bundledKeycloak =
+    config.allowLocalKeycloakJwks === true &&
+    config.issuer === localKeycloakIssuer &&
+    config.jwksUrl === localKeycloakJwks;
+  const issuer = authUrl(config.issuer, isLoopbackHttp(config.issuer) || bundledKeycloak);
+  let jwksUrl: URL;
+  if (config.jwksUrl) {
+    jwksUrl = authUrl(config.jwksUrl, isLoopbackHttp(config.jwksUrl) || bundledKeycloak);
+  } else {
     const response = await fetch(`${config.issuer.replace(/\/$/, '')}/.well-known/openid-configuration`, {
       signal: AbortSignal.timeout(10000),
+      redirect: 'error',
     });
     ensure(response.ok, 'AUTH_UNAVAILABLE', 'Cannot load OAuth discovery.');
     const metadata = (await response.json()) as { issuer: string; jwks_uri: string };
@@ -22,9 +48,15 @@ export async function createAuthenticator(storage: StorageAdapter, config: AuthC
       'INVALID_CONFIG',
       'Discovery issuer does not match configured issuer.',
     );
-    jwksUrl = metadata.jwks_uri;
+    ensure(typeof metadata.jwks_uri === 'string', 'INVALID_CONFIG', 'Discovery did not return a JWKS URL.');
+    jwksUrl = authUrl(metadata.jwks_uri, isLoopbackHttp(metadata.jwks_uri));
+    ensure(
+      jwksUrl.protocol === 'https:' || jwksUrl.origin === issuer.origin,
+      'INVALID_CONFIG',
+      'Discovered signing keys require HTTPS or the same loopback origin.',
+    );
   }
-  const jwks = createRemoteJWKSet(new URL(jwksUrl), { timeoutDuration: 5000, cooldownDuration: 30000 });
+  const jwks = createRemoteJWKSet(jwksUrl, { timeoutDuration: 5000, cooldownDuration: 30000 });
   return async (authorization: string | undefined): Promise<Principal> => {
     ensure(
       authorization && authorization.startsWith('Bearer ') && authorization.length <= 16384,

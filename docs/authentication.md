@@ -35,7 +35,7 @@ Use `--input-file` for larger payloads and reviews. The CLI invokes the same aut
 
 ## Existing providers
 
-Set `OAUTH_ISSUER`, `OAUTH_AUDIENCE`, and `PUBLIC_URL`. The server reads OpenID discovery unless `OAUTH_JWKS_URL` is explicitly configured. Inside Compose, set that override to your provider's actual JWKS address; its default points to the bundled Keycloak. Configure the provider to issue the two scopes and the exact audience. Register issuer/subject identities and project grants as above.
+Set `OAUTH_ISSUER`, `OAUTH_AUDIENCE`, and `PUBLIC_URL`. The server reads OpenID discovery unless `OAUTH_JWKS_URL` is explicitly configured. Use HTTPS for issuer and signing-key URLs. Development can use literal HTTP loopback addresses, and the base Compose file enables a separate exception for its exact local Keycloak issuer and internal signing-key URL. The production override disables that exception. Configure the provider to issue the two scopes and the exact audience. Register issuer/subject identities and project grants as above.
 
 ## Production HTTPS
 

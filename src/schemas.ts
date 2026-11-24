@@ -404,6 +404,7 @@ export const schemas = {
       submission_id: id,
       decision: z.enum(['approve', 'request_changes']),
       feedback: text.max(16000),
+      automatic: z.literal(true).optional(),
     })
     .strict(),
   ticket_context: z
