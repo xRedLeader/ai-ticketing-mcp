@@ -56,6 +56,21 @@ export function createHttpServer(app: Application, config: HttpConfig) {
     (config.allowedOrigins ?? [url.hostname]).map((host) => host.trim()),
   );
   let active = 0;
+  let readiness = 0;
+  let waits = 0;
+  const waitsByActor = new Map<string, number>();
+  const beginRunWait = (actor: string) => {
+    const count = waitsByActor.get(actor) ?? 0;
+    ensure(waits < 32 && count < 2, 'SERVER_BUSY', 'Too many active run waits. Retry later.');
+    waits++;
+    waitsByActor.set(actor, count + 1);
+    return () => {
+      waits--;
+      const remaining = waitsByActor.get(actor)! - 1;
+      if (remaining) waitsByActor.set(actor, remaining);
+      else waitsByActor.delete(actor);
+    };
+  };
   const server = createServer(async (req, res) => {
     const start = performance.now();
     let path = '';
@@ -81,11 +96,7 @@ export function createHttpServer(app: Application, config: HttpConfig) {
       ),
     );
     if (!validateHost(req, res) || !validateOrigin(req, res)) return;
-    if (active >= 128) {
-      json(res, 503, { error: 'SERVER_BUSY' });
-      return;
-    }
-    active++;
+    let admitted = false;
     try {
       const requestUrl = URL.parse(req.url ?? '/', url);
       ensure(requestUrl, 'INVALID_INPUT', 'Invalid HTTP request target.');
@@ -95,11 +106,19 @@ export function createHttpServer(app: Application, config: HttpConfig) {
         return;
       }
       if (req.method === 'GET' && path === '/readyz') {
+        if (readiness >= 8) {
+          json(res, 503, { status: 'not_ready' });
+          return;
+        }
+        readiness++;
         try {
-          await Promise.all([app.storage.health(), app.searchAdapter.health()]);
-          json(res, 200, { status: 'ready' });
+          const checks = await Promise.allSettled([app.storage.health(), app.searchAdapter.health()]);
+          const ready = checks.every((check) => check.status === 'fulfilled');
+          json(res, ready ? 200 : 503, { status: ready ? 'ready' : 'not_ready' });
         } catch {
           json(res, 503, { status: 'not_ready' });
+        } finally {
+          readiness--;
         }
         return;
       }
@@ -120,6 +139,12 @@ export function createHttpServer(app: Application, config: HttpConfig) {
         json(res, 404, { error: 'NOT_FOUND' });
         return;
       }
+      if (active >= 128) {
+        json(res, 503, { error: 'SERVER_BUSY' });
+        return;
+      }
+      admitted = true;
+      active++;
       const principal = await config.authenticate(req.headers.authorization);
       if (path === '/metrics') {
         ensure(req.method === 'GET', 'INVALID_INPUT', 'Metrics require GET.');
@@ -160,13 +185,19 @@ export function createHttpServer(app: Application, config: HttpConfig) {
         'Content-Type must be application/json.',
       );
       const parsed = await body(req);
-      const mcp = createMcpServer(app, principal, profile);
+      if (res.destroyed) return;
+      const disconnect = new AbortController();
+      const mcp = createMcpServer(app, principal, profile, {
+        signal: disconnect.signal,
+        beginRunWait: () => beginRunWait(principal.actorId),
+      });
       const transport = new NodeStreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
       });
       res.once('close', () => {
-        void mcp.close();
+        disconnect.abort();
+        void mcp.close().catch(() => {});
       });
       await mcp.connect(
         config.profiler?.wrapTransport(transport, {
@@ -177,6 +208,7 @@ export function createHttpServer(app: Application, config: HttpConfig) {
       );
       await transport.handleRequest(req, res, parsed);
     } catch (error) {
+      if (res.destroyed) return;
       if (res.headersSent) {
         res.end();
         return;
@@ -200,7 +232,7 @@ export function createHttpServer(app: Application, config: HttpConfig) {
         );
       json(res, status, { error: safe.code, message: safe.message });
     } finally {
-      active--;
+      if (admitted) active--;
     }
   });
   server.requestTimeout = 20000;

@@ -94,6 +94,7 @@ export interface ApplicationOptions {
   executionStatus?: ExecutionStatusProvider;
 }
 const LEASE_MS = 600_000;
+const SUBMISSION_HISTORY_BYTES = 1024 * 1024;
 const resumeChangeTypes = ['ticket.updated', 'ticket.invalidated', 'ticket.transitioned', 'ticket.linked'];
 const artifactPinWriters = new Set<Operation>([
   'milestone_create',
@@ -535,6 +536,30 @@ export class Application {
     ticket.updated_at = this.timestamp();
     await tx.put('tickets', ticket);
   }
+  private async pinSharedArtifacts(tx: Transaction, project: Project, actor: Actor, content: string) {
+    const references = new Set(
+      content.match(/\bexecution:[0-9a-f-]{36}:[0-9a-f-]{36}:(?:stdout|stderr|result)(?![\w:-])/g),
+    );
+    for (const artifactId of references) {
+      const identity = artifactIdentity.exec(artifactId);
+      if (!identity) continue;
+      const run = await tx.get('execution_jobs', identity[1]!);
+      if (!run || run.project_id === project.id || !run.artifacts.includes(artifactId)) continue;
+      if (!actor.system_admin && !(await tx.get('members', `${run.project_id}:${actor.id}`))) continue;
+      const attempt = await tx.get('execution_attempts', identity[2]!);
+      if (attempt?.project_id !== run.project_id || attempt.run_id !== run.id) continue;
+      ensure(
+        !(await tx.get('artifact_retirements', artifactId)),
+        'ARTIFACT_RETIRED',
+        'Referenced execution log has been retired; retrieve current evidence.',
+      );
+      const previous = await tx.find('events', {
+        where: { project_id: project.id, type: 'artifact.reference_pinned', entity_id: artifactId },
+        limit: 1,
+      });
+      if (!previous.length) await this.event(tx, project, actor, 'artifact.reference_pinned', artifactId);
+    }
+  }
   private async scoped(
     actorId: string,
     operation: Operation,
@@ -664,26 +689,28 @@ export class Application {
         }
       }
       if (this.storage.artifactRetention && artifactPinWriters.has(operation)) {
+        const content = JSON.stringify({
+          ...input,
+          project_id: undefined,
+          ticket_id: undefined,
+          claim_token: undefined,
+          idempotency_key: undefined,
+          expected_revision: undefined,
+          knowledge_id: undefined,
+        }).toLowerCase();
         const ids = [
-          ...new Set(
-            JSON.stringify({
-              ...input,
-              project_id: undefined,
-              ticket_id: undefined,
-              claim_token: undefined,
-              idempotency_key: undefined,
-              expected_revision: undefined,
-              knowledge_id: undefined,
-            })
-              .toLowerCase()
-              .match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g) ?? [],
-          ),
+          ...new Set(content.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g) ?? []),
         ];
         ensure(ids.length <= 1000, 'INVALID_INPUT', 'Too many artifact reference identities.');
-        if (ids.length)
+        if (project && ids.length)
           for (const field of ['run_id', 'attempt_id'] as const)
             ensure(
-              !(await tx.find('artifact_retirements', { where: { [field]: { in: ids } }, limit: 1 })).length,
+              !(
+                await tx.find('artifact_retirements', {
+                  where: { project_id: project.id, [field]: { in: ids } },
+                  limit: 1,
+                })
+              ).length,
               'ARTIFACT_RETIRED',
               'Referenced execution logs have been retired; retrieve current evidence.',
             );
@@ -693,13 +720,18 @@ export class Application {
               ensure(
                 !(
                   await tx.find('artifact_retirements', {
-                    where: { [source.kind === 'ticket' ? 'ticket_id' : 'checkpoint_id']: source.id },
+                    where: {
+                      project_id: input.project_id!,
+                      [source.kind === 'ticket' ? 'ticket_id' : 'checkpoint_id']: source.id,
+                    },
                     limit: 1,
                   })
                 ).length,
                 'ARTIFACT_RETIRED',
                 'Memory sources cannot pin retired execution logs.',
               );
+        if (project && content.includes('execution:'))
+          await this.pinSharedArtifacts(tx, project, actor, content);
       }
       const result = this.result(operation, await work(tx, project!, actor));
       if (operation === 'work_claim' || operation === 'spike_claim') {
@@ -1442,6 +1474,8 @@ export class Application {
       if (previous) return previous;
       ensure(
         !(await tx.artifactPinned!({
+          project_id: projectId,
+          artifact_id: artifactId,
           run_id: state.run.id,
           attempt_id: identity[2]!,
           ticket_id: state.run.ticket_id,
@@ -1484,6 +1518,8 @@ export class Application {
       const state = await inspect(tx);
       ensure(
         !(await tx.artifactPinned!({
+          project_id: projectId,
+          artifact_id: artifactId,
           run_id: state.run.id,
           attempt_id: identity[2]!,
           ticket_id: state.run.ticket_id,
@@ -1636,7 +1672,12 @@ export class Application {
         if (ids.length)
           for (const field of ['run_id', 'attempt_id'] as const)
             ensure(
-              !(await tx.find('artifact_retirements', { where: { [field]: { in: ids } }, limit: 1 })).length,
+              !(
+                await tx.find('artifact_retirements', {
+                  where: { project_id: projectId, [field]: { in: ids } },
+                  limit: 1,
+                })
+              ).length,
               'ARTIFACT_RETIRED',
               'Reconciliation evidence cannot cite retired execution logs.',
             );
@@ -3246,6 +3287,7 @@ export class Application {
     raw: unknown,
     viewerProfile?: McpProfile,
     bindContext = false,
+    signal?: AbortSignal,
   ): Promise<unknown> {
     const started = performance.now();
     this.metrics.requests++;
@@ -3267,7 +3309,7 @@ export class Application {
       if (readOperations.has(operation))
         return this.result(
           operation,
-          await this.read(actorId, operation, result.data, viewerProfile, bindContext),
+          await this.read(actorId, operation, result.data, viewerProfile, bindContext, signal),
         );
       return await this.dispatch(actorId, operation, result.data);
     } catch (error) {
@@ -4574,6 +4616,8 @@ export class Application {
       'Storage must check expired artifact pins.',
     );
     const pinned = await transaction.artifactPinned({
+      project_id: projectId,
+      artifact_id: artifactId,
       run_id: run.id,
       attempt_id: attempt.id,
       ticket_id: run.ticket_id,
@@ -4713,6 +4757,7 @@ export class Application {
     input: any,
     viewerProfile?: McpProfile,
     bindContext = false,
+    signal?: AbortSignal,
   ): Promise<unknown> {
     if (operation === 'milestone_list' || operation === 'milestone_get')
       return this.storage.readSnapshot(async (reader) => {
@@ -4727,6 +4772,7 @@ export class Application {
     if (operation === 'run_wait') {
       const deadline = performance.now() + input.timeout_ms;
       for (;;) {
+        signal?.throwIfAborted();
         const result = (await this.read(actorId, 'run_get', input, viewerProfile, bindContext)) as {
           run: { status: string };
           reconciliation: { state: string };
@@ -4738,7 +4784,7 @@ export class Application {
           remaining <= 0
         )
           return result;
-        await delay(Math.min(250, remaining));
+        await delay(Math.min(250, remaining), undefined, { signal });
       }
     }
     if (operation === 'knowledge_shared_list')
@@ -5105,7 +5151,7 @@ export class Application {
         };
       }
       case 'ticket_history': {
-        if (['checkpoints', 'executions', 'changes'].includes(input.kind))
+        if (['checkpoints', 'executions', 'changes', 'submissions'].includes(input.kind))
           return this.storage.readSnapshot(async (reader) => {
             await this.access(reader, await this.actor(actorId, reader), project.id);
             return this.ticketHistory(reader, project, input);
@@ -5394,6 +5440,61 @@ export class Application {
   }
   private async ticketHistory(reader: Reader, project: Project, input: Input<'ticket_history'>) {
     const ticket = await this.ticket(reader, project.id, input.ticket_id);
+    if (input.kind === 'submissions') {
+      const read = async (offset: number) =>
+        (
+          await reader.find('submissions', {
+            where: {
+              project_id: project.id,
+              ticket_id: ticket.id,
+              ...(input.item_id ? { id: input.item_id } : {}),
+            },
+            order: [
+              { field: 'ticket_revision', direction: 'desc' },
+              { field: 'id', direction: 'desc' },
+            ],
+            offset,
+            limit: 1,
+          })
+        )[0];
+      const items: Submission[] = [];
+      let bytes = 256;
+      let offset = input.offset;
+      for (; items.length < input.limit; offset++) {
+        const row = await read(offset);
+        if (!row) return { items, has_more: false, next_offset: offset };
+        const rowBytes = Buffer.byteLength(JSON.stringify(row)) + 1;
+        if (input.evidence_offset === undefined && bytes + rowBytes <= SUBMISSION_HISTORY_BYTES) {
+          items.push(row);
+          bytes += rowBytes;
+          continue;
+        }
+        if (items.length) return { items, has_more: true, next_offset: offset };
+        const start = input.evidence_offset ?? 0;
+        const evidence: Submission['evidence'] = [];
+        const page = { ...row, evidence };
+        bytes += Buffer.byteLength(JSON.stringify(page));
+        for (const item of row.evidence.slice(start)) {
+          const size = Buffer.byteLength(JSON.stringify(item)) + 1;
+          if (bytes + size > SUBMISSION_HISTORY_BYTES) break;
+          evidence.push(item);
+          bytes += size;
+        }
+        ensure(
+          start >= row.evidence.length || evidence.length > 0,
+          'RESPONSE_TOO_LARGE',
+          'Evidence item exceeds the submission history budget.',
+        );
+        const next = start + evidence.length;
+        return {
+          items: [page],
+          has_more: !input.item_id && !!(await read(offset + 1)),
+          next_offset: offset + 1,
+          ...(next < row.evidence.length ? { next_evidence_offset: next } : {}),
+        };
+      }
+      return { items, has_more: !input.item_id && !!(await read(offset)), next_offset: offset };
+    }
     if (['checkpoints', 'executions', 'changes'].includes(input.kind)) {
       const pageInput = { limit: input.limit + 1, offset: input.offset };
       const where = { project_id: project.id, ...(input.item_id ? { id: input.item_id } : {}) };
@@ -5458,7 +5559,7 @@ export class Application {
         items: await reader.unansweredQuestions(project.id, ticket.id, false, input.limit, input.offset),
       };
     return {
-      items: await reader.find(input.kind as 'notes' | 'submissions' | 'reviews', {
+      items: await reader.find(input.kind as 'notes' | 'reviews', {
         where: {
           project_id: project.id,
           ticket_id: ticket.id,

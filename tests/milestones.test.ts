@@ -8,7 +8,14 @@ import { createSqliteAdapters } from '../src/adapters/sqlite.js';
 import { registerMilestoneContractTests } from '../src/testing/milestone-contracts.js';
 
 it('keeps artifact pin SQL compatible with absent optional milestone tables', () => {
-  const query = { run_id: 'run', attempt_id: 'attempt', ticket_id: 'ticket', checkpoint_id: 'checkpoint' };
+  const query = {
+    project_id: 'project',
+    artifact_id: 'artifact',
+    run_id: 'run',
+    attempt_id: 'attempt',
+    ticket_id: 'ticket',
+    checkpoint_id: 'checkpoint',
+  };
   assert.ok(!artifactPinSql(query, () => '?').includes('milestones'));
   assert.ok(artifactPinSql(query, () => '?', ['milestones']).includes('FROM milestones'));
   assert.ok(!artifactPinSql(query, () => '?', ['injected_table']).includes('injected_table'));

@@ -320,6 +320,8 @@ export interface ArtifactRetirement {
   file_identity: string;
 }
 export interface ArtifactPinQuery {
+  project_id: string;
+  artifact_id: string;
   run_id: string;
   attempt_id: string;
   ticket_id: string;

@@ -9,6 +9,58 @@ import { countReferenceTokens } from '../tokens.js';
 import { fixture, type ContractAdapters } from './contracts.js';
 
 export function registerReviewerPacketContracts(name: string, factory: () => Promise<ContractAdapters>) {
+  it(`${name} submission history bounds pages and resumes large evidence by exact submission ID`, async () => {
+    const adapters = await factory();
+    try {
+      await adapters.storage.migrate();
+      const f = await fixture(adapters);
+      const ticket = await f.ticket();
+      const claim = await f.claim(ticket.id);
+      const submitted = await f.submit(ticket.id, claim.claim.token);
+      const submission = (await f.storage.get('submissions', submitted.submission.id))!;
+      const evidence = Array.from({ length: 40 }, (_, part) => ({
+        ...submission.evidence[0]!,
+        references: Array.from(
+          { length: 16 },
+          (_, index) => `Report ${part}/${index} ${'measurement '.repeat(145)}`,
+        ),
+      }));
+      const large = {
+        ...submission,
+        id: randomUUID(),
+        ticket_revision: submission.ticket_revision + 1,
+        evidence,
+      };
+      await f.storage.transaction(f.project.id, (tx) => tx.put('submissions', large));
+      const history = (input: Record<string, unknown> = {}) =>
+        f.app.execute(f.reviewer.id, 'ticket_history', {
+          project_id: f.project.id,
+          ticket_id: ticket.id,
+          kind: 'submissions',
+          limit: 100,
+          ...input,
+        }) as Promise<{
+          items: (typeof large)[];
+          has_more: boolean;
+          next_offset: number;
+          next_evidence_offset?: number;
+        }>;
+      const first = await history();
+      assert.equal(first.items.length, 1);
+      assert.equal(first.items[0]!.id, large.id);
+      assert.ok(first.has_more);
+      assert.ok(first.next_evidence_offset);
+      const second = await history({ item_id: large.id, evidence_offset: first.next_evidence_offset });
+      assert.equal(second.items[0]!.id, large.id);
+      assert.equal(second.next_evidence_offset, undefined);
+      assert.deepEqual([...first.items[0]!.evidence, ...second.items[0]!.evidence], evidence);
+      assert.equal((await history({ offset: first.next_offset })).items[0]!.id, submission.id);
+      for (const page of [first, second]) assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 1024 * 1024);
+    } finally {
+      await adapters.dispose?.();
+    }
+  });
+
   it(`${name} reviewer packets: delivers fresh evidence and executable omissions through an independent SDK client`, async () => {
     const adapters = await factory();
     await adapters.storage.migrate();

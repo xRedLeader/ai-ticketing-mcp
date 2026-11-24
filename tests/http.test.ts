@@ -1,9 +1,74 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { Application } from '../src/application.js';
 import { createHttpServer } from '../src/http.js';
 import { createAuthenticator } from '../src/auth.js';
 import type { StorageAdapter } from '../src/contracts.js';
+
+it('bounds HTTP run waits per actor and releases a disconnected wait', async () => {
+  const entered = [
+    Promise.withResolvers<void>(),
+    Promise.withResolvers<void>(),
+    Promise.withResolvers<void>(),
+  ];
+  const stopped = Promise.withResolvers<void>();
+  let started = 0;
+  const app = {
+    storage: { async health() {} },
+    searchAdapter: { async health() {} },
+    async execute(...args: unknown[]) {
+      const slot = started++;
+      entered[slot]!.resolve();
+      try {
+        await delay(10_000, undefined, { signal: args[5] as AbortSignal });
+      } finally {
+        if (slot === 0) stopped.resolve();
+      }
+    },
+  } as unknown as Application;
+  const server = createHttpServer(app, {
+    publicUrl: 'http://127.0.0.1',
+    issuer: 'https://login.acme.org',
+    authenticate: async () => ({ actorId: 'reader', scopes: new Set(['ticketing:read']) }),
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const controllers = Array.from({ length: 3 }, () => new AbortController());
+  const wait = (id: number, signal?: AbortSignal) =>
+    fetch(`${url}/mcp?profile=executor`, {
+      method: 'POST',
+      headers: { Accept: 'application/json, text/event-stream', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id,
+        method: 'tools/call',
+        params: { name: 'run_wait', arguments: { project_id: randomUUID(), run_id: randomUUID() } },
+      }),
+      signal,
+    });
+  const outstanding: Promise<unknown>[] = [];
+  try {
+    outstanding.push(wait(1, controllers[0]!.signal).catch(() => {}));
+    await entered[0]!.promise;
+    outstanding.push(wait(2, controllers[1]!.signal).catch(() => {}));
+    await entered[1]!.promise;
+    const denied = await (await wait(3)).json();
+    assert.equal(denied.result.structuredContent.error.code, 'SERVER_BUSY');
+    for (const route of ['healthz', 'readyz']) assert.equal((await fetch(`${url}/${route}`)).status, 200);
+    controllers[0]!.abort();
+    await stopped.promise;
+    outstanding.push(wait(4, controllers[2]!.signal).catch(() => {}));
+    await entered[2]!.promise;
+    assert.equal(started, 3);
+  } finally {
+    for (const controller of controllers) controller.abort();
+    await Promise.allSettled(outstanding);
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
 
 it('returns a bad request when URL parsing fails and still serves health checks', async (t) => {
   const server = createHttpServer({} as Application, {

@@ -10,6 +10,7 @@ export function artifactPinSql(
     ids.map((id) => `LOWER(${expression}) LIKE ${bind(`%${id}%`)}`).join(' OR ');
   const checks = [
     `EXISTS(SELECT 1 FROM tickets WHERE id=${bind(query.ticket_id)} AND status NOT IN ('done','cancelled'))`,
+    `EXISTS(SELECT 1 FROM events WHERE type='artifact.reference_pinned' AND entity_id=${bind(query.artifact_id)})`,
     ...[
       ['projects', 'instructions'],
       ...(tables.includes('ideas')
@@ -35,13 +36,16 @@ export function artifactPinSql(
         'knowledge_revisions',
         "title || body || CAST(verification AS TEXT) || COALESCE(CAST(fact AS TEXT),'')",
       ],
-    ].map(([table, expression]) => `EXISTS(SELECT 1 FROM ${table} WHERE ${contains(expression!)})`),
+    ].map(
+      ([table, expression]) =>
+        `EXISTS(SELECT 1 FROM ${table} WHERE ${table === 'projects' ? 'id' : 'project_id'}=${bind(query.project_id)} AND (${contains(expression!)}))`,
+    ),
     ...['knowledge', 'knowledge_revisions'].map(
       (table) =>
-        `EXISTS(SELECT 1 FROM ${table} WHERE ${contains('CAST(sources AS TEXT)', [query.ticket_id, query.checkpoint_id])})`,
+        `EXISTS(SELECT 1 FROM ${table} WHERE project_id=${bind(query.project_id)} AND (${contains('CAST(sources AS TEXT)', [query.ticket_id, query.checkpoint_id])}))`,
     ),
-    `EXISTS(SELECT 1 FROM receipts WHERE operation NOT IN ('run_submit','run_cancel') AND (${contains('CAST(result AS TEXT)')}))`,
-    `EXISTS(SELECT 1 FROM events WHERE type NOT LIKE 'run.%' AND type NOT LIKE 'artifact.%' AND (${contains('CAST(data AS TEXT)')}))`,
+    `EXISTS(SELECT 1 FROM receipts WHERE project_id=${bind(query.project_id)} AND operation NOT IN ('run_submit','run_cancel') AND (${contains('CAST(result AS TEXT)')}))`,
+    `EXISTS(SELECT 1 FROM events WHERE project_id=${bind(query.project_id)} AND type NOT LIKE 'run.%' AND type NOT LIKE 'artifact.%' AND (${contains('CAST(data AS TEXT)')}))`,
   ];
   return `SELECT ${checks.join(' OR ')} AS pinned`;
 }

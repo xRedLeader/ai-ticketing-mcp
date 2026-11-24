@@ -1,6 +1,7 @@
 services:
   app:
     environment:
+      MCP_PROFILE_CAPTURE: ${PRODUCTION_MCP_PROFILE_CAPTURE:-false}
       PUBLIC_URL: ${PUBLIC_URL:?Set the public HTTPS origin}
       OAUTH_ISSUER: ${OAUTH_ISSUER:?Set the exact public realm issuer}
       OAUTH_AUDIENCE: ${OAUTH_AUDIENCE:?Set the exact public MCP resource URL}

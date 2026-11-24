@@ -58,6 +58,7 @@ export function createRuntime(env: NodeJS.ProcessEnv = process.env) {
       model: env.EMBEDDING_MODEL ?? 'nomic-embed-text',
       dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 768),
       apiKey: env.EMBEDDING_API_KEY,
+      allowLocalOllamaHttp: env.EMBEDDING_ALLOW_LOCAL_OLLAMA_HTTP === 'true',
       revision: env.EMBEDDING_REVISION ?? '1',
       spaceId: env.EMBEDDING_SPACE_ID?.trim() || undefined,
       timeoutMs: Number(env.EMBEDDING_TIMEOUT_MS ?? 30000),

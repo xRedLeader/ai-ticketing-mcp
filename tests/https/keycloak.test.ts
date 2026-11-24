@@ -54,6 +54,8 @@ it(
           windowsHide: true,
           env: {
             ...process.env,
+            MCP_PROFILE_CAPTURE: 'true',
+            PRODUCTION_MCP_PROFILE_CAPTURE: 'false',
             ...env,
           },
         },
@@ -62,6 +64,7 @@ it(
       assert.equal(keycloak.image, 'quay.io/keycloak/keycloak:26.4.7');
       assert.equal(app.environment.OAUTH_JWKS_URL, env.OAUTH_JWKS_URL);
       assert.equal(app.environment.OAUTH_ALLOW_LOCAL_KEYCLOAK_JWKS, 'false');
+      assert.equal(app.environment.MCP_PROFILE_CAPTURE, 'false');
       assert.ok(proxy.networks.default.aliases.includes(env.LOGIN_DOMAIN));
       // Compose escapes dollars when serializing a reusable configuration.
       const [entrypoint, ...entrypointArgs] = (keycloak.entrypoint as string[]).map((value) =>

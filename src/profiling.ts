@@ -1,4 +1,4 @@
-import { mkdir, open, rename, unlink, writeFile, type FileHandle } from 'node:fs/promises';
+import { mkdir, open, readdir, rename, rmdir, unlink, writeFile, type FileHandle } from 'node:fs/promises';
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
@@ -80,6 +80,21 @@ const defaults: ProfileLimits = {
   max_files: 8,
   max_queue_bytes: 16 * 1024 * 1024,
 };
+const managedRun = /^run-\d+-\d+-[0-9a-f-]{36}$/;
+const manifestBytes = 256 * 1024;
+function diskReservation(fileBytes: number, files: number) {
+  const bytes = fileBytes * files + 2 * manifestBytes;
+  if (
+    !Number.isSafeInteger(fileBytes) ||
+    fileBytes <= 0 ||
+    !Number.isSafeInteger(files) ||
+    files <= 0 ||
+    files > 128 ||
+    !Number.isSafeInteger(bytes)
+  )
+    throw new Error('INVALID_LIMITS');
+  return bytes;
+}
 type Queued = { bytes: Buffer; seq: number; message: boolean };
 class Recorder implements ProfileRecorder {
   readonly runDirectory: string;
@@ -380,4 +395,42 @@ export async function createProfileRecorder(options: ProfileOptions): Promise<Pr
   const recorder = new Recorder(options);
   await recorder.initialize();
   return recorder;
+}
+
+/** Reserve a whole run so simultaneous CLI processes cannot overbook the shared capture directory. */
+export async function createManagedProfileRecorder(
+  options: ProfileOptions,
+  maxRetainedBytes: number,
+): Promise<ProfileRecorder> {
+  const root = resolve(options.directory);
+  const lock = join(root, '.capture-admission');
+  let bytes = diskReservation(
+    options.maxFileBytes ?? defaults.max_file_bytes,
+    options.maxFiles ?? defaults.max_files,
+  );
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  await mkdir(lock, { mode: 0o700 });
+  try {
+    for (const entry of await readdir(root, { withFileTypes: true })) {
+      if (!managedRun.test(entry.name)) continue;
+      if (!entry.isDirectory()) throw new Error('INVALID_CAPTURE_DIRECTORY');
+      const file = await open(
+        join(root, entry.name, 'run.json'),
+        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0),
+      );
+      try {
+        const stat = await file.stat();
+        if (!stat.isFile() || stat.size > manifestBytes) throw new Error('INVALID_CAPTURE_MANIFEST');
+        const { limits } = JSON.parse(await file.readFile('utf8')) as ProfileRun;
+        bytes += diskReservation(limits.max_file_bytes, limits.max_files);
+      } finally {
+        await file.close();
+      }
+      if (bytes > maxRetainedBytes) throw new Error('CAPTURE_QUOTA');
+    }
+    if (bytes > maxRetainedBytes) throw new Error('CAPTURE_QUOTA');
+    return await createProfileRecorder(options);
+  } finally {
+    await rmdir(lock);
+  }
 }
