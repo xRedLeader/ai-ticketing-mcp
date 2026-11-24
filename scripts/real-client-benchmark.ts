@@ -11,6 +11,7 @@ import { once } from 'node:events';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { countReferenceTokens } from '../src/tokens.js';
+import { serializeSuccessEnvelope } from '../src/envelope.js';
 import {
   parseCodexInvocation,
   validateRole,
@@ -20,6 +21,13 @@ import {
   parsePartialMaintenanceLedger,
   type ExpectedWorkflow,
 } from './real-client-observation.js';
+import {
+  benchmarkPromptParts,
+  createPromptLayout,
+  discoverPromptCatalog,
+  prefixCacheObservation,
+  PROMPT_LAYOUT,
+} from './real-client-prefix.js';
 
 assert.equal(Number(process.versions.node.split('.')[0]), 24, 'Use Node 24.');
 const { values } = parseArgs({
@@ -52,7 +60,7 @@ const timeout = Number(values['timeout-seconds']) * 1000;
 assert.ok(Number.isSafeInteger(timeout) && timeout > 0);
 const measurementSourceHashes = Object.fromEntries(
   await Promise.all(
-    ['real-client-benchmark.ts', 'real-client-observation.ts'].map(async (name) => [
+    ['real-client-benchmark.ts', 'real-client-observation.ts', 'real-client-prefix.ts'].map(async (name) => [
       name,
       createHash('sha256')
         .update(await readFile(join(repo, 'scripts', name)))
@@ -78,10 +86,17 @@ async function recover(directory: string, role: string, failure: string) {
     stdout = await readFile(join(directory, `${role}.jsonl`), 'utf8');
   } catch {}
   const observation = parseCodexInvocation(stdout, null);
+  let layout = null;
+  try {
+    layout =
+      JSON.parse(await readFile(join(directory, `${role}-request.json`), 'utf8')).prompt_layout ?? null;
+  } catch {}
   return {
     consumer: 'model',
     role,
     ...observation,
+    prompt_layout: layout,
+    prefix_cache_observation: prefixCacheObservation(observation.usage),
     success: false,
     interrupted: true,
     errors: [...observation.errors, failure],
@@ -198,6 +213,7 @@ if (values.resume) {
       .update(await readFile(join(root, 'server.mjs')))
       .digest('hex'),
     scenario_contract_sha256: contractHash,
+    prompt_layout: PROMPT_LAYOUT,
     models: { worker: values.model ?? 'gpt-6.1-sol', reviewer: values['reviewer-model'] ?? 'gpt-6-astra' },
     effort: values.effort ?? 'xhigh',
     monetary_cost: { status: 'unavailable', usd: null },
@@ -214,6 +230,8 @@ if (values.resume) {
         'Per-invocation on-request approval routes through auto_review with a read-only sandbox. No tool preapproval or machine policy changes. Approval-review usage is not separately exposed by this CLI and remains unknown.',
       runtime:
         'Production code and migrations copied together from the explicit stable build; hashes verified on resume.',
+      prompt_prefix:
+        'Harness-owned role instructions and same-role SDK policy/catalog hashes precede changing task/current authority. Native Codex ordering and provider cache keys are unobserved; layout alone establishes no savings. SDK discovery is not model fact delivery.',
       evidence:
         'Synthetic coordination evidence; no claim of implementation-quality or external URL verification.',
     },
@@ -343,19 +361,6 @@ async function seed(directory: string, workflow: any) {
     } as ExpectedWorkflow,
   };
 }
-function prompt(role: 'worker' | 'reviewer', workflow: any) {
-  const common = `This is a synthetic coordination benchmark. Use ONLY the ai-ticketing MCP tools. Do not use filesystem, shell, plugins, web, or other servers. Discover the project named ${JSON.stringify(contract.project.name)} through MCP. Never infer requirements, IDs, decisions, permissions, or submission evidence from this prompt. Read them from actual MCP responses. Follow every required omission reference. Use fresh idempotency keys for logical mutations, retaining a key only for an identical retry. Do not edit repository code. `;
-  if (role === 'reviewer')
-    return (
-      common +
-      'Find the in-review ticket. Read complete current requirements, instructions, policy, blockers, dependencies, and the exact latest submission evidence through MCP before reviewing. Independently check internal consistency and criterion coverage of this synthetic prepared evidence; approve if all current criteria have passing evidence and a reference. In review feedback quote every actual criterion ID and every submitted evidence reference you checked. Do not claim or resubmit the ticket. Finish only after a successful ticket_review.'
-    );
-  return (
-    common +
-    `Read complete current requirements, project instructions/policy, blockers/dependencies and prior checkpoint decisions before progress. ${workflow.blocking ? 'Initially a prerequisite and blocking question prevent claims: observe the rejected claim, read both blockers, and answer the actual blocking question. The external fixture then completes the prerequisite; claim again. ' : ''}Claim work atomically. A separate observed SDK sidecar handles two virtual heartbeat/change intervals outside model turns; do not call routine maintenance tools or wait real minutes. ${workflow.change ? 'After the first claim, deliberately attempt one checkpoint using that initial token. The fixture coordinates the first background interval and a requirement change before processing it; observe CLAIM_EXPIRED. Then reconcile changes, reload current requirements, and reclaim with a fresh key; the sidecar handles the second interval with the new token. ' : ''}Persist one successful checkpoint. In its progress quote the last sentence of the current description and the first sentence of the project instructions; include approval_policy=POLICY. Copy all prior checkpoint decisions verbatim into its decisions array when resuming. Submit passing evidence for every CURRENT received criterion using the latest returned revision. Use the synthetic prepared evidence reference https://example.test/access-check-evidence and summarize authorized-owner and rejected-outsider outcomes; do not fetch the URL. ${workflow.review ? 'Stop at in_review for a separate reviewer.' : 'Stop only when the self-policy submission returns done.'} Report the final ticket key/status and any failures concisely.`
-  );
-}
-
 async function maintenance(directory: string, seeded: any) {
   const statePath = join(directory, 'maintenance-state.json');
   let completed = 0;
@@ -606,7 +611,6 @@ async function maintenance(directory: string, seeded: any) {
 }
 async function invoke(role: 'worker' | 'reviewer', workflow: any, directory: string, seeded: any) {
   const actor = role === 'worker' ? seeded.expected.workerId : seeded.expected.reviewerId;
-  const sidecar = role === 'worker' ? await maintenance(directory, seeded) : undefined;
   const configPath = join(directory, `${role}-fixture.json`);
   await writeFile(
     configPath,
@@ -619,6 +623,47 @@ async function invoke(role: 'worker' | 'reviewer', workflow: any, directory: str
     }),
     { flag: 'wx', mode: 0o600 },
   );
+  const observer = new Client({ name: 'observed-prefix-discovery', version: '1.0.0' });
+  let discovery: Awaited<ReturnType<typeof discoverPromptCatalog>>;
+  try {
+    await observer.connect(
+      new StdioClientTransport({
+        command: process.execPath,
+        args: [join(root, 'server.mjs')],
+        cwd: repo,
+        env: Object.fromEntries(
+          Object.entries({
+            ...process.env,
+            MCP_BENCH_FIXTURE: configPath,
+            ACTOR_ID: actor,
+            STORAGE_ADAPTER: 'sqlite',
+            SQLITE_PATH: seeded.config.database,
+            EMBEDDING_PROVIDER: 'none',
+          }).filter(([, value]) => value !== undefined),
+        ) as Record<string, string>,
+        stderr: 'pipe',
+      }),
+    );
+    discovery = await discoverPromptCatalog(observer);
+  } finally {
+    await observer.close();
+  }
+  const layout = createPromptLayout({
+    role,
+    ...benchmarkPromptParts(role, workflow, contract.project.name),
+    ...discovery,
+    authority: {
+      actor_id: actor,
+      project_id: seeded.config.projectId,
+      profile: role,
+      session_id: randomUUID(),
+      runtime_sha256: createHash('sha256')
+        .update(serializeSuccessEnvelope(manifest.runtime_hashes))
+        .digest('hex'),
+      contract_sha256: contractHash,
+    },
+  });
+  const sidecar = role === 'worker' ? await maintenance(directory, seeded) : undefined;
   const cwd = await mkdtemp(join(tmpdir(), 'ticketing-model-client-'));
   const args = codexArguments({
     model: manifest.models[role],
@@ -637,7 +682,8 @@ async function invoke(role: 'worker' | 'reviewer', workflow: any, directory: str
         requested_model: manifest.models[role],
         reasoning_effort: manifest.effort,
         arguments: args,
-        prompt: prompt(role, workflow),
+        prompt: layout.prompt,
+        prompt_layout: layout.provenance,
         cwd,
       },
       null,
@@ -677,7 +723,7 @@ async function invoke(role: 'worker' | 'reviewer', workflow: any, directory: str
   child.stdout.pipe(out);
   child.stderr.pipe(err);
   child.stdin.on('error', () => {});
-  child.stdin.end(prompt(role, workflow));
+  child.stdin.end(layout.prompt);
   const timer = setTimeout(() => {
     timedOut = true;
     child.kill();
@@ -729,6 +775,8 @@ async function invoke(role: 'worker' | 'reviewer', workflow: any, directory: str
     model_requested: manifest.models[role],
     model_reported: null,
     reasoning_effort: manifest.effort,
+    prompt_layout: layout.provenance,
+    prefix_cache_observation: prefixCacheObservation(observation.usage),
     elapsed_ms: Math.round(performance.now() - started),
     exit_code: exitCode,
     timed_out: timedOut,
