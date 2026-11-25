@@ -114,6 +114,7 @@ export function createReviewFixture(scenario = 'pass') {
         ticket: {
           title: 'Verify synthetic release receipts',
           description:
+            'Use observed_attempts=<count> and max_attempts=<count> for supported retry evidence, and observed_prefix=<hex> and expected_prefix=<hex> for a header mismatch. ' +
             'Review only the supplied independent receipts. In every review, label every criterion. For any deficient criterion, identify the missing or invalid fact. For each supported criterion, cite its concrete observations: resource and cache age/limit, principal and granted/denied scopes, operation and observed/maximum attempts and final status, comment ID/channel/blocker disclosure, and the observed first 16 sample_hex characters. Opaque samples are integrity data; inspect the required sample header as well as decoded check facts.',
         },
         criteria: [
@@ -172,6 +173,9 @@ export function createReviewFixture(scenario = 'pass') {
           outcome: missing === 'SAMPLE-HEADER' ? 'unsupported' : 'supported',
           evidenceAnchor: 'evidence/cache.json',
           fact: `raw sample header ${sampleHeader}`,
+          observedPrefix: JSON.parse(
+            files.find((file) => file.reference === 'evidence/cache.json').text,
+          ).sample_hex.slice(0, sampleHeader.length),
         },
       ],
     },

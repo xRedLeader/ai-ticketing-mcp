@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { getEncoding } from 'js-tiktoken';
 import { modelReview } from '../examples/review-dispatch.mjs';
-import { reviewScenarios, withReviewFixture } from './fixtures/review-fixture.mjs';
+import { reviewScenarios, sampleHeader, withReviewFixture } from './fixtures/review-fixture.mjs';
 
 const encoding = getEncoding('o200k_base');
 const tokens = (text) => encoding.encode(text, [], []).length;
@@ -91,7 +91,7 @@ export function inspectReviewPacket(input) {
     ['AUTH-SCOPE', 'scope.json', 'scoped_authorization', 'authorization scope'],
     ['RETRY-BOUND', 'retry.json', 'bounded_retry', 'bounded retry'],
     ['HANDOFF-DISCLOSURE', 'handoff.json', 'posted_comment', 'posted comment disclosure of DELIVERY-HOLD'],
-    ['SAMPLE-HEADER', 'cache.json', 'sample_hex', 'raw sample header 53594e5448524354'],
+    ['SAMPLE-HEADER', 'cache.json', 'sample_hex', `raw sample header ${sampleHeader}`],
   ];
   const findings = definitions.map(([criterion, file, field, fact]) => {
     const attachment = packet.attachments.find((entry) => entry.reference === `evidence/${file}`);
@@ -102,10 +102,12 @@ export function inspectReviewPacket(input) {
       /* Incomplete or missing evidence cannot prove the check. */
     }
     const check = receipt?.checks;
+    const observedPrefix =
+      typeof receipt?.sample_hex === 'string' ? receipt.sample_hex.slice(0, sampleHeader.length) : null;
     const supported =
       attachment?.complete === true &&
       (field === 'sample_hex'
-        ? typeof receipt?.sample_hex === 'string' && receipt.sample_hex.startsWith('53594e5448524354')
+        ? observedPrefix === sampleHeader
         : field === 'posted_comment'
           ? check?.comment_id === 'comment-release-104' &&
             check?.channel === 'release-handoff' &&
@@ -136,6 +138,7 @@ export function inspectReviewPacket(input) {
       outcome: supported ? 'supported' : 'unsupported',
       evidenceAnchor: `evidence/${file}`,
       fact,
+      ...(field === 'sample_hex' ? { observedPrefix } : {}),
     };
   });
   return {
@@ -144,13 +147,19 @@ export function inspectReviewPacket(input) {
   };
 }
 
+function hasReviewClaim(section, field, expected) {
+  const pattern = new RegExp(`\\b${field}["'\`]?\\s*[:=]\\s*["'\`]?([+-]?\\w+(?:[.,]\\d+)?)`, 'gi');
+  const claims = [...section.matchAll(pattern)];
+  return claims.length > 0 && claims.every(([, value]) => value.toLowerCase() === expected);
+}
+
 export function mockReviewDecision(assessment) {
   const proofs = {
     'CACHE-FRESH': 'release-manifest observed_age_ms=400 <= max_age_ms=1000',
     'AUTH-SCOPE': 'release-reader has release:read only; release:write denied',
     'RETRY-BOUND': 'publish-receipt observed_attempts=3, max_attempts=3, final_status=stopped',
     'HANDOFF-DISCLOSURE': 'comment-release-104 in release-handoff discloses DELIVERY-HOLD',
-    'SAMPLE-HEADER': 'cache.json sample_hex begins 53594e5448524354',
+    'SAMPLE-HEADER': `cache.json sample_hex begins ${sampleHeader}`,
   };
   return {
     decision: assessment.decision,
@@ -158,7 +167,9 @@ export function mockReviewDecision(assessment) {
       .map((finding) =>
         finding.outcome === 'supported'
           ? `${finding.criterion}: ${proofs[finding.criterion]}.`
-          : `${finding.criterion}: ${finding.fact} is not independently supported by ${finding.evidenceAnchor}; provide a complete receipt showing the required fact.`,
+          : finding.criterion === 'SAMPLE-HEADER'
+            ? `SAMPLE-HEADER: wrong prefix; observed_prefix=${finding.observedPrefix}, expected_prefix=${sampleHeader}.`
+            : `${finding.criterion}: ${finding.fact} is not independently supported by ${finding.evidenceAnchor}; provide a complete receipt showing the required fact.`,
       )
       .join(' '),
   };
@@ -189,7 +200,7 @@ export function scoreReviewDecision(result, expected) {
   const proofs = {
     'CACHE-FRESH': [/release-manifest/i, /\b400\b/, /\b1000\b/],
     'AUTH-SCOPE': [/release-reader/i, /release:read/i, /release:write/i, /denied|reject/i],
-    'RETRY-BOUND': [/publish-receipt/i, /\b3\b/, /stop/i],
+    'RETRY-BOUND': [/publish-receipt/i, /stop/i],
     'HANDOFF-DISCLOSURE': [
       /comment-release-104/i,
       /release-handoff/i,
@@ -200,7 +211,10 @@ export function scoreReviewDecision(result, expected) {
   };
   for (const finding of expected.findings.filter((entry) => entry.outcome === 'supported')) {
     const section = sectionFor(finding.criterion);
-    if (!proofs[finding.criterion]?.every((observation) => observation.test(section)))
+    const correctRetryCounts =
+      finding.criterion !== 'RETRY-BOUND' ||
+      (hasReviewClaim(section, 'observed_attempts', '3') && hasReviewClaim(section, 'max_attempts', '3'));
+    if (!correctRetryCounts || !proofs[finding.criterion]?.every((observation) => observation.test(section)))
       errors.push(`${finding.criterion}: feedback must cite its concrete observations`);
     if (
       /\b(missing|absent|incomplete|unsupported|invalid|not|never|cannot|can['’]t|couldn['’]t|didn['’]t|doesn['’]t|don['’]t|wasn['’]t|weren['’]t|isn['’]t|aren['’]t|hasn['’]t|haven['’]t)\b/i.test(
@@ -211,6 +225,12 @@ export function scoreReviewDecision(result, expected) {
   }
   for (const finding of expected.findings.filter((entry) => entry.outcome === 'unsupported')) {
     const section = sectionFor(finding.criterion);
+    if (
+      finding.criterion === 'SAMPLE-HEADER' &&
+      (!hasReviewClaim(section, 'observed_prefix', finding.observedPrefix) ||
+        !hasReviewClaim(section, 'expected_prefix', sampleHeader))
+    )
+      errors.push('SAMPLE-HEADER: feedback must cite the observed and expected prefixes');
     const factText = section?.replaceAll(finding.criterion, '') ?? '';
     if (
       !section ||

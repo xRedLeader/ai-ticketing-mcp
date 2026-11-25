@@ -96,7 +96,10 @@ it('rejects the bad header and finalizes only the repaired current submission', 
   const pair = await captureReviewLifecyclePair('wrong-header');
   for (const arm of [pair.baseline, pair.candidate]) {
     assert.equal(arm.stages[0].preflight, false);
-    assert.match(arm.stages[0].feedback, /SAMPLE-HEADER.*not independently supported/);
+    assert.match(
+      arm.stages[0].feedback,
+      /SAMPLE-HEADER: wrong prefix; observed_prefix=e37d5cd68b3d10f2, expected_prefix=53594e5448524354\./,
+    );
     assert.equal(arm.stages[0].requests.length, 1);
     assert.equal(arm.stages[1].requests.length, 1);
     assert.notEqual(arm.stages[0].submission_id, arm.stages[1].submission_id);

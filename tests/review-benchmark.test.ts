@@ -160,6 +160,56 @@ it('requires concrete positive proof in every supported criterion, including the
   );
 });
 
+it('requires the observed and expected prefixes in negative header feedback', () => {
+  const { expected } = createReviewFixture('wrong-header');
+  const decision = mockReviewDecision(expected);
+  const feedbackWith = (header: string) => decision.feedback.replace(/SAMPLE-HEADER:.*$/, header);
+  const observed = 'e37d5cd68b3d10f2';
+  const required = '53594e5448524354';
+  assert.equal(
+    scoreReviewDecision(
+      {
+        ...decision,
+        feedback: feedbackWith(
+          `SAMPLE-HEADER: wrong prefix; observed_prefix=${observed}, expected_prefix=${required}.`,
+        ),
+      },
+      expected,
+    ).pass,
+    true,
+  );
+  for (const header of [
+    'SAMPLE-HEADER: cache.json sample header is wrong.',
+    `SAMPLE-HEADER: wrong prefix; observed_prefix=deadbeefdeadbeef, expected_prefix=${required}.`,
+    `SAMPLE-HEADER: wrong prefix; observed_prefix=${observed}.`,
+    `SAMPLE-HEADER: wrong prefix; observed_prefix=${required}, expected_prefix=${observed}.`,
+    `SAMPLE-HEADER: wrong prefix; observed_prefix=${observed}, expected_prefix=${required}, observed_prefix=deadbeefdeadbeef.`,
+  ]) {
+    assert.equal(
+      scoreReviewDecision({ ...decision, feedback: feedbackWith(header) }, expected).pass,
+      false,
+      header,
+    );
+  }
+});
+
+it('requires both observed and maximum counts in supported retry feedback', () => {
+  const { expected } = createReviewFixture('pass');
+  const decision = mockReviewDecision(expected);
+  assert.equal(scoreReviewDecision(decision, expected).pass, true);
+  for (const counts of [
+    'observed_attempts=7, max_attempts=3',
+    'observed_attempts=3, max_attempts=7',
+    'observed_attempts=3',
+    'max_attempts=3',
+    'observed_attempts=3.5, max_attempts=3',
+    'observed_attempts=3, max_attempts=3, observed_attempts=7',
+  ]) {
+    const feedback = decision.feedback.replace('observed_attempts=3, max_attempts=3', counts);
+    assert.equal(scoreReviewDecision({ ...decision, feedback }, expected).pass, false, counts);
+  }
+});
+
 it('makes the sole wrong-header fact depend on a referenced dictionary chunk in both compact packets', async () => {
   const positive = await captureReviewBenchmarkPair('pass');
   const negative = await captureReviewBenchmarkPair('wrong-header');
