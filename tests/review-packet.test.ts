@@ -7,6 +7,10 @@ import { it } from 'node:test';
 import { getEncoding } from 'js-tiktoken';
 // @ts-expect-error The standalone dispatcher runs directly on Node.
 import { buildReviewInput, modelReview } from '../examples/review-dispatch.mjs';
+// @ts-expect-error standalone offline calibration runs directly on Node.
+import { runChunkBenchmark } from '../scripts/review-chunk-benchmark.mjs';
+// @ts-expect-error internal selector runs directly on Node.
+import { selectCompactReviewInput } from '../examples/review-packet.mjs';
 
 const encoding = getEncoding('o200k_base');
 const countTokens = (input: string) => encoding.encode(input, [], []).length;
@@ -55,7 +59,8 @@ function decode(input: string): string {
         assert.ok(Number.isInteger(part) && Number(part) >= 0);
         assert.ok(Number(part) < envelope.hexChunks.length);
         const chunk = envelope.hexChunks[Number(part)];
-        assert.match(chunk, /^[0-9a-fA-F]{256}$/);
+        assert.match(chunk, /^[0-9a-fA-F]+$/);
+        assert.ok([32, 64, 256].includes(chunk.length));
         return chunk;
       })
       .join('');
@@ -140,6 +145,37 @@ it('retains source strings untouched when JSON is incomplete, malformed, escaped
   }
 });
 
+it('reconstructs a contrary header from its actual shorter dictionary reference after isolated edits', () => {
+  const magic = '53594e5448524354';
+  const shared = magic + hex('edited-header', 8176);
+  const texts = [0, 1, 2, 3].map((index) => {
+    let sample = Array.from({ length: shared.length / 256 }, (_, offset) => {
+      const chunk = shared.slice(offset * 256, (offset + 1) * 256);
+      return chunk.slice(0, 96) + hex(`edited-${index}-${offset}`, 2) + chunk.slice(98);
+    }).join('');
+    if (index === 0) sample = sample.slice(32, 64) + sample.slice(32);
+    return JSON.stringify({ digest: hex(`edited-digest-${index}`, 64), hex: sample });
+  });
+  const input = fixture(texts.map((text, index) => attachment(text, `evidence/header-${index}.json`)));
+  const compact = buildReviewInput(input, 'compact');
+  assert.equal(decode(compact), buildReviewInput(input));
+  const wire = JSON.parse(compact);
+  assert.ok(wire.hexChunks[0].length < 256);
+  const original = JSON.parse(texts[0]!);
+  assert.notEqual(original.hex.slice(0, magic.length), magic);
+  const start = texts[0]!.indexOf('"hex":"') + '"hex":"'.length;
+  let offset = 0;
+  let observedHeader;
+  for (const part of wire.packet.attachments[0].text.parts) {
+    if (offset === start) {
+      assert.equal(typeof part, 'number');
+      observedHeader = wire.hexChunks[part].slice(0, magic.length);
+    }
+    offset += typeof part === 'string' ? part.length : wire.hexChunks[part].length;
+  }
+  assert.equal(observedHeader, original.hex.slice(0, magic.length));
+});
+
 it('fails closed on ambiguous text and bounded-reader violations, and never increases reference tokens', () => {
   const text = `{"payload":"${hex('repeated')}"}`;
   const common = [attachment(text), attachment(text)];
@@ -164,6 +200,8 @@ it('fails closed on ambiguous text and bounded-reader violations, and never incr
     attachments: Array.from({ length: 4 }, () => attachment(`{"hex":"${'a'.repeat(256)}"}`, 'r.json')),
   };
   const full = buildReviewInput(lowTokenInput);
+  for (const sizes of [[0], [-1], [16], [Infinity], [32, 64], [64, 256, 32], [256, , 32], [], null])
+    assert.throws(() => selectCompactReviewInput(full, sizes), /Unsupported review chunk sizes/);
   const compact = buildReviewInput(lowTokenInput, 'compact');
   const envelope = JSON.parse(buildReviewInput(fixture(common), 'compact'));
   const candidate = JSON.stringify({
@@ -198,7 +236,7 @@ it('uses compact only on opt-in while retaining the one-request tool-free adviso
     await writeFile(privateFile, 'private-content-sentinel');
     const input = fixture([]);
     input.submission.evidence[0]!.references = [...paths, privateFile];
-    input.submission.evidence[1]!.references = [];
+    input.submission.evidence[1]!.references = [paths[1]!];
     const requests: Record<string, unknown>[] = [];
     const config = { workspace: directory, evidenceRoot, apiKey: 'header-only-sentinel' };
     const request = async (_url: string, init: RequestInit) => {
@@ -236,5 +274,39 @@ it('uses compact only on opt-in while retaining the one-request tool-free adviso
     await Promise.all([...paths, privateFile].map((path) => rm(path, { force: true })));
     await rmdir(evidenceRoot);
     await rmdir(directory);
+  }
+});
+
+it('calibrates shorter chunks across changed alignment without regressing the original candidate', async () => {
+  const report = await runChunkBenchmark({ repeats: 1 });
+  assert.equal(report.workflows.length, 15);
+  for (const workflow of report.workflows) {
+    const original = workflow.results.find(
+      (result: { chunk_size: number | string }) => result.chunk_size === 256,
+    );
+    const adaptive = workflow.results.find(
+      (result: { chunk_size: number | string }) => result.chunk_size === 'adaptive',
+    );
+    assert.equal(
+      adaptive.tokens,
+      Math.min(...workflow.results.map((result: { tokens: number }) => result.tokens)),
+    );
+    assert.ok(adaptive.tokens <= original.tokens);
+    assert.ok(adaptive.max_chunk_locations_per_pass <= 4096);
+    if (adaptive.tokens === original.tokens) assert.equal(adaptive.bytes, original.bytes);
+  }
+  for (const name of ['shift-32', 'shift-64', 'isolated-edits']) {
+    const workflow = report.workflows.find((entry: { name: string }) => entry.name === name);
+    const original = workflow.results.find(
+      (result: { chunk_size: number | string }) => result.chunk_size === 256,
+    );
+    const adaptive = workflow.results.find(
+      (result: { chunk_size: number | string }) => result.chunk_size === 'adaptive',
+    );
+    assert.ok(adaptive.tokens < original.tokens * 0.6);
+  }
+  for (const name of ['entropy', 'unique-high-entropy', 'low-token-density']) {
+    const workflow = report.workflows.find((entry: { name: string }) => entry.name === name);
+    assert.equal(workflow.results.at(-1).tokens, workflow.full_tokens);
   }
 });

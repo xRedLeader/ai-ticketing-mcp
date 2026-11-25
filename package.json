@@ -37,6 +37,8 @@
     "benchmark": "tsx scripts/benchmark.ts",
     "benchmark:protocol": "tsx scripts/protocol-benchmark.ts",
     "benchmark:review": "node scripts/review-benchmark.mjs",
+    "benchmark:review:chunks": "node scripts/review-chunk-benchmark.mjs",
+    "benchmark:review:lifecycle": "tsx scripts/review-lifecycle.mjs",
     "benchmark:review:live": "node scripts/review-benchmark-live.mjs",
     "benchmark:claims": "tsx scripts/claim-benchmark.ts",
     "profile:report": "tsx src/cli.ts profile-report",
