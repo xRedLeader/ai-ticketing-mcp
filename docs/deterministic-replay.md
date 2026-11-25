@@ -1,8 +1,8 @@
-# Offline deterministic retrieval replay
+# Offline deterministic policy replay
 
 Replay retained real-client benchmark reports without running a client, model, provider, server, or policy activation. Node 24 and the repository's installed dependencies are required:
 
-These traces record retrievals, without the complete eligible queue and capacity state needed to replay alternative schedules; this tool evaluates one retrieval policy and preserves the recorded schedule.
+The client traces contain retrievals and preserve their recorded schedule. Scheduling replay uses a separate frozen queue snapshot.
 
 ```sh
 node --import tsx scripts/deterministic-replay.ts \
@@ -49,3 +49,13 @@ node --import tsx --test tests/deterministic-replay.test.ts
 Fixtures reuse the frozen workflow IDs and real-client invocation parser. They cover exact read reuse, external revision changes, rejected reads, write/unknown-operation barriers, invocation isolation, stale acceptance, self-review, failed and incomplete attempts, unknown usage, per-workflow regressions, exact byte snapshots, and exclusive output creation. No test calls a provider.
 
 One local replay of the retained six-workflow `self2-live` artifacts kept all four originally failed attempts and found one independently accepted current revision. Its review workflow contained one exact repeated read: 158 request bytes and 3,765 full SDK-result bytes, with 66 request and 555 canonical-result reference tokens. No stale response appeared in that captured comparison. These are recorded transport opportunities only; counterfactual model usage, elapsed improvement, completion, and savings remain unknown. Synthetic changed-revision and rejected-read fixtures demonstrate why the policy remains a recommendation.
+
+## Scheduling replay
+
+Capture a standalone SQLite backup of the eligible queue at an observed decision. Keep the snapshot and a private observation JSON with `snapshot_sha256`, `observed_at` in UTC, `project_id`, and `actor_id`. Include the original `labels`, `capabilities`, and `limit` when supplied. The replay checks the pinned database bytes, evaluates both scheduling policies through `work_next` on a temporary copy, and reports the ordered candidates with their original requirements revisions.
+
+```sh
+node --import tsx scripts/scheduling-replay.ts --snapshot .local/frozen-queue.sqlite --observation .local/queue-observation.json --out .local/queue-replay.json
+```
+
+This evaluates one queue decision with the supplied actor and capabilities. A changed first candidate shows the scheduling effect at that decision. Completion, elapsed time, and provider usage for the alternate order remain unknown. The retrieval report provides observed outcome and usage metrics.
