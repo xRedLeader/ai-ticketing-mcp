@@ -68,8 +68,6 @@ export function parseCodexInvocation(stdout: string, exitCode: number | null) {
   let terminal: string | undefined;
   let terminals = 0;
   let duplicateEvents = 0;
-  let turnStarted = false;
-  let setupNotices = 0;
   for (const [position, line] of stdout.split(/\r?\n/).entries()) {
     if (!line.trim()) continue;
     let event: any;
@@ -83,11 +81,9 @@ export function parseCodexInvocation(stdout: string, exitCode: number | null) {
       errors.push('Non-model observations cannot establish model delivery.');
       continue;
     }
-    if (event.type === 'turn.started') turnStarted = true;
     if (event.type === 'error' || event.type === 'warning')
       errors.push(event.message ?? `Codex reported ${event.type}.`);
     if (event.type === 'turn.completed' || event.type === 'turn.failed') {
-      turnStarted = true;
       terminal = event.type;
       terminals++;
       if (event.usage)
@@ -103,17 +99,7 @@ export function parseCodexInvocation(stdout: string, exitCode: number | null) {
     if (!item) continue;
     if (item.type === 'error') {
       if (item.message) warnings.push(item.message);
-      const knownSetupNotice =
-        !turnStarted &&
-        setupNotices === 0 &&
-        event.type === 'item.completed' &&
-        Object.keys(event).sort().join(',') === 'item,type' &&
-        Object.keys(item).sort().join(',') === 'id,message,type' &&
-        typeof item.id === 'string' &&
-        item.message ===
-          'Code Mode is unavailable because code-mode host is disabled. Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`.';
-      if (knownSetupNotice) setupNotices++;
-      else errors.push(item.message ?? 'Codex reported an item error.');
+      errors.push(item.message ?? 'Codex reported an item error.');
       continue;
     }
     if (item.type !== 'mcp_tool_call') {
@@ -193,7 +179,6 @@ export function parseCodexInvocation(stdout: string, exitCode: number | null) {
     usage,
     errors,
     warnings,
-    setup_notice_count: setupNotices,
     duplicate_completion_events: duplicateEvents,
     identical_mutation_retries: retries,
     provider_retry_count: null,
@@ -733,6 +718,9 @@ export function codexArguments(options: {
     'suppress_unstable_features_warning=true',
     '--enable',
     'skip_host_skill_discovery',
+    // On current Codex clients the host also routes calls to the isolated fixture MCP.
+    '--enable',
+    'code_mode_host',
     ...[
       'plugins',
       'apps',
@@ -741,7 +729,6 @@ export function codexArguments(options: {
       'multi_agent',
       'multi_agent_v2',
       'code_mode',
-      'code_mode_host',
       'browser_use',
       'computer_use',
       'image_generation',

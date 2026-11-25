@@ -36,7 +36,7 @@ const context = {
   omitted: [],
 };
 const progress = `${expected.description} ${contract.project.instructions.split('. ')[0]}. approval_policy=self`;
-it('allows only the exact single pre-turn disabled-code-mode notice and fails surfaced client errors', () => {
+it('rejects the disabled tool host and other surfaced client errors', () => {
   const notice = {
     type: 'item.completed',
     item: {
@@ -50,11 +50,8 @@ it('allows only the exact single pre-turn disabled-code-mode notice and fails su
     completed = { type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 1 } };
   const observe = (events: any[]) =>
     parseCodexInvocation(events.map((event) => JSON.stringify(event)).join('\n'), 0);
-  const valid = observe([notice, started, completed]);
-  assert.deepEqual(valid.errors, []);
-  assert.equal(valid.setup_notice_count, 1);
-  assert.equal(valid.warnings.length, 1);
   for (const events of [
+    [notice, started, completed],
     [notice, notice, started, completed],
     [started, notice, completed],
     [{ ...notice, item: { ...notice.item, message: 'Unknown setup error' } }, started, completed],
@@ -226,13 +223,14 @@ it('fully overrides the live server identity and disables auxiliary tool surface
     'shell_tool',
     'unified_exec',
     'code_mode',
-    'code_mode_host',
     'multi_agent',
     'browser_use',
     'computer_use',
     'unbounded_connection_retries',
   ])
     assert.ok(args.some((item, index) => item === '--disable' && args[index + 1] === feature));
+  assert.ok(args.some((item, index) => item === '--enable' && args[index + 1] === 'code_mode_host'));
+  assert.ok(!args.some((item, index) => item === '--disable' && args[index + 1] === 'code_mode_host'));
   const override = args.find((item) => item.startsWith('mcp_servers='))!;
   for (const value of [
     '"ai-ticketing"',
