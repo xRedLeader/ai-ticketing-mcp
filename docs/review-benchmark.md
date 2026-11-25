@@ -6,6 +6,8 @@ The cases include approval, missing evidence, missing criterion support, a hando
 
 ## Paired live review
 
+The packet comparison disables evidence preflight to measure both representations of the same submission. Production preflight runs by default.
+
 The live command uses a fixed synthetic fixture and a fresh run name. Each run issues exactly one invocation per format with identical review instructions, decision schema and model selection. It saves requests before dispatch and retains results from unsuccessful arms. Inspect the findings for every criterion alongside the verdict. A failed feedback check can also mean a reviewer expressed a fact in language outside the fixture scorer.
 
 ```sh
@@ -29,3 +31,11 @@ On November 24, 2026, four isolated Codex invocations requested `gpt-6.2-astra` 
 | Wrong header   | Request changes            |        39,230 + 256 |           25,564 + 250 |
 
 The two compact reviews used 51,582 reported tokens in total, down from 78,950 for the two full reviews. Both reviewers of the damaged receipt cited the observed prefix `e37d5cd68b3d10f2` and the required `53594e5448524354`. All four invocations reported zero cached input. These observations cover this client, model selection and pair of fixtures.
+
+## Chunk calibration and ticket lifecycle
+
+`npm run benchmark:review:chunks` compares 32-, 64- and 256-character chunks on fifteen packets and verifies exact reconstruction for every candidate. The compact encoder scans the eligible values once, tries those three sizes and selects the useful candidate with the fewest reference tokens. The calibration reports median encoding time so operators can see the CPU cost.
+
+`npm run benchmark:review:lifecycle` measures reference tokens per ticket reaching the correct final approval. Its four scenarios exercise missing receipts, an incomplete posted comment, an incorrect binary header and a simulated rate limit. Each arm opens worker and reviewer MCP sessions, discovers their tools, submits deficient work, records the rejection, repairs and checkpoints the evidence, and submits it again. It counts the MCP messages and every simulated model request and response through a verifier's approval in SQLite.
+
+The baseline uses full packets with preflight disabled. The candidate uses compact packets with preflight enabled. Each report includes model calls, retries, local repair bytes and wall-clock time. Model verdicts and worker repairs are deterministic fixtures. Live repair cost, provider latency, billing and uncached provider usage remain unknown. The dispatcher tests cover production leases, retry scheduling and advisory approval handoff.
