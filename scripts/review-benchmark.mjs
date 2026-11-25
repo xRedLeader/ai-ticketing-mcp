@@ -241,7 +241,7 @@ export async function captureReviewBenchmarkPair(scenario = 'pass', { model = 'g
       let calls = 0;
       let capture;
       const decision = await modelReview(
-        { ...fixture.config, reviewModel: model, reviewPacketFormat: format },
+        { ...fixture.config, reviewModel: model, reviewPacketFormat: format, reviewEvidencePreflight: false },
         fixture.review,
         async (url, init) => {
           calls++;
