@@ -58,4 +58,4 @@ Capture a standalone SQLite backup of the eligible queue at an observed decision
 node --import tsx scripts/scheduling-replay.ts --snapshot .local/frozen-queue.sqlite --observation .local/queue-observation.json --out .local/queue-replay.json
 ```
 
-This evaluates one queue decision with the supplied actor and capabilities. A changed first candidate shows the scheduling effect at that decision. Completion, elapsed time, and provider usage for the alternate order remain unknown. The retrieval report provides observed outcome and usage metrics.
+Use snapshots from an execution runtime with the external client-capability registry disabled. The replay uses the supplied actor and capabilities for one queue decision. A changed first candidate shows the effect on ordering at that decision. Completion, elapsed time, and provider usage for the alternate order remain unknown. The retrieval report provides observed outcome and usage metrics.

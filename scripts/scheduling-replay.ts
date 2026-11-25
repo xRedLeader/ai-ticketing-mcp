@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -17,13 +17,24 @@ const observation = z.strictObject({
   actor_id: z.uuid(),
   capabilities: z.array(z.string()).default([]),
   labels: z.array(z.string()).default([]),
-  limit: z.int().min(1).max(25).default(10),
+  limit: z.int().min(1).max(25).default(1),
 });
+
+async function assertStandalone(snapshot: string) {
+  for (const suffix of ['-wal', '-journal']) {
+    const sidecar = await stat(snapshot + suffix).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ENOENT') throw error;
+    });
+    assert.ok(!sidecar?.size, 'Use a standalone SQLite backup without an active WAL or journal.');
+  }
+}
 
 /** Compare actual scheduler ordering on the same retained queue, without dispatch. */
 export async function replayScheduling(snapshot: string, input: z.input<typeof observation>) {
   const request = observation.parse(input);
+  await assertStandalone(snapshot);
   const source = await readFile(snapshot);
+  await assertStandalone(snapshot);
   assert.equal(createHash('sha256').update(source).digest('hex'), request.snapshot_sha256);
   const root = resolve(tmpdir());
   const directory = await mkdtemp(join(root, 'ticketing-scheduling-replay-'));
@@ -61,6 +72,7 @@ export async function replayScheduling(snapshot: string, input: z.input<typeof o
       const candidate = await select();
       return {
         request,
+        client_capability_registry: 'disabled',
         policy_activation: 'recommendations_only',
         provider_invocations_added: 0,
         baseline: { policy: recorded, candidates: baseline },
