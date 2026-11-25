@@ -12,6 +12,7 @@ import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { countReferenceTokens } from '../src/tokens.js';
 import { serializeSuccessEnvelope } from '../src/envelope.js';
+import { UsageBudget } from '../src/usage-budget.js';
 import {
   parseCodexInvocation,
   validateRole,
@@ -41,6 +42,10 @@ const { values } = parseArgs({
     model: { type: 'string' },
     'reviewer-model': { type: 'string' },
     effort: { type: 'string' },
+    'reviewer-effort': { type: 'string' },
+    'budget-db': { type: 'string' },
+    'budget-run': { type: 'string' },
+    'invocation-token-allowance': { type: 'string' },
     'codex-bin': { type: 'string' },
     'timeout-seconds': { type: 'string', default: '600' },
   },
@@ -58,6 +63,23 @@ assert.ok(
 );
 const timeout = Number(values['timeout-seconds']) * 1000;
 assert.ok(Number.isSafeInteger(timeout) && timeout > 0);
+const budgetFlags = [values['budget-db'], values['budget-run'], values['invocation-token-allowance']];
+assert.ok(
+  budgetFlags.every(Boolean) || budgetFlags.every((value) => !value),
+  'Provide all three budget flags together.',
+);
+const budgetConfiguration = values['budget-db']
+  ? {
+      database: resolve(values['budget-db']),
+      run_id: values['budget-run']!,
+      invocation_token_allowance: Number(values['invocation-token-allowance']),
+    }
+  : null;
+if (budgetConfiguration)
+  assert.ok(
+    Number.isSafeInteger(budgetConfiguration.invocation_token_allowance) &&
+      budgetConfiguration.invocation_token_allowance > 0,
+  );
 const measurementSourceHashes = Object.fromEntries(
   await Promise.all(
     ['real-client-benchmark.ts', 'real-client-observation.ts', 'real-client-prefix.ts'].map(async (name) => [
@@ -69,6 +91,7 @@ const measurementSourceHashes = Object.fromEntries(
   ),
 );
 let manifest: any;
+let budget: UsageBudget | null = null;
 async function recoverMaintenance(directory: string) {
   try {
     return JSON.parse(await readFile(join(directory, 'maintenance-result.json'), 'utf8'));
@@ -87,13 +110,17 @@ async function recover(directory: string, role: string, failure: string) {
   } catch {}
   const observation = parseCodexInvocation(stdout, null);
   let layout = null;
+  let request: any = {};
   try {
-    layout =
-      JSON.parse(await readFile(join(directory, `${role}-request.json`), 'utf8')).prompt_layout ?? null;
+    request = JSON.parse(await readFile(join(directory, `${role}-request.json`), 'utf8'));
+    layout = request.prompt_layout ?? null;
   } catch {}
   return {
     consumer: 'model',
     role,
+    model_requested: request.requested_model ?? null,
+    model_reported: null,
+    reasoning_effort: request.reasoning_effort ?? null,
     ...observation,
     prompt_layout: layout,
     prefix_cache_observation: prefixCacheObservation(observation.usage),
@@ -104,6 +131,8 @@ async function recover(directory: string, role: string, failure: string) {
   };
 }
 async function save() {
+  manifest.budget_usage =
+    budget?.report(manifest.budget_configuration.run_id) ?? manifest.budget_usage ?? null;
   manifest.usage = aggregateUsage(
     manifest.workflows.flatMap((workflow: any) =>
       workflow.attempts.flatMap((attempt: any) => attempt.invocations ?? []),
@@ -152,6 +181,14 @@ if (values.resume) {
     if (values[flag])
       assert.equal(values[flag], manifest.models[key], 'Do not change models within one report.');
   if (values.effort) assert.equal(values.effort, manifest.effort);
+  assert.equal(
+    timeout,
+    manifest.invocation_timeout_ms ?? timeout,
+    'Do not change timeout within one report.',
+  );
+  if (values['reviewer-effort'])
+    assert.equal(values['reviewer-effort'], manifest.efforts?.reviewer ?? manifest.effort);
+  if (budgetConfiguration) assert.deepEqual(budgetConfiguration, manifest.budget_configuration);
   assert.deepEqual(
     await digestTree(join(root, 'runtime')),
     manifest.runtime_hashes,
@@ -203,6 +240,7 @@ if (values.resume) {
     values['codex-bin'] ?? process.env.CODEX_BIN ?? (process.platform === 'win32' ? 'codex.exe' : 'codex');
   manifest = {
     version: 1,
+    run: values.run,
     created_at: new Date().toISOString(),
     client: 'Codex CLI',
     client_version: execFileSync(codex, ['--version'], { encoding: 'utf8' }).trim(),
@@ -216,6 +254,12 @@ if (values.resume) {
     prompt_layout: PROMPT_LAYOUT,
     models: { worker: values.model ?? 'gpt-6.1-sol', reviewer: values['reviewer-model'] ?? 'gpt-6-astra' },
     effort: values.effort ?? 'xhigh',
+    efforts: {
+      worker: values.effort ?? 'xhigh',
+      reviewer: values['reviewer-effort'] ?? values.effort ?? 'xhigh',
+    },
+    budget_configuration: budgetConfiguration,
+    invocation_timeout_ms: timeout,
     monetary_cost: { status: 'unavailable', usd: null },
     measurement: {
       provider_usage:
@@ -246,6 +290,8 @@ assert.equal(
   manifest.fixture_server_sha256,
 );
 const runtimeRoot = join(root, 'runtime');
+budget = manifest.budget_configuration ? new UsageBudget(manifest.budget_configuration.database) : null;
+const roleEffort = (role: 'worker' | 'reviewer') => manifest.efforts?.[role] ?? manifest.effort;
 const load = (name: string) => import(pathToFileURL(join(runtimeRoot, 'dist', name)).href);
 const [{ createSqliteAdapters }, { fixture }] = await Promise.all([
   load('adapters/sqlite.js'),
@@ -293,7 +339,8 @@ async function seed(directory: string, workflow: any) {
       kind: 'blocks',
       action: 'add',
     });
-    await f.call(f.worker.id, 'ticket_note', {
+    // The production policy forbids the worker from answering its own blocking question.
+    await f.call(f.other.id, 'ticket_note', {
       ticket_id: ticket.id,
       kind: 'question',
       body: 'Confirm that the prerequisite access boundary is ready.',
@@ -609,7 +656,13 @@ async function maintenance(directory: string, seeded: any) {
     },
   };
 }
-async function invoke(role: 'worker' | 'reviewer', workflow: any, directory: string, seeded: any) {
+async function invoke(
+  role: 'worker' | 'reviewer',
+  workflow: any,
+  directory: string,
+  seeded: any,
+  attemptId: string,
+) {
   const actor = role === 'worker' ? seeded.expected.workerId : seeded.expected.reviewerId;
   const configPath = join(directory, `${role}-fixture.json`);
   await writeFile(
@@ -663,11 +716,10 @@ async function invoke(role: 'worker' | 'reviewer', workflow: any, directory: str
       contract_sha256: contractHash,
     },
   });
-  const sidecar = role === 'worker' ? await maintenance(directory, seeded) : undefined;
   const cwd = await mkdtemp(join(tmpdir(), 'ticketing-model-client-'));
   const args = codexArguments({
     model: manifest.models[role],
-    effort: manifest.effort,
+    effort: roleEffort(role),
     cwd,
     node: process.execPath,
     server: join(root, 'server.mjs'),
@@ -680,7 +732,7 @@ async function invoke(role: 'worker' | 'reviewer', workflow: any, directory: str
     JSON.stringify(
       {
         requested_model: manifest.models[role],
-        reasoning_effort: manifest.effort,
+        reasoning_effort: roleEffort(role),
         arguments: args,
         prompt: layout.prompt,
         prompt_layout: layout.provenance,
@@ -691,104 +743,162 @@ async function invoke(role: 'worker' | 'reviewer', workflow: any, directory: str
     ),
     { flag: 'wx', mode: 0o600 },
   );
-  const stdoutPath = join(directory, `${role}.jsonl`),
-    stderrPath = join(directory, `${role}.stderr`);
-  const out = createWriteStream(stdoutPath, { flags: 'wx', mode: 0o600 }),
-    err = createWriteStream(stderrPath, { flags: 'wx', mode: 0o600 });
-  const environment = { ...process.env };
-  for (const key of ['ACTOR_ID', 'SQLITE_PATH', 'STORAGE_ADAPTER', 'EMBEDDING_PROVIDER'])
-    delete environment[key];
-  const started = performance.now();
-  let timedOut = false;
-  let spawnError: string | null = null;
-  let exitCode: number | null = null;
-  const child = spawn(manifest.codex_binary, args, {
-    cwd,
-    env: environment,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    windowsHide: true,
-  });
-  let buffered = '';
-  child.stdout.on('data', (chunk) => {
-    buffered += chunk.toString();
-    let at;
-    while ((at = buffered.indexOf('\n')) >= 0) {
-      const line = buffered.slice(0, at);
-      buffered = buffered.slice(at + 1);
-      try {
-        sidecar?.observe(JSON.parse(line));
-      } catch {}
-    }
-  });
-  child.stdout.pipe(out);
-  child.stderr.pipe(err);
-  child.stdin.on('error', () => {});
-  child.stdin.end(layout.prompt);
-  const timer = setTimeout(() => {
-    timedOut = true;
-    child.kill();
-  }, timeout);
-  try {
-    await new Promise<void>((done) => {
-      child.once('error', (error) => {
-        spawnError = error.message;
-        done();
-      });
-      child.once('close', (code) => {
-        exitCode = code;
-        done();
-      });
-    });
-  } finally {
-    clearTimeout(timer);
-    if (!out.writableEnded) out.end();
-    if (!err.writableEnded) err.end();
-    await Promise.all([
-      out.closed ? Promise.resolve() : once(out, 'close'),
-      err.closed ? Promise.resolve() : once(err, 'close'),
-    ]);
-  }
-  const observation = parseCodexInvocation(await readFile(stdoutPath, 'utf8'), exitCode);
-  if (spawnError) observation.errors.push(spawnError);
-  if (timedOut) observation.errors.push('Codex invocation timed out.');
-  let validation: any = { success: false, errors: [...observation.errors] };
-  try {
-    validation = validateRole(observation, role, seeded.expected);
-  } catch (error) {
-    validation.errors.push(`Post-client validation failed: ${String(error)}`);
-  }
-  let maintained: any;
-  try {
-    maintained = await sidecar?.finish();
-    if (maintained && !maintained.success) {
-      validation.success = false;
-      validation.errors.push(maintained.failure!);
-    }
-  } catch (error) {
-    validation.success = false;
-    validation.errors.push(`Maintenance finalization failed: ${String(error)}`);
-    maintained = await recoverMaintenance(directory);
-  }
-  const report = {
-    consumer: 'model',
+  const budgetAttemptId = `${values.run}:${attemptId}:${role}`;
+  const previousBudgetAttempt = budget
+    ?.report(manifest.budget_configuration.run_id)
+    .attempts.filter(
+      (attempt) =>
+        attempt.attempt_id !== budgetAttemptId &&
+        attempt.ticket_id === `${values.run}:${workflow.id}` &&
+        attempt.role === role,
+    )
+    .at(-1);
+  const admission = budget?.admit(manifest.budget_configuration.run_id, {
+    attempt_id: budgetAttemptId,
+    ticket_id: `${values.run}:${workflow.id}`,
+    requirements_revision: 1,
+    actor_id: actor,
     role,
-    model_requested: manifest.models[role],
-    model_reported: null,
-    reasoning_effort: manifest.effort,
-    prompt_layout: layout.provenance,
-    prefix_cache_observation: prefixCacheObservation(observation.usage),
-    elapsed_ms: Math.round(performance.now() - started),
-    exit_code: exitCode,
-    timed_out: timedOut,
-    ...observation,
-    ...validation,
-    maintenance: maintained,
-  };
-  await writeFile(join(directory, `${role}-result.json`), JSON.stringify(report, null, 2) + '\n', {
-    flag: 'wx',
-    mode: 0o600,
+    provider: 'openai',
+    model: manifest.models[role],
+    retry_of: previousBudgetAttempt?.settlement ? previousBudgetAttempt.attempt_id : null,
+    allowance: {
+      provider_tokens: manifest.budget_configuration.invocation_token_allowance,
+      runtime_ms: timeout,
+      cost_usd_micros: null,
+    },
   });
-  return report;
+  assert.ok(
+    !admission || (admission.admitted && admission.start_allowed),
+    `Invocation budget did not admit a new launch: ${JSON.stringify(admission)}`,
+  );
+  const invocationStarted = performance.now();
+  let completedReport: any;
+  let sidecar: Awaited<ReturnType<typeof maintenance>> | undefined;
+  let sidecarFinished = false;
+  try {
+    sidecar = role === 'worker' ? await maintenance(directory, seeded) : undefined;
+    const stdoutPath = join(directory, `${role}.jsonl`),
+      stderrPath = join(directory, `${role}.stderr`);
+    const out = createWriteStream(stdoutPath, { flags: 'wx', mode: 0o600 }),
+      err = createWriteStream(stderrPath, { flags: 'wx', mode: 0o600 });
+    const environment = { ...process.env };
+    for (const key of ['ACTOR_ID', 'SQLITE_PATH', 'STORAGE_ADAPTER', 'EMBEDDING_PROVIDER'])
+      delete environment[key];
+    const started = performance.now();
+    let timedOut = false;
+    let spawnError: string | null = null;
+    let exitCode: number | null = null;
+    const child = spawn(manifest.codex_binary, args, {
+      cwd,
+      env: environment,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    let buffered = '';
+    child.stdout.on('data', (chunk) => {
+      buffered += chunk.toString();
+      let at;
+      while ((at = buffered.indexOf('\n')) >= 0) {
+        const line = buffered.slice(0, at);
+        buffered = buffered.slice(at + 1);
+        try {
+          sidecar?.observe(JSON.parse(line));
+        } catch {}
+      }
+    });
+    child.stdout.pipe(out);
+    child.stderr.pipe(err);
+    child.stdin.on('error', () => {});
+    child.stdin.end(layout.prompt);
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, timeout);
+    try {
+      await new Promise<void>((done) => {
+        child.once('error', (error) => {
+          spawnError = error.message;
+          done();
+        });
+        child.once('close', (code) => {
+          exitCode = code;
+          done();
+        });
+      });
+    } finally {
+      clearTimeout(timer);
+      if (!out.writableEnded) out.end();
+      if (!err.writableEnded) err.end();
+      await Promise.all([
+        out.closed ? Promise.resolve() : once(out, 'close'),
+        err.closed ? Promise.resolve() : once(err, 'close'),
+      ]);
+    }
+    const observation = parseCodexInvocation(await readFile(stdoutPath, 'utf8'), exitCode);
+    if (spawnError) observation.errors.push(spawnError);
+    if (timedOut) observation.errors.push('Codex invocation timed out.');
+    let validation: any = { success: false, errors: [...observation.errors] };
+    try {
+      validation = validateRole(observation, role, seeded.expected);
+    } catch (error) {
+      validation.errors.push(`Post-client validation failed: ${String(error)}`);
+    }
+    let maintained: any;
+    try {
+      sidecarFinished = true;
+      maintained = await sidecar?.finish();
+      if (maintained && !maintained.success) {
+        validation.success = false;
+        validation.errors.push(maintained.failure!);
+      }
+    } catch (error) {
+      validation.success = false;
+      validation.errors.push(`Maintenance finalization failed: ${String(error)}`);
+      maintained = await recoverMaintenance(directory);
+    }
+    const report = {
+      consumer: 'model',
+      role,
+      model_requested: manifest.models[role],
+      model_reported: null,
+      reasoning_effort: roleEffort(role),
+      prompt_layout: layout.provenance,
+      prefix_cache_observation: prefixCacheObservation(observation.usage),
+      elapsed_ms: Math.round(performance.now() - started),
+      exit_code: exitCode,
+      timed_out: timedOut,
+      ...observation,
+      ...validation,
+      maintenance: maintained,
+    };
+    await writeFile(join(directory, `${role}-result.json`), JSON.stringify(report, null, 2) + '\n', {
+      flag: 'wx',
+      mode: 0o600,
+    });
+    completedReport = report;
+    return report;
+  } finally {
+    try {
+      if (sidecar && !sidecarFinished) await sidecar.finish();
+    } finally {
+      if (budget) {
+        const partial =
+          completedReport ??
+          parseCodexInvocation(
+            await readFile(join(directory, `${role}.jsonl`), 'utf8').catch(() => ''),
+            null,
+          );
+        budget.settle(manifest.budget_configuration.run_id, budgetAttemptId, {
+          outcome: completedReport?.success ? 'succeeded' : 'failed',
+          usage: partial.usage,
+          usage_source: join(directory, `${role}.jsonl`),
+          runtime_ms: Math.ceil(performance.now() - invocationStarted),
+          provider_retry_count: partial.provider_retry_count ?? null,
+        });
+      }
+    }
+  }
 }
 const selected = manifest.workflows.filter(
   (item: any) => values.workflow === 'all' || item.id === values.workflow,
@@ -830,13 +940,13 @@ for (const item of selected) {
   let seeded: any;
   try {
     seeded = await seed(directory, workflow);
-    const worker = await invoke('worker', workflow, directory, seeded);
+    const worker = await invoke('worker', workflow, directory, seeded, id);
     attempt.invocations.push(worker);
     if (!worker.success)
       throw new Error('Worker invocation did not satisfy observed-response completion checks.');
     if (workflow.review) {
       assert.equal((await seeded.a.storage.get('tickets', seeded.expected.ticket.id)).status, 'in_review');
-      const reviewer = await invoke('reviewer', workflow, directory, seeded);
+      const reviewer = await invoke('reviewer', workflow, directory, seeded, id);
       attempt.invocations.push(reviewer);
       if (!reviewer.success)
         throw new Error('Reviewer invocation did not satisfy observed-response completion checks.');
@@ -889,3 +999,4 @@ console.log(
 );
 if (selected.some((item: any) => !item.attempts.some((attempt: any) => attempt.status === 'completed')))
   process.exitCode = 1;
+budget?.close();

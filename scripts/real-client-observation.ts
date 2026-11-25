@@ -81,6 +81,8 @@ export function parseCodexInvocation(stdout: string, exitCode: number | null) {
       errors.push('Non-model observations cannot establish model delivery.');
       continue;
     }
+    if (event.type === 'error' || event.type === 'warning')
+      errors.push(event.message ?? `Codex reported ${event.type}.`);
     if (event.type === 'turn.completed' || event.type === 'turn.failed') {
       terminal = event.type;
       terminals++;
@@ -97,6 +99,7 @@ export function parseCodexInvocation(stdout: string, exitCode: number | null) {
     if (!item) continue;
     if (item.type === 'error') {
       if (item.message) warnings.push(item.message);
+      errors.push(item.message ?? 'Codex reported an item error.');
       continue;
     }
     if (item.type !== 'mcp_tool_call') {
@@ -686,6 +689,7 @@ export function codexArguments(options: {
     '--no-daemon',
     'exec',
     '--ignore-user-config',
+    '--ignore-rules',
     '--ephemeral',
     '--strict-config',
     '--json',
@@ -706,12 +710,40 @@ export function codexArguments(options: {
     'approvals_reviewer="auto_review"',
     '--config',
     'tool_output_token_limit=32768',
-    '--disable',
-    'plugins',
-    '--disable',
-    'shell_tool',
-    '--disable',
-    'unified_exec',
+    '--config',
+    'project_doc_max_bytes=0',
+    '--config',
+    'web_search="disabled"',
+    '--config',
+    'suppress_unstable_features_warning=true',
+    '--enable',
+    'skip_host_skill_discovery',
+    // On current Codex clients the host also routes calls to the isolated fixture MCP.
+    '--enable',
+    'code_mode_host',
+    ...[
+      'plugins',
+      'apps',
+      'shell_tool',
+      'unified_exec',
+      'multi_agent',
+      'multi_agent_v2',
+      'code_mode',
+      'browser_use',
+      'computer_use',
+      'image_generation',
+      'view_image',
+      'sleep_tool',
+      'goals',
+      'memories',
+      'remote_plugin',
+      'recommended_plugins',
+      'skill_search',
+      'hooks',
+      'workspace_dependencies',
+      'in_app_browser',
+      'unbounded_connection_retries',
+    ].flatMap((feature) => ['--disable', feature]),
     '--config',
     `mcp_servers=${toml(mcp)}`,
     '-',
