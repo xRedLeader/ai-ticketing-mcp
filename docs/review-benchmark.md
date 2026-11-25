@@ -8,6 +8,8 @@ The cases include approval, missing evidence, missing criterion support, a hando
 
 The live command uses a fixed synthetic fixture and a fresh run name. Each run issues exactly one invocation per format with identical review instructions, decision schema and model selection. It saves requests before dispatch and retains results from unsuccessful arms. Inspect the findings for every criterion alongside the verdict. A failed feedback check can also mean a reviewer expressed a fact in language outside the fixture scorer.
 
+The scorer checks the reported values for `observed_attempts` and `max_attempts` when retry evidence satisfies the criterion. For a header mismatch it checks `observed_prefix` against the receipt and `expected_prefix` against the required header.
+
 ```sh
 npm run benchmark:review:live -- --run release-pass --scenario pass --model gpt-5-mini
 npm run benchmark:review:live -- --run release-header --scenario wrong-header --model gpt-5-mini
