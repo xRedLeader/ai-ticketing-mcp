@@ -2,6 +2,8 @@
 
 This harness invokes the installed Codex CLI once per role and workflow. It does not implement a model loop. The six scenario definitions remain in the unchanged [protocol workflow contract](../scripts/fixtures/protocol-workflows.json); the deterministic reference benchmark remains separate.
 
+For optional, explicit model/effort selection, matched budgeted evaluations, and the local fail-closed promotion gate, see [model routing](model-routing.md). Routing requires retained real-client artifacts and a durable admission ledger; deterministic replay cannot qualify an alternate route.
+
 Use Node 24, installed dependencies, an authenticated Codex CLI, and an explicit stable build containing `dist`, `migrations`, `package.json`, and `package-lock.json`. The harness copies that build and its migrations together, records its revision and hashes, and verifies the copy on resume. It never opens the real roadmap database or copies authentication files.
 
 Start with the measured short workflow, using a unique run name and the chosen build:
@@ -26,7 +28,7 @@ node --import tsx scripts/real-client-revalidation.ts --run client-study --origi
 
 This command makes no provider calls. It creates a new private `corrections/revalidation-UUID.json` artifact with original verdicts and failures, corrected verdicts, source/input hashes, per-mutation delivery proofs, authoritative final-state checks, and unchanged usage totals. It reads the original fixture database in read-only mode, checks the stored description against the production-normalized frozen seed, and never normalizes captured responses. Original reports and per-attempt artifacts remain unchanged. Missing responses, incomplete maintenance evidence, changed usage, or unfinished authoritative state remain failures.
 
-The default worker is `gpt-6.1-sol`, the independent reviewer is `gpt-6-astra`, and both request `xhigh`. Override models on the first command with `--model` and `--reviewer-model`; `--effort` sets the requested effort. A report retains its chosen models. Unsupported models, client failures, missing usage, incomplete delivery, and unfinished tickets are reported explicitly. `--timeout-seconds` bounds each invocation; its default is 600 seconds. `CODEX_BIN` or `--codex-bin` can select an installed native CLI executable.
+The default worker is `gpt-6.1-sol`, the independent reviewer is `gpt-6-astra`, and both request `xhigh`. Override models on the first command with `--model` and `--reviewer-model`; `--effort` sets the worker effort and the reviewer's default, while `--reviewer-effort` pins the reviewer separately. A report retains its chosen models and per-role efforts. Unsupported models, client failures, missing usage, incomplete delivery, and unfinished tickets are reported explicitly. `--timeout-seconds` bounds each invocation; its default is 600 seconds. `CODEX_BIN` or `--codex-bin` can select an installed native CLI executable.
 
 ## Isolation and observations
 

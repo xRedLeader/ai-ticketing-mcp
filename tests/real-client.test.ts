@@ -36,6 +36,32 @@ const context = {
   omitted: [],
 };
 const progress = `${expected.description} ${contract.project.instructions.split('. ')[0]}. approval_policy=self`;
+it('allows only the exact single pre-turn disabled-code-mode notice and fails surfaced client errors', () => {
+  const notice = {
+    type: 'item.completed',
+    item: {
+      id: 'setup',
+      type: 'error',
+      message:
+        'Code Mode is unavailable because code-mode host is disabled. Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`.',
+    },
+  };
+  const started = { type: 'turn.started' },
+    completed = { type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 1 } };
+  const observe = (events: any[]) =>
+    parseCodexInvocation(events.map((event) => JSON.stringify(event)).join('\n'), 0);
+  const valid = observe([notice, started, completed]);
+  assert.deepEqual(valid.errors, []);
+  assert.equal(valid.setup_notice_count, 1);
+  assert.equal(valid.warnings.length, 1);
+  for (const events of [
+    [notice, notice, started, completed],
+    [started, notice, completed],
+    [{ ...notice, item: { ...notice.item, message: 'Unknown setup error' } }, started, completed],
+    [{ type: 'error', message: 'provider failed' }, completed],
+  ])
+    assert.ok(observe(events).errors.length > 0);
+});
 function trace(entries: { id: string; tool: string; arguments?: any; data?: any; error?: string }[]) {
   const events: any[] = [];
   for (const entry of entries) {
@@ -188,12 +214,24 @@ it('fully overrides the live server identity and disables auxiliary tool surface
   });
   for (const flag of [
     '--ignore-user-config',
+    '--ignore-rules',
     '--ephemeral',
     '--strict-config',
     'tool_output_token_limit=32768',
   ])
     assert.ok(args.includes(flag));
-  for (const feature of ['plugins', 'shell_tool', 'unified_exec'])
+  for (const feature of [
+    'plugins',
+    'apps',
+    'shell_tool',
+    'unified_exec',
+    'code_mode',
+    'code_mode_host',
+    'multi_agent',
+    'browser_use',
+    'computer_use',
+    'unbounded_connection_retries',
+  ])
     assert.ok(args.some((item, index) => item === '--disable' && args[index + 1] === feature));
   const override = args.find((item) => item.startsWith('mcp_servers='))!;
   for (const value of [
