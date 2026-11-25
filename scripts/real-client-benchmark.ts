@@ -339,7 +339,8 @@ async function seed(directory: string, workflow: any) {
       kind: 'blocks',
       action: 'add',
     });
-    await f.call(f.worker.id, 'ticket_note', {
+    // The production policy forbids the worker from answering its own blocking question.
+    await f.call(f.other.id, 'ticket_note', {
       ticket_id: ticket.id,
       kind: 'question',
       body: 'Confirm that the prerequisite access boundary is ready.',
