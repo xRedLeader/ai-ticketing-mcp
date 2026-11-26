@@ -121,6 +121,8 @@ Library consumers can create a recorder with `createProfileRecorder`, supply it 
 
 ## Hot reload for local stdio
 
+To publish new worker advice to an open session, including one pinned by a subscription, configure [live worker guidance](catalog-hot-reload.md#update-worker-guidance-on-an-open-connection).
+
 Build each candidate in a separate, immutable checkout with `npm run build`. Keep the launcher, active build, and previous build available. Publish the initial server selection using an absolute path to the built CLI:
 
 ```powershell

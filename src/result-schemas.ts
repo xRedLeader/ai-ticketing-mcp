@@ -484,6 +484,7 @@ const milestoneSummary = milestoneReceipt.extend({
   status: z.enum(['open', 'completed']),
   progress: milestoneProgress,
 });
+const projectList = z.object({ projects: z.array(projectSummary) });
 export const resultSchemas: Record<Operation, z.ZodType> = {
   spike_schedule: z.object({
     id,
@@ -778,7 +779,7 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
     }),
     evidence_ref: retrieval,
   }),
-  project_list: z.object({ projects: z.array(projectSummary) }),
+  project_list: projectList,
   project_get: z.object({
     project,
     members: z.array(member.extend({ name: z.string(), kind: z.enum(['human', 'agent']) })),
@@ -897,10 +898,14 @@ export const resultSchemas: Record<Operation, z.ZodType> = {
     has_more: z.boolean(),
   }),
 };
-export function toolOutputSchema(operation: Operation) {
+export function toolOutputSchema(operation: Operation, reloadableGuide = false) {
+  const data =
+    reloadableGuide && operation === 'project_list'
+      ? projectList.extend({ worker_guide: z.string() })
+      : resultSchemas[operation];
   return z.object({
     ok: z.boolean(),
-    data: resultSchemas[operation].nullable(),
+    data: data.nullable(),
     error: z
       .object({ code: z.string(), message: z.string(), details: z.record(z.string(), json) })
       .nullable(),

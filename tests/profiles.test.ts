@@ -1,10 +1,15 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import { InMemoryTransport } from '@modelcontextprotocol/server';
 import type { Application } from '../src/application.js';
 import { DomainError } from '../src/contracts.js';
 import { serializeSuccessEnvelope } from '../src/envelope.js';
 import { createHttpServer } from '../src/http.js';
+import { createMcpServer } from '../src/mcp.js';
 import { parseMcpProfile, profileOperations, type McpProfile } from '../src/profiles.js';
 import { schemas } from '../src/schemas.js';
 import { countReferenceTokens } from '../src/tokens.js';
@@ -138,6 +143,102 @@ it('serializes recursively ordered JSON envelopes while preserving standard JSON
   const cycle: Record<string, unknown> = {};
   cycle.self = cycle;
   assert.throws(() => serializeSuccessEnvelope(cycle), TypeError);
+});
+
+it('requires delivery of the current worker guide on each connection before dispatching work', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'ticketing-worker-guide-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const workerGuideFile = join(directory, 'worker.json');
+  const publish = (advice: string) => writeFile(workerGuideFile, JSON.stringify({ advice }));
+  const requests: string[] = [];
+  let allowListing = false;
+  const app = {
+    async execute(_actor: string, operation: string) {
+      requests.push(operation);
+      if (operation === 'project_list' && allowListing) return { projects: [] };
+      throw new DomainError('FORBIDDEN', 'Operation denied.');
+    },
+  } as unknown as Application;
+  for (const path of ['resource', 'tool', 'prompt']) {
+    await publish('Start from the verified checkpoint.');
+    const principal = { actorId: 'worker', scopes: new Set(['ticketing:read', 'ticketing:write']) };
+    const server = createMcpServer(app, principal, 'worker', { workerGuideFile });
+    const client = new Client({ name: 'worker', version: '1' }, { defaultCacheTtlMs: 600_000 });
+    const [front, back] = InMemoryTransport.createLinkedPair();
+    const project_id = 'dc71df55-80ee-4ca1-a22d-ecdc40566c79';
+    const args = { project_id, ticket_id: 'SELF-1', idempotency_key: 'test-guide' };
+    const note = () => client.callTool({ name: 'ticket_note', arguments: { ...args, body: 'Updated' } });
+    const list = () => client.callTool({ name: 'project_list', arguments: {} });
+    const errorCode = (reply: Awaited<ReturnType<typeof note>>) =>
+      (reply.structuredContent?.error as { code: string }).code;
+    try {
+      await server.connect(back);
+      await client.connect(front);
+      assert.match(client.getInstructions()!, /ticketing:\/\/guide/);
+      assert.doesNotMatch(client.getInstructions()!, /context returned by work_claim/);
+      allowListing = false;
+      assert.equal(errorCode(await list()), 'FORBIDDEN');
+      principal.scopes.delete('ticketing:read');
+      await assert.rejects(client.readResource({ uri: 'ticketing://guide' }), /scope/i);
+      await assert.rejects(client.getPrompt({ name: 'execution' }), /scope/i);
+      principal.scopes.add('ticketing:read');
+      assert.equal(errorCode(await note()), 'WORKER_GUIDE_REQUIRED');
+      assert.equal(requests.at(-1), 'project_list');
+      for (const name of ['work_heartbeat', 'work_release']) {
+        const call = await client.callTool({
+          name,
+          arguments: {
+            ...args,
+            claim_token: project_id,
+            ...(name === 'work_release' ? { reason: 'Handoff' } : {}),
+          },
+        });
+        assert.equal(errorCode(call), 'FORBIDDEN');
+        assert.equal(requests.at(-1), name);
+      }
+      allowListing = true;
+      if (path === 'tool') {
+        const reply = await list();
+        const data = reply.structuredContent?.data as { projects: unknown[]; worker_guide: string };
+        assert.deepEqual(data.projects, []);
+        assert.match(data.worker_guide, /Start from the verified checkpoint/);
+        assert.deepEqual(JSON.parse((reply.content[0] as { text: string }).text), reply.structuredContent);
+      } else if (path === 'resource') {
+        const resource = await client.readResource({ uri: 'ticketing://guide' });
+        assert.match(String(resource.contents[0]?.text), /Start from the verified checkpoint/);
+      } else {
+        const prompt = await client.getPrompt({ name: 'execution' });
+        assert.match(JSON.stringify(prompt.messages), /Start from the verified checkpoint/);
+      }
+      await publish('Start from the verified checkpoint.');
+      assert.equal(errorCode(await note()), 'FORBIDDEN');
+      assert.equal(requests.at(-1), 'ticket_note');
+      const before = requests.length;
+      await rm(workerGuideFile);
+      assert.equal(errorCode(await note()), 'WORKER_GUIDE_UNAVAILABLE');
+      for (const invalid of [
+        Buffer.from([0xff]),
+        '{',
+        '{}',
+        '{"advice":2}',
+        JSON.stringify({ advice: '  ' }),
+        JSON.stringify({ advice: 'unsafe\0text' }),
+        JSON.stringify({ advice: 'x'.repeat(8192) }),
+      ]) {
+        await writeFile(workerGuideFile, invalid);
+        assert.equal(errorCode(await note()), 'WORKER_GUIDE_UNAVAILABLE');
+      }
+      await publish('Updated guidance');
+      assert.equal(errorCode(await note()), 'WORKER_GUIDE_REQUIRED');
+      assert.equal(requests.length, before);
+      const latest = await client.readResource({ uri: 'ticketing://guide' });
+      assert.match(String(latest.contents[0]?.text), /Updated guidance/);
+      assert.equal(errorCode(await note()), 'FORBIDDEN');
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  }
 });
 
 it('serves profile-specific HTTP catalogs and prompts without changing scope authorization', async () => {
