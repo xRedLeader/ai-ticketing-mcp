@@ -17,11 +17,12 @@ export function createMcpServer(
   http?: { signal: AbortSignal; beginRunWait: () => () => void },
 ) {
   profile = parseMcpProfile(profile);
+  const claimContextGuidance =
+    'Use the context returned by work_claim before issuing other ticket reads. Use the facts and revision already delivered when they suffice. Fetch every required omission before its dependent action. After a requirements, authority, or lease change, read the current state and reconcile before continuing. After reconnecting or replaying a claim receipt, read fresh ticket_context.';
   const workflows: Record<McpProfile, string> = {
     researcher:
       'Use spike_list and spike_get to discover separate research. Claim with spike_claim, preserve the returned claim token, and use ticket_checkpoint and work_heartbeat with the returned ticket ID. The first claim starts a durable elapsed deadline that reclaims never reset. Budget exhaustion prevents new managed starts; preserve observations and complete findings/evidence with spike_complete. A recommendation never triages an idea or creates delivery tickets.',
-    worker:
-      'Use project_list and project_get to discover authorized work. Use work_claim to select and claim work atomically and receive brief context. Persist the claim token, heartbeat at least every three minutes, checkpoint progress, and submit evidence for every criterion. Retrieve omitted context before continuing resumed work.',
+    worker: `Use project_list and project_get to discover authorized work, then work_claim to claim it atomically. ${claimContextGuidance} Persist the claim token, heartbeat at least every three minutes, checkpoint progress, and submit evidence for every criterion.`,
     executor:
       'Use project_list, project_get and work_claim to acquire authorized work and context. Retrieve required omissions before resuming. Use run_submit with a registered recipe and checkpoint; the separate companion executes and maintains admitted runs. Persist the run ID, use bounded run_wait or run_get for status, and artifact_read for exact evidence before ticket_submit. run_cancel requires existing project-admin authority and does not confirm exit or undo effects. Use work_release for intentional handoff.',
     planner:
@@ -168,8 +169,7 @@ export function createMcpServer(
   const prompts = {
     planning:
       'Read project instructions, search prior decisions, and create bounded tickets with explicit criteria and dependencies. Do not invent project facts.',
-    execution:
-      'Use work_claim to acquire work and receive brief context. Persist the claim token, retrieve omitted context before resuming work, heartbeat at least every three minutes, and checkpoint progress. Submit evidence for every criterion only after verification.',
+    execution: `${claimContextGuidance} Persist the claim token, heartbeat at least every three minutes, and checkpoint progress. Submit evidence for every criterion only after verification.`,
     handoff:
       'Persist a checkpoint describing completed work, remaining work, decisions, references, and unresolved questions. Release the claim when handing off intentionally.',
     verification:
