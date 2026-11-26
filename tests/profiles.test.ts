@@ -180,6 +180,22 @@ it('serves profile-specific HTTP catalogs and prompts without changing scope aut
           prompts[profile].sort(),
         );
         if (profile !== 'full') assert.ok(!client.getInstructions()?.includes('work_next'));
+        if (profile === 'worker') {
+          const guide = await client.readResource({ uri: 'ticketing://guide' });
+          const execution = await client.getPrompt({ name: 'execution' });
+          const message = execution.messages[0]?.content;
+          assert.ok(message?.type === 'text');
+          for (const text of [
+            client.getInstructions(),
+            (guide.contents[0] as { text: string }).text,
+            message.text,
+          ]) {
+            assert.match(String(text), /context returned by work_claim before issuing other ticket reads/);
+            assert.match(String(text), /required omission before its dependent action/);
+            assert.match(String(text), /requirements, authority, or lease change, read the current state/);
+            assert.match(String(text), /replaying a claim receipt, read fresh ticket_context/);
+          }
+        }
         if (profile === 'executor') {
           const guide = await client.readResource({ uri: 'ticketing://guide' });
           assert.ok(!String((guide.contents[0] as { text: string }).text).includes('changes_since'));
