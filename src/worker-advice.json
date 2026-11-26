@@ -1,0 +1,3 @@
+{
+  "advice": "Use the context returned by work_claim before issuing other ticket reads. Use the facts and revision already delivered when they suffice. Fetch every required omission before its dependent action. After a requirements, authority, or lease change, read the current state and reconcile before continuing. After reconnecting or replaying a claim receipt, read fresh ticket_context."
+}

@@ -1,13 +1,91 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { createSqliteAdapters } from '../src/adapters/sqlite.js';
+import { fixture } from '../src/testing/contracts.js';
+
+it('reloads advice on a pinned stdio connection while maintaining its SQLite claim', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'ticketing-pinned-guide-'));
+  const database = join(directory, 'tickets.sqlite');
+  const guide = join(directory, 'worker.json');
+  const pointer = join(directory, 'active');
+  const entry = join(directory, 'cli.js');
+  const client = new Client(
+    { name: 'guide-test', version: '1' },
+    { capabilities: { roots: { listChanged: true } } },
+  );
+  const adapters = createSqliteAdapters(database);
+  t.after(async () => {
+    await client.close();
+    await adapters.search.close();
+    await adapters.storage.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+  await adapters.storage.migrate();
+  const f = await fixture(adapters);
+  const ticket = await f.ticket();
+  await writeFile(entry, `import(${JSON.stringify(new URL('../src/cli.ts', import.meta.url).href)})`);
+  await writeFile(pointer, entry);
+  await writeFile(guide, JSON.stringify({ advice: 'First advice.' }));
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: ['--import', 'tsx', 'src/stdio-hot-reload.ts', '--pointer', pointer, '--profile', 'worker'],
+    env: {
+      NODE_OPTIONS: `--import=${import.meta.resolve('tsx')}`,
+      STORAGE_ADAPTER: 'sqlite',
+      SQLITE_PATH: database,
+      ACTOR_ID: f.worker.id,
+      EMBEDDING_PROVIDER: 'none',
+      MCP_PROFILE_CAPTURE: 'false',
+      MCP_WORKER_GUIDE_FILE: guide,
+    },
+    stderr: 'pipe',
+  });
+  let logs = '';
+  transport.stderr?.on('data', (chunk) => {
+    logs += chunk.toString();
+  });
+  await client.connect(transport);
+  await client.sendRootsListChanged();
+  const call = async (name: string, args: Record<string, unknown>) =>
+    (await client.callTool({ name, arguments: args })).structuredContent as any;
+  assert.match((await call('project_list', {})).data.worker_guide, /First advice/);
+  const args = { project_id: f.project.id, ticket_id: ticket.id };
+  const claimed = await call('work_claim', { ...args, idempotency_key: randomUUID() });
+  assert.equal(claimed.ok, true);
+  const claim_token = claimed.data.claim.token;
+  await writeFile(guide + '.next', JSON.stringify({ advice: 'Updated advice.' }));
+  await rename(guide + '.next', guide);
+  const note = { ...args, idempotency_key: randomUUID(), body: 'Checked after publication.' };
+  assert.equal((await call('ticket_note', note)).error.code, 'WORKER_GUIDE_REQUIRED');
+  assert.equal(
+    (await call('work_heartbeat', { ...args, claim_token, idempotency_key: randomUUID() })).ok,
+    true,
+  );
+  assert.match((await call('project_list', {})).data.worker_guide, /Updated advice/);
+  const written = await call('ticket_note', note);
+  assert.equal(written.ok, true);
+  assert.deepEqual(await call('ticket_note', note), written);
+  await rm(guide);
+  assert.equal(
+    (await call('ticket_note', { ...note, idempotency_key: randomUUID() })).error.code,
+    'WORKER_GUIDE_UNAVAILABLE',
+  );
+  assert.equal(
+    (await call('work_release', { ...args, claim_token, idempotency_key: randomUUID(), reason: 'Handoff' }))
+      .ok,
+    true,
+  );
+  assert.match(logs, /mcp_relay_pinned/);
+  assert.equal(logs.match(/mcp_relay_ready/g)?.length, 1);
+  assert.doesNotMatch(logs, /mcp_relay_switched/);
+});
 
 it('bootstraps a durable local agent and indexes eventual SQLite search without an external worker', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'ticketing-stdio-test-'));

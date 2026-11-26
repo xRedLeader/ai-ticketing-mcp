@@ -3,6 +3,7 @@ import { parseArgs } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { write } from 'node:fs';
+import { isAbsolute } from 'node:path';
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { createRuntime } from './runtime.js';
@@ -130,6 +131,15 @@ async function main() {
     values.sqlite === undefined
       ? process.env
       : { ...process.env, STORAGE_ADAPTER: 'sqlite', SQLITE_PATH: values.sqlite };
+  const workerGuideFile =
+    command === 'stdio' && parseMcpProfile(values.profile) === 'worker'
+      ? runtimeEnv.MCP_WORKER_GUIDE_FILE
+      : undefined;
+  ensure(
+    workerGuideFile === undefined || isAbsolute(workerGuideFile),
+    'INVALID_CONFIG',
+    'MCP_WORKER_GUIDE_FILE must be an absolute file path.',
+  );
   const app = createRuntime(runtimeEnv);
   let profiler: ProfileRecorder | undefined;
   let keepAlive = false;
@@ -270,6 +280,7 @@ async function main() {
           scopes: new Set(['ticketing:read', 'ticketing:write']),
         },
         parseMcpProfile(values.profile),
+        workerGuideFile ? { workerGuideFile } : undefined,
       );
       const transport = new StdioServerTransport();
       await server.connect(
