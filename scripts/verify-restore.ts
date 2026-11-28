@@ -4,6 +4,26 @@ import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 
 const quote = (identifier: string) => `"${identifier.replaceAll('"', '""')}"`;
+type Table = { schema: string; name: string; visible: boolean; columns: unknown };
+const coreTables = [
+  'actors',
+  'projects',
+  'members',
+  'tickets',
+  'criteria',
+  'links',
+  'notes',
+  'claims',
+  'submissions',
+  'reviews',
+  'knowledge',
+  'events',
+  'receipts',
+  'jobs',
+  'search_documents',
+  'search_profiles',
+  'search_vectors',
+];
 
 export async function verifyRestore(source: pg.Client, restored: pg.Client) {
   const clients = [source, restored];
@@ -12,18 +32,35 @@ export async function verifyRestore(source: pg.Client, restored: pg.Client) {
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
       await client.query("SET LOCAL TIME ZONE 'UTC'");
     }
-    const inventories = [];
-    for (const client of clients)
-      inventories.push(
-        (
-          await client.query<{ schema: string; name: string; columns: unknown }>(
-            `SELECT n.nspname AS schema,c.relname AS name,coalesce(jsonb_agg(jsonb_build_array(a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull) ORDER BY a.attnum) FILTER (WHERE a.attnum IS NOT NULL),'[]'::jsonb) AS columns FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace LEFT JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped WHERE n.nspname=current_schema() AND c.relkind IN ('r','p') GROUP BY n.nspname,c.relname ORDER BY c.relname`,
-          )
-        ).rows,
-      );
+    const inventories: Table[][] = [];
+    for (const [index, client] of clients.entries()) {
+      const database = index === 0 ? 'source' : 'restored';
+      const schema = (
+        await client.query<{ schema: string }>(
+          `SELECT n.nspname AS schema FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=to_regclass('schema_migrations') AND c.relkind IN ('r','p')`,
+        )
+      ).rows[0]?.schema;
+      assert.ok(schema, `${database} database has no visible schema_migrations table`);
+      const inventory = (
+        await client.query<Table>(
+          `SELECT n.nspname AS schema,c.relname AS name,pg_table_is_visible(c.oid) AS visible,coalesce(jsonb_agg(jsonb_build_array(a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull) ORDER BY a.attnum) FILTER (WHERE a.attnum IS NOT NULL),'[]'::jsonb) AS columns FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace LEFT JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped WHERE n.nspname=$1 AND c.relkind IN ('r','p') GROUP BY n.nspname,c.relname,c.oid ORDER BY c.relname`,
+          [schema],
+        )
+      ).rows;
+      for (const name of coreTables)
+        assert.ok(
+          inventory.some((table) => table.name === name),
+          `${database} database application schema ${quote(schema)} is missing required table ${name}`,
+        );
+      for (const table of inventory)
+        assert.ok(
+          table.visible,
+          `${database} database search_path shadows ${quote(schema)}.${quote(table.name)}`,
+        );
+      inventories.push(inventory);
+    }
     const [original, copy] = inventories;
     const names = [...new Set([...original!, ...copy!].map((table) => table.name))].sort();
-    assert.ok(names.length, 'No application tables found in the current schema');
     const results = [];
     for (const name of names) {
       const tables = inventories.map((inventory) => inventory.find((table) => table.name === name));
