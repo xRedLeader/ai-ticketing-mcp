@@ -1,12 +1,51 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { adapters } from './helpers.js';
 import { fixture, testEmbeddings } from '../../src/testing/contracts.js';
 import type { SearchDocument } from '../../src/contracts.js';
 import { createApplication } from '../../src/application.js';
 
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
+
+it('fuses complete lexical and semantic ranks before paging the best hit', async () => {
+  const a = adapters();
+  try {
+    await a.storage.migrate();
+    await a.search.configure(testEmbeddings.profile);
+    const f = await fixture(a);
+    const document = {
+      id: randomUUID(),
+      project_id: f.project.id,
+      kind: 'ticket' as const,
+      revision: 1,
+      title: 'database',
+      text: '',
+      archived: false,
+    };
+    for (let i = 0; i < 3; i++) {
+      await a.search.indexText({
+        ...document,
+        id: randomUUID(),
+        title: 'database database database',
+        text: 'database database',
+      });
+      const vector = { ...document, id: randomUUID(), title: 'unrelated' };
+      await a.search.indexText(vector);
+      await a.search.indexVector(vector, testEmbeddings.profile, [1, 0, 0]);
+    }
+    await a.search.indexText(document);
+    await a.search.indexVector(document, testEmbeddings.profile, [1, 0.5, 0]);
+    const semantic = { profile: testEmbeddings.profile, vector: [1, 0, 0] };
+    const all = await a.search.search(f.project.id, 'database', 20, semantic);
+    assert.equal(all[0]?.id, document.id);
+    assert.ok(Math.abs(all[0]!.score - 2 / 64) < 1e-12);
+    assert.deepEqual(await a.search.search(f.project.id, 'database', 1, semantic), all.slice(0, 1));
+    assert.deepEqual(await a.search.search(f.project.id, 'database', 2, semantic, 1), all.slice(1, 3));
+  } finally {
+    await a.dispose();
+  }
+});
 
 it('skips provider calls for unchanged source text and preserves optional-adapter fallback', async () => {
   const a = adapters();

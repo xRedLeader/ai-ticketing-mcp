@@ -976,7 +976,7 @@ class SqliteStorage extends Handle implements StorageAdapter {
   }
 }
 class SqliteSearch extends Handle implements SearchAdapter {
-  readonly capabilities = Object.freeze({ semantic: false });
+  readonly capabilities = Object.freeze({ semantic: false, pagination: true as const });
   async configure(_profile: EmbeddingProfile) {
     this.open();
   }
@@ -1009,17 +1009,23 @@ class SqliteSearch extends Handle implements SearchAdapter {
   ): Promise<void> {
     throw new DomainError('UNSUPPORTED_SEARCH', 'SQLite provides full-text search only.');
   }
-  async search(projectId: string, query: string, limit: number): Promise<SearchHit[]> {
+  async search(
+    projectId: string,
+    query: string,
+    limit: number,
+    _semantic?: Parameters<SearchAdapter['search']>[3],
+    offset = 0,
+  ): Promise<SearchHit[]> {
     this.open();
-    page(limit, 0);
+    page(limit, offset);
     const words = query.match(/[\p{L}\p{N}_]+/gu) ?? [];
     if (!words.length) return [];
     const match = words.map((word) => `"${word}"`).join(' AND ');
     return this.db
       .prepare(
-        'SELECT d.id,d.kind,d.revision,-bm25(search_fts,2.0,1.0) score FROM search_fts JOIN search_documents d ON d.rowid=search_fts.rowid WHERE search_fts MATCH ? AND d.project_id=? AND d.archived=0 ORDER BY bm25(search_fts,2.0,1.0),d.id LIMIT ?',
+        'SELECT d.id,d.kind,d.revision,-bm25(search_fts,2.0,1.0) score FROM search_fts JOIN search_documents d ON d.rowid=search_fts.rowid WHERE search_fts MATCH ? AND d.project_id=? AND d.archived=0 ORDER BY bm25(search_fts,2.0,1.0),d.id LIMIT ? OFFSET ?',
       )
-      .all(match, projectId, limit) as unknown as SearchHit[];
+      .all(match, projectId, limit, offset) as unknown as SearchHit[];
   }
   async coverage(projectId: string, _profile?: EmbeddingProfile) {
     this.open();

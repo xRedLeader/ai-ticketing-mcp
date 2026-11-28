@@ -738,7 +738,7 @@ export interface EmbeddingProfile {
   dimensions: number;
 }
 export interface SearchAdapter {
-  readonly capabilities?: { semantic: boolean };
+  readonly capabilities?: { semantic: boolean; pagination?: true };
   configure(profile: EmbeddingProfile): Promise<void>;
   indexText(document: SearchDocument): Promise<void>;
   indexVector(
@@ -753,6 +753,7 @@ export interface SearchAdapter {
     query: string,
     limit: number,
     semantic?: { profile: EmbeddingProfile; vector: number[] },
+    offset?: number,
   ): Promise<SearchHit[]>;
   coverage(
     projectId: string,

@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fixture, hasCode, type ContractAdapters, testEmbeddings } from './contracts.js';
 import { createApplication } from '../application.js';
 
@@ -750,14 +751,22 @@ export function registerKnowledgeContractTests(name: string, factory: () => Prom
         const contextInput = { project_id: f.project.id, ticket_id: ticket.id };
         const context = (await f.app.execute(f.worker.id, 'ticket_context', contextInput)) as any;
         const proposed = (await f.call(f.worker.id, 'knowledge_write', input)) as any;
+        const index = async () => {
+          const deadline = Date.now() + 10000;
+          while (await f.storage.get('jobs', `knowledge:${proposed.id}`)) {
+            assert.ok(Date.now() < deadline, 'The current knowledge indexing job must finish.');
+            if (!(await f.app.indexOnce(1000))) await delay(10);
+          }
+        };
         const search = () =>
           f.app.execute(f.worker.id, 'search', {
             project_id: f.project.id,
             query: 'database',
             kind: 'knowledge',
           }) as Promise<any>;
-        await f.app.indexOnce(1000);
+        await index();
         const hit = (await search()).results.find((row: any) => row.id === proposed.id);
+        assert.ok(hit, 'The current knowledge revision must appear in search.');
         assert.equal(hit.memory.status, 'proposed');
         assert.equal(hit.memory.verification_state, 'unverified');
         assert.equal(hit.memory.trusted_reuse, false);
@@ -779,7 +788,7 @@ export function registerKnowledgeContractTests(name: string, factory: () => Prom
           (await search()).results.some((row: any) => row.id === proposed.id),
           false,
         );
-        await f.app.indexOnce(1000);
+        await index();
         assert.equal(
           (await search()).results.find((row: any) => row.id === proposed.id).memory.trusted_reuse,
           false,

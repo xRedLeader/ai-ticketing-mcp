@@ -843,6 +843,7 @@ function vectorLiteral(vector: number[], profile: EmbeddingProfile) {
   return `[${vector.join(',')}]`;
 }
 export class PostgresSearch implements SearchAdapter {
+  readonly capabilities = Object.freeze({ semantic: true, pagination: true as const });
   private coverageCache = new Map<
     string,
     { expires: number; value: Promise<{ documents: number; embedded: number; observed_at: string }> }
@@ -934,41 +935,36 @@ export class PostgresSearch implements SearchAdapter {
     query: string,
     limit: number,
     semantic?: { profile: EmbeddingProfile; vector: number[] },
+    offset = 0,
   ): Promise<SearchHit[]> {
-    const textResults = await this.pool.query(
-      `SELECT id,kind,revision FROM search_documents WHERE project_id=$1 AND NOT archived AND search @@ websearch_to_tsquery('english',$2) ORDER BY ts_rank_cd(search,websearch_to_tsquery('english',$2)) DESC,id LIMIT $3`,
-      [projectId, query, limit * 3],
+    ensure(
+      Number.isSafeInteger(limit) && limit >= 1 && Number.isSafeInteger(offset) && offset >= 0,
+      'INVALID_QUERY',
+      'Search limit must be positive and offset must be nonnegative.',
     );
-    let vectorRows: { id: string; kind: SearchDocument['kind']; revision: number }[] = [];
-    if (semantic) {
-      const p = semantic.profile;
-      vectorLiteral(semantic.vector, p);
-      ensure(
-        /^[a-f0-9]{16,64}$/.test(p.id) &&
-          Number.isInteger(p.dimensions) &&
-          p.dimensions >= 1 &&
-          p.dimensions <= 2000,
-        'INVALID_PROFILE',
-        'Invalid vector profile.',
-      );
+    if (!semantic) {
       const result = await this.pool.query(
-        `SELECT d.id,d.kind,d.revision FROM search_vectors v JOIN search_documents d ON d.id=v.document_id AND d.revision=v.revision WHERE d.project_id=$1 AND NOT d.archived AND v.profile_id='${p.id}' ORDER BY v.embedding::vector(${p.dimensions}) <=> $2::vector(${p.dimensions}),d.id LIMIT $3`,
-        [projectId, vectorLiteral(semantic.vector, p), limit * 3],
+        `SELECT id,kind,revision FROM search_documents WHERE project_id=$1 AND NOT archived AND search @@ websearch_to_tsquery('english',$2) ORDER BY ts_rank_cd(search,websearch_to_tsquery('english',$2)) DESC,id LIMIT $3 OFFSET $4`,
+        [projectId, query, limit, offset],
       );
-      vectorRows = result.rows;
+      return result.rows.map((row, i) => ({ ...row, score: 1 / (60 + offset + i + 1) }));
     }
-    const merged = new Map<string, SearchHit>();
-    for (const rows of [textResults.rows, vectorRows])
-      rows.forEach((row, i) => {
-        const previous = merged.get(row.id);
-        merged.set(row.id, {
-          id: row.id,
-          kind: row.kind,
-          revision: row.revision,
-          score: (previous?.score ?? 0) + 1 / (60 + i + 1),
-        });
-      });
-    return [...merged.values()].sort((a, b) => b.score - a.score || a.id.localeCompare(b.id)).slice(0, limit);
+    const p = semantic.profile;
+    ensure(
+      /^[a-f0-9]{16,64}$/.test(p.id) &&
+        Number.isInteger(p.dimensions) &&
+        p.dimensions >= 1 &&
+        p.dimensions <= 2000,
+      'INVALID_PROFILE',
+      'Invalid vector profile.',
+    );
+    const vectorQuery = `UNION ALL SELECT d.id,d.kind,d.revision,1.0/(60+row_number() OVER (ORDER BY v.embedding::vector(${p.dimensions}) <=> $5::vector(${p.dimensions}),d.id)) AS score FROM search_vectors v JOIN search_documents d ON d.id=v.document_id AND d.revision=v.revision WHERE d.project_id=$1 AND NOT d.archived AND v.profile_id='${p.id}'`;
+    // Complete ranks keep fusion stable when filters require later pages.
+    const result = await this.pool.query(
+      `WITH ranked AS (SELECT id,kind,revision,1.0/(60+row_number() OVER (ORDER BY ts_rank_cd(search,websearch_to_tsquery('english',$2)) DESC,id)) AS score FROM search_documents WHERE project_id=$1 AND NOT archived AND search @@ websearch_to_tsquery('english',$2) ${vectorQuery}) SELECT id,kind,revision,sum(score)::float8 AS score FROM ranked GROUP BY id,kind,revision ORDER BY sum(score) DESC,id LIMIT $3 OFFSET $4`,
+      [projectId, query, limit, offset, vectorLiteral(semantic.vector, p)],
+    );
+    return result.rows;
   }
   async coverage(projectId: string, profile?: EmbeddingProfile) {
     // shortcut: coverage is a five-second snapshot; use durable counters if exact live counts become necessary.

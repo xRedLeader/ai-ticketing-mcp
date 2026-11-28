@@ -32,11 +32,12 @@ export const testEmbeddings: EmbeddingProvider = {
 export interface ContractAdapters {
   storage: StorageAdapter;
   search: SearchAdapter;
+  initialTime?: () => Promise<Date>;
   dispose?: () => Promise<void>;
 }
 export async function fixture(adapters: ContractAdapters, policy: Policy = 'independent') {
   const { storage, search } = adapters;
-  const clock = { now: new Date() };
+  const clock = { now: adapters.initialTime ? await adapters.initialTime() : new Date() };
   const app = createApplication({ storage, search, embeddings: testEmbeddings, now: () => clock.now });
   const actor = (name: string, kind: Actor['kind'] = 'agent', system_admin = false): Actor => ({
     id: randomUUID(),
@@ -490,6 +491,116 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
       await f.search.indexText({ ...source, revision: source.revision + 1, archived: true });
       assert.equal((await f.search.coverage(f.project.id, testEmbeddings.profile)).documents, 0);
     });
+    check(
+      'finds filtered and eligible hits beyond the first search page without changing ranks',
+      async (f) => {
+        const template = await f.ticket({ labels: ['target'] });
+        const source = (await f.app.sourceDocument(f.storage, 'ticket', template.id))!;
+        const blockers = Array.from({ length: 105 }, (_, i) => ({
+          ...template,
+          id: `00000000-${f.project.id.slice(9, 23)}-${f.project.id.slice(-8)}${i.toString(16).padStart(4, '0')}`,
+          key: `${f.project.key}-SEARCH-${i}`,
+          status: 'backlog' as const,
+          labels: [],
+        }));
+        const eligible = {
+          ...template,
+          id: `ffffffff-ffff-4fff-8fff-${f.project.id.replaceAll('-', '').slice(0, 12)}`,
+          key: `${f.project.key}-SEARCH-OK`,
+        };
+        await f.storage.transaction(f.project.id, async (tx) => {
+          for (const ticket of [...blockers, eligible]) await tx.put('tickets', ticket);
+        });
+        const knowledge = (await f.call(f.worker.id, 'knowledge_write', {
+          title: source.title,
+          body: source.text,
+          kind: 'note',
+        })) as { id: string };
+        for (const document of [
+          ...[...blockers, eligible].map((ticket) => ({ ...source, id: ticket.id })),
+          { ...source, id: knowledge.id, kind: 'knowledge' as const, revision: 1 },
+        ]) {
+          await f.search.indexText(document);
+          if (f.search.capabilities?.semantic !== false)
+            await f.search.indexVector(document, testEmbeddings.profile, [1, 1, 0.2]);
+        }
+        // Candidates are indexed directly; leave no setup jobs in a shared contract database.
+        await f.storage.transaction(f.project.id, async (tx) => {
+          await tx.remove('jobs', `ticket:${template.id}`);
+          await tx.remove('jobs', `knowledge:${knowledge.id}`);
+        });
+        const semantic =
+          f.search.capabilities?.semantic === false
+            ? undefined
+            : { profile: testEmbeddings.profile, vector: [1, 1, 0.2] };
+        const ranked = await f.search.search(f.project.id, 'database', 1000, semantic);
+        assert.ok(ranked.findIndex((hit) => hit.id === eligible.id) > 100);
+        if (!f.search.capabilities?.pagination) {
+          await assert.rejects(
+            f.app.execute(f.worker.id, 'search', {
+              project_id: f.project.id,
+              query: 'database',
+              labels: ['target'],
+              limit: 1,
+            }),
+            hasCode('UNSUPPORTED_SEARCH'),
+          );
+          return;
+        }
+        const pages = [];
+        for (let offset = 0; offset < ranked.length; offset += 17)
+          pages.push(...(await f.search.search(f.project.id, 'database', 17, semantic, offset)));
+        assert.deepEqual(pages, ranked);
+        for (const filters of [
+          { status: 'ready' },
+          { labels: ['target'] },
+          { kind: 'knowledge' },
+          { kind: 'ticket', status: 'ready', labels: ['target'] },
+        ]) {
+          const result = (await f.app.execute(f.worker.id, 'search', {
+            project_id: f.project.id,
+            query: 'database',
+            limit: 1,
+            ...filters,
+          })) as { results: { id: string }[] };
+          assert.deepEqual(
+            result.results.map((hit) => hit.id),
+            [filters.kind === 'knowledge' ? knowledge.id : eligible.id],
+          );
+        }
+        const unpaged: SearchAdapter = {
+          capabilities: { semantic: false },
+          configure: (profile) => f.search.configure(profile),
+          indexText: (document) => f.search.indexText(document),
+          indexVector: (document, profile, vector) => f.search.indexVector(document, profile, vector),
+          search: (project, query, limit, semantic) => f.search.search(project, query, limit, semantic),
+          coverage: (project, profile) => f.search.coverage(project, profile),
+          health: () => f.search.health(),
+          close: async () => {},
+        };
+        await assert.rejects(
+          createApplication({ storage: f.storage, search: unpaged }).execute(f.worker.id, 'search', {
+            project_id: f.project.id,
+            query: 'database',
+            labels: ['target'],
+            limit: 1,
+          }),
+          hasCode('UNSUPPORTED_SEARCH'),
+        );
+        await f.storage.transaction(f.project.id, async (tx) => {
+          for (const ticket of blockers) await tx.put('tickets', { ...ticket, status: 'cancelled' });
+        });
+        const result = (await f.app.execute(f.worker.id, 'search', {
+          project_id: f.project.id,
+          query: 'database',
+          limit: 1,
+        })) as { results: { id: string }[] };
+        assert.deepEqual(
+          result.results.map((hit) => hit.id),
+          [knowledge.id],
+        );
+      },
+    );
     check('retains immutable GitHub evidence and its exact SHA/check metadata', async (f) => {
       const ticket = await f.ticket();
       const row: GitHubEvidence = {

@@ -5352,9 +5352,25 @@ export class Application {
       archived: ticket.status === 'cancelled',
     };
   }
+  private async *searchPages(
+    projectId: string,
+    query: string,
+    semantic?: Parameters<SearchAdapter['search']>[3],
+  ) {
+    for (let offset = 0; ; offset += 100) {
+      const hits = await this.searchAdapter.search(projectId, query, 100, semantic, offset);
+      yield hits;
+      if (hits.length < 100) return;
+      ensure(
+        this.searchAdapter.capabilities?.pagination,
+        'UNSUPPORTED_SEARCH',
+        'Search adapter must support pagination to inspect remaining eligible results.',
+      );
+    }
+  }
   private async search(actor: Actor, input: Input<'search'>) {
     let degraded: string | null = null;
-    let semantic;
+    let semantic: Parameters<SearchAdapter['search']>[3];
     const embeddings = this.searchAdapter.capabilities?.semantic === false ? undefined : this.embeddings;
     if (embeddings) {
       try {
@@ -5363,89 +5379,91 @@ export class Application {
         degraded = 'Embedding provider unavailable; returning full-text results.';
       }
     } else degraded = 'Semantic search is disabled; returning full-text results.';
-    const hits = await this.searchAdapter.search(
-      input.project_id,
-      input.query,
-      Math.min(100, input.limit * 3),
-      semantic,
-    );
-    const results = await this.storage.readSnapshot(async (tx) => {
-      await this.access(tx, await this.actor(actor.id, tx), input.project_id);
-      let inspect: Awaited<ReturnType<typeof inspectMemory>> | undefined;
-      const results = [];
-      for (const hit of hits) {
-        if (input.kind && input.kind !== hit.kind) continue;
-        const source = await this.sourceDocument(tx, hit.kind, hit.id);
-        if (
-          !source ||
-          source.project_id !== input.project_id ||
-          source.archived ||
-          source.revision !== hit.revision
-        )
-          continue;
-        if (hit.kind === 'knowledge') {
-          const document = (await tx.get('knowledge', hit.id))!;
-          const uncited =
-            !document.fact && !document.sources.length && !document.expires_at && !document.supersedes.length;
-          if (!uncited) inspect ??= await inspectMemory(tx, input.project_id, this.timestamp());
-          const assessment = uncited
-            ? { validity: 'unsupported' as const, trusted_reuse: false, contradictions: [] }
-            : await inspect!(document);
-          if (assessment.validity === 'unavailable') {
-            degraded =
-              'Memory validity is unavailable above 1,000 project records or accepted revisions; knowledge results are withheld.';
-            continue;
-          }
-          if (['stale', 'expired', 'superseded', 'archived'].includes(assessment.validity)) continue;
-          source.memory = {
-            status: document.status,
-            verification_state: document.verification.state,
-            validity: assessment.validity,
-            trusted_reuse: assessment.trusted_reuse,
-            contradiction_count: assessment.contradictions.length,
-          };
-        }
-        if (hit.kind === 'ticket' || hit.kind === 'checkpoint') {
-          const ticket = await tx.get('tickets', source.ticket_id ?? hit.id);
-          if (ticket?.status === 'cancelled') continue;
+    const results: Record<string, unknown>[] = [];
+    const seen = new Set<string>();
+    for await (const hits of this.searchPages(input.project_id, input.query, semantic)) {
+      await this.storage.readSnapshot(async (tx) => {
+        await this.access(tx, await this.actor(actor.id, tx), input.project_id);
+        let inspect: Awaited<ReturnType<typeof inspectMemory>> | undefined;
+        for (const hit of hits) {
+          if (seen.has(hit.id)) continue;
+          seen.add(hit.id);
+          if (input.kind && input.kind !== hit.kind) continue;
+          const source = await this.sourceDocument(tx, hit.kind, hit.id);
           if (
-            (input.status && ticket?.status !== input.status) ||
-            !input.labels.every((label) => ticket?.labels.includes(label))
+            !source ||
+            source.project_id !== input.project_id ||
+            source.archived ||
+            source.revision !== hit.revision
           )
             continue;
-        } else if (input.status || input.labels.length) continue;
-        results.push({
-          id: source.id,
-          kind: source.kind,
-          title: source.title,
-          revision: source.revision,
-          excerpt: queryExcerpt(source.text, input.query, this.countTokens),
-          score: hit.score,
-          resource_uri: `ticketing://${hit.kind}/${source.project_id}/${source.id}`,
-          retrieval: {
-            tool:
-              hit.kind === 'ticket'
-                ? 'ticket_get'
-                : hit.kind === 'checkpoint'
-                  ? 'checkpoint_get'
-                  : 'knowledge_get',
-            arguments: {
-              project_id: source.project_id,
-              [hit.kind === 'ticket'
-                ? 'ticket_id'
-                : hit.kind === 'checkpoint'
-                  ? 'checkpoint_id'
-                  : 'knowledge_id']: source.id,
-              ...(hit.kind === 'knowledge' ? { revision: source.revision } : {}),
+          if (hit.kind === 'knowledge') {
+            const document = (await tx.get('knowledge', hit.id))!;
+            const uncited =
+              !document.fact &&
+              !document.sources.length &&
+              !document.expires_at &&
+              !document.supersedes.length;
+            if (!uncited) inspect ??= await inspectMemory(tx, input.project_id, this.timestamp());
+            const assessment = uncited
+              ? { validity: 'unsupported' as const, trusted_reuse: false, contradictions: [] }
+              : await inspect!(document);
+            if (assessment.validity === 'unavailable') {
+              degraded =
+                'Memory validity is unavailable above 1,000 project records or accepted revisions; knowledge results are withheld.';
+              continue;
+            }
+            if (['stale', 'expired', 'superseded', 'archived'].includes(assessment.validity)) continue;
+            source.memory = {
+              status: document.status,
+              verification_state: document.verification.state,
+              validity: assessment.validity,
+              trusted_reuse: assessment.trusted_reuse,
+              contradiction_count: assessment.contradictions.length,
+            };
+          }
+          if (hit.kind === 'ticket' || hit.kind === 'checkpoint') {
+            const ticket = await tx.get('tickets', source.ticket_id ?? hit.id);
+            if (ticket?.status === 'cancelled') continue;
+            if (
+              (input.status && ticket?.status !== input.status) ||
+              !input.labels.every((label) => ticket?.labels.includes(label))
+            )
+              continue;
+          } else if (input.status || input.labels.length) continue;
+          results.push({
+            id: source.id,
+            kind: source.kind,
+            title: source.title,
+            revision: source.revision,
+            excerpt: queryExcerpt(source.text, input.query, this.countTokens),
+            score: hit.score,
+            resource_uri: `ticketing://${hit.kind}/${source.project_id}/${source.id}`,
+            retrieval: {
+              tool:
+                hit.kind === 'ticket'
+                  ? 'ticket_get'
+                  : hit.kind === 'checkpoint'
+                    ? 'checkpoint_get'
+                    : 'knowledge_get',
+              arguments: {
+                project_id: source.project_id,
+                [hit.kind === 'ticket'
+                  ? 'ticket_id'
+                  : hit.kind === 'checkpoint'
+                    ? 'checkpoint_id'
+                    : 'knowledge_id']: source.id,
+                ...(hit.kind === 'knowledge' ? { revision: source.revision } : {}),
+              },
             },
-          },
-          untrusted_content: true,
-          ...(source.memory ? { memory: source.memory } : {}),
-        });
-        if (results.length === input.limit) break;
-      }
-      return results;
-    });
+            untrusted_content: true,
+            ...(source.memory ? { memory: source.memory } : {}),
+          });
+          if (results.length === input.limit) break;
+        }
+      });
+      if (results.length === input.limit) break;
+    }
     const coverage = await this.searchAdapter.coverage(input.project_id, embeddings?.profile);
     // Recheck live grants after providers and the authorized snapshot complete.
     await this.access(this.storage, await this.actor(actor.id), input.project_id);
