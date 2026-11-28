@@ -47,6 +47,56 @@ it('fuses complete lexical and semantic ranks before paging the best hit', async
   }
 });
 
+it('streams multiple pages of one fused ranking on the reader connection and closes it on early return', async (t) => {
+  const a = adapters();
+  try {
+    await a.storage.migrate();
+    await a.search.configure(testEmbeddings.profile);
+    const f = await fixture(a);
+    const document = {
+      project_id: f.project.id,
+      kind: 'ticket' as const,
+      revision: 1,
+      title: 'database',
+      text: 'rank test',
+      archived: false,
+    };
+    for (let i = 0; i < 205; i++) {
+      const row = { ...document, id: randomUUID() };
+      await a.search.indexText(row);
+      if (i % 3 === 0) await a.search.indexVector(row, testEmbeddings.profile, [1, 0, 0]);
+    }
+    const semantic = { profile: testEmbeddings.profile, vector: [1, 0, 0] };
+    const expected = await a.search.search(f.project.id, 'database', 205, semantic);
+    const statements: string[] = [];
+    a.storage.pool.once('acquire', (client) => {
+      const query = client.query.bind(client);
+      t.mock.method(client, 'query', (sql: string, ...args: unknown[]) => {
+        statements.push(sql);
+        return Reflect.apply(query, client, [sql, ...args]);
+      });
+    });
+    await a.storage.readSnapshot(async (reader) => {
+      const pages = a.search.rankedPages(reader, f.project.id, 'database', semantic)!;
+      const received = [];
+      for await (const hits of pages) {
+        received.push(...hits);
+        if (received.length === 200) break;
+      }
+      assert.deepEqual(received, expected.slice(0, 200));
+      assert.ok(await reader.get('projects', f.project.id));
+    });
+    assert.equal(
+      statements.filter((sql) => sql.startsWith('DECLARE ') && sql.includes('WITH ranked')).length,
+      1,
+    );
+    assert.equal(statements.filter((sql) => sql.startsWith('FETCH ')).length, 2);
+    assert.equal(statements.filter((sql) => sql.startsWith('CLOSE ')).length, 1);
+  } finally {
+    await a.dispose();
+  }
+});
+
 it('skips provider calls for unchanged source text and preserves optional-adapter fallback', async () => {
   const a = adapters();
   try {

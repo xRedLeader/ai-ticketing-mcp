@@ -218,28 +218,38 @@ export function registerKnowledgeContractTests(name: string, factory: () => Prom
     check('rechecks revoked access after a delayed search provider returns candidates', async (f) => {
       const a = await acceptFact(f);
       await f.app.indexOnce(1000);
-      const search = new Proxy(f.search, {
-        get(target, key) {
-          const value = Reflect.get(target, key);
-          if (key === 'search')
-            return async (...args: any[]) => {
-              const candidates = await value.apply(target, args);
-              await f.call(f.admin.id, 'member_set', { actor_id: f.worker.id, role: 'none' });
-              return candidates;
-            };
-          return typeof value === 'function' ? value.bind(target) : value;
-        },
-      });
-      const app = createApplication({ storage: f.storage, search, embeddings: testEmbeddings });
-      await assert.rejects(
-        app.execute(f.worker.id, 'search', {
-          project_id: f.project.id,
-          query: 'database',
-          kind: 'knowledge',
-        }),
-        hasCode('FORBIDDEN'),
-      );
-      await assert.rejects(read(f, a.accepted.id), hasCode('FORBIDDEN'));
+      const revoke = () => f.call(f.admin.id, 'member_set', { actor_id: f.worker.id, role: 'none' });
+      for (const paired of f.search.rankedPages ? [false, true] : [false]) {
+        if (paired) await f.call(f.admin.id, 'member_set', { actor_id: f.worker.id, role: 'contributor' });
+        const search = Object.create(f.search) as typeof f.search;
+        search.search = async (...args) => {
+          const candidates = await f.search.search(...args);
+          await revoke();
+          return candidates;
+        };
+        search.rankedPages = paired
+          ? (...args) => {
+              const pages = f.search.rankedPages!(...args);
+              if (!pages) return undefined;
+              return (async function* () {
+                for await (const hits of pages) {
+                  await revoke();
+                  yield hits;
+                }
+              })();
+            }
+          : undefined;
+        const app = createApplication({ storage: f.storage, search, embeddings: testEmbeddings });
+        await assert.rejects(
+          app.execute(f.worker.id, 'search', {
+            project_id: f.project.id,
+            query: 'database',
+            kind: 'knowledge',
+          }),
+          hasCode('FORBIDDEN'),
+        );
+        await assert.rejects(read(f, a.accepted.id), hasCode('FORBIDDEN'));
+      }
     });
 
     check('keeps ticket-only and empty searches free of memory scans and project write locks', async (f) => {

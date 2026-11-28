@@ -6,7 +6,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { it, type TestContext } from 'node:test';
 import { createSqliteAdapters } from '../src/adapters/sqlite.js';
 import { createApplication } from '../src/application.js';
-import type { Reader, StorageAdapter } from '../src/contracts.js';
+import type { Reader, SearchAdapter, StorageAdapter } from '../src/contracts.js';
 import { serializeSuccessEnvelope } from '../src/envelope.js';
 import { profileOperations } from '../src/profiles.js';
 import { countReferenceTokens } from '../src/tokens.js';
@@ -35,6 +35,87 @@ async function finish(f: Awaited<ReturnType<typeof setup>>, ticketId: string) {
     expected_revision: submitted.ticket.revision,
     decision: 'approve',
     feedback: 'Independently checked.',
+  });
+}
+
+for (const paired of [true, false]) {
+  it(`validates late search hits together and skips ineligible criteria (${paired ? 'paired' : 'separate'} index)`, async (t) => {
+    const f = await setup(t);
+    const template = await f.ticket({ title: 'Coordination', description: 'Match this phrase.' });
+    const tickets = Array.from({ length: 201 }, (_, i) => ({
+      ...template,
+      id: '00000000-0000-4000-8000-' + i.toString(16).padStart(12, '0'),
+      key: f.project.key + '-S' + i,
+      labels: i === 0 || i === 200 ? ['eligible'] : [],
+    }));
+    await f.storage.transaction(f.project.id, async (tx) => {
+      for (const ticket of tickets) await tx.put('tickets', ticket);
+    });
+    const source = (await f.app.sourceDocument(f.storage, 'ticket', template.id))!;
+    for (const ticket of tickets) await f.search.indexText({ ...source, id: ticket.id });
+    const args = { project_id: f.project.id, query: 'Coordination', labels: ['eligible'], limit: 2 };
+    let transferred = false;
+    async function transfer() {
+      if (transferred) return;
+      transferred = true;
+      await f.storage.transaction(f.project.id, async (tx) => {
+        await tx.put('tickets', { ...tickets[0]!, labels: [] });
+        await tx.put('tickets', { ...tickets[100]!, labels: ['eligible'] });
+      });
+    }
+    const base = f.search;
+    const search = Object.create(base) as SearchAdapter;
+    search.rankedPages = paired
+      ? (reader, project, query) => {
+          const pages = base.rankedPages!(reader, project, query)!;
+          return (async function* () {
+            for await (const page of pages) {
+              yield page;
+              await transfer();
+            }
+          })();
+        }
+      : undefined;
+    search.search = async (project, query, limit, semantic, offset) => {
+      if (offset === 100) await transfer();
+      return base.search(project, query, limit, semantic, offset);
+    };
+    const app = createApplication({ storage: f.storage, search });
+    const result = (await app.execute(f.worker.id, 'search', args)) as { results: { id: string }[] };
+    assert.ok(transferred);
+    assert.deepEqual(
+      result.results.map((item) => item.id),
+      [tickets[paired ? 0 : 100]!.id, tickets[200]!.id],
+    );
+
+    let ticketPages = 0,
+      criteriaReads = 0,
+      individualTickets = 0;
+    const snapshot = f.storage.readSnapshot.bind(f.storage);
+    t.mock.method(f.storage, 'readSnapshot', (work: (reader: Reader) => Promise<unknown>) =>
+      snapshot((reader) => {
+        const find = reader.find.bind(reader),
+          get = reader.get.bind(reader);
+        t.mock.method(reader, 'find', (table: Parameters<Reader['find']>[0], query: any) => {
+          if (table === 'tickets') ticketPages++;
+          if (table === 'criteria') criteriaReads++;
+          return find(table, query);
+        });
+        t.mock.method(reader, 'get', (table: Parameters<Reader['get']>[0], id: string) => {
+          if (table === 'tickets') individualTickets++;
+          return get(table, id);
+        });
+        return work(reader);
+      }),
+    );
+    const absent = (await app.execute(f.worker.id, 'search', { ...args, limit: 1, labels: ['absent'] })) as {
+      results: unknown[];
+    };
+    assert.deepEqual(absent.results, []);
+    assert.deepEqual(
+      { ticketPages, criteriaReads, individualTickets },
+      { ticketPages: 3, criteriaReads: 0, individualTickets: 0 },
+    );
   });
 }
 

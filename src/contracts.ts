@@ -632,6 +632,11 @@ export interface Query<T> {
   offset?: number;
 }
 export interface Reader {
+  /** All run states for one ticket; terminal execution projections must remain immutable. */
+  executionStatusCounts?(
+    projectId: string,
+    ticketId: string,
+  ): Promise<Partial<Record<ExecutionJob['status'], number>>>;
   /** Aggregate only the selected milestone, including acceptance of current requirements. */
   milestoneProgress?(projectId: string, milestoneId: string): Promise<MilestoneProgress>;
   unansweredQuestions(
@@ -755,6 +760,13 @@ export interface SearchAdapter {
     semantic?: { profile: EmbeddingProfile; vector: number[] },
     offset?: number,
   ): Promise<SearchHit[]>;
+  /** Stream unique hits in rank order, at most 100 per page, on this reader; return undefined for a different store. */
+  rankedPages?(
+    reader: Reader,
+    projectId: string,
+    query: string,
+    semantic?: { profile: EmbeddingProfile; vector: number[] },
+  ): AsyncIterable<SearchHit[]> | undefined;
   coverage(
     projectId: string,
     profile?: EmbeddingProfile,

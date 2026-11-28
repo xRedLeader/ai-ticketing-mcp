@@ -28,6 +28,8 @@ The manifest is private to the actual SDK `Client` and current transport/profile
 
 The helper makes retained material available to its caller; the caller must actually present it to the relevant worker or reviewer before recording information-delivery proof. A fingerprint, metadata result, another role's prior read, or this helper's return alone does not establish model delivery. Count every actual `Client.callTool` invocation, including metadata checks, required omissions, pagination, final context verification, fallback reads and failed attempts. Re-presenting a retained packet to a model still consumes that model's input budget.
 
+Execution fingerprints cover all runs for the ticket, including required history beyond the packed preview, through a status summary and the current claim owner's authority. Reservation, start, settlement and cancellation invalidate retained history. Built-in stores aggregate statuses in SQL; execution adapters without the optional summary use bounded history pages. Terminal execution projections must remain immutable for this summary to remain valid.
+
 ## Verification
 
 Run with Node 24 and installed project dependencies:

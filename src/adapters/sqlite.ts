@@ -436,6 +436,16 @@ function repository(db: DatabaseSync): Transaction {
     return `"${key}"`;
   };
   return {
+    async executionStatusCounts(projectId, ticketId) {
+      return Object.fromEntries(
+        db
+          .prepare(
+            'SELECT status,count(*) AS count FROM execution_jobs WHERE project_id=? AND ticket_id=? GROUP BY status',
+          )
+          .all(projectId, ticketId)
+          .map((row) => [String(row.status), Number(row.count)]),
+      );
+    },
     async lockArtifactReferences() {
       // The caller's BEGIN IMMEDIATE already serializes reference writes and physical reads.
     },
@@ -648,6 +658,7 @@ function repository(db: DatabaseSync): Transaction {
 }
 
 type Shared = { path: string; key: string; writer: DatabaseSync; tail: Promise<void>; users: number };
+const snapshotConnections = new WeakMap<Reader, { shared: Shared; db: DatabaseSync }>();
 const sharedFiles = new Map<string, Shared>();
 const activeWriter = new AsyncLocalStorage<{ shared: Shared; active: boolean }>();
 function acquire(filename: string): Shared {
@@ -746,6 +757,10 @@ class Handle {
   }
 }
 class SqliteStorage extends Handle implements StorageAdapter {
+  executionStatusCounts(projectId: string, ticketId: string) {
+    this.open();
+    return repository(this.db).executionStatusCounts!(projectId, ticketId);
+  }
   readonly researchSpikes = true as const;
   readonly ideaIntake = true as const;
   readonly milestones = true as const;
@@ -806,8 +821,23 @@ class SqliteStorage extends Handle implements StorageAdapter {
       try {
         db.exec('BEGIN');
         db.prepare('SELECT name FROM sqlite_schema LIMIT 1').get();
-        const { get, find, unansweredQuestions, workCandidates, milestoneProgress } = repository(db);
-        const result = await work({ get, find, unansweredQuestions, workCandidates, milestoneProgress });
+        const { get, find, unansweredQuestions, workCandidates, milestoneProgress, executionStatusCounts } =
+          repository(db);
+        const reader = {
+          get,
+          find,
+          unansweredQuestions,
+          workCandidates,
+          milestoneProgress,
+          executionStatusCounts,
+        };
+        snapshotConnections.set(reader, { shared: this.shared, db });
+        let result: T;
+        try {
+          result = await work(reader);
+        } finally {
+          snapshotConnections.delete(reader);
+        }
         db.exec('COMMIT');
         return result;
       } finally {
@@ -975,6 +1005,10 @@ class SqliteStorage extends Handle implements StorageAdapter {
     this.db.prepare('SELECT 1 FROM schema_migrations LIMIT 1').get();
   }
 }
+const rankedText =
+  'SELECT d.id,d.kind,d.revision,-bm25(search_fts,2.0,1.0) score FROM search_fts JOIN search_documents d ON d.rowid=search_fts.rowid WHERE search_fts MATCH ? AND d.project_id=? AND d.archived=0 ORDER BY bm25(search_fts,2.0,1.0),d.id';
+const textMatch = (query: string) =>
+  (query.match(/[\p{L}\p{N}_]+/gu) ?? []).map((word) => `"${word}"`).join(' AND ');
 class SqliteSearch extends Handle implements SearchAdapter {
   readonly capabilities = Object.freeze({ semantic: false, pagination: true as const });
   async configure(_profile: EmbeddingProfile) {
@@ -1018,14 +1052,30 @@ class SqliteSearch extends Handle implements SearchAdapter {
   ): Promise<SearchHit[]> {
     this.open();
     page(limit, offset);
-    const words = query.match(/[\p{L}\p{N}_]+/gu) ?? [];
-    if (!words.length) return [];
-    const match = words.map((word) => `"${word}"`).join(' AND ');
+    const match = textMatch(query);
+    if (!match) return [];
     return this.db
-      .prepare(
-        'SELECT d.id,d.kind,d.revision,-bm25(search_fts,2.0,1.0) score FROM search_fts JOIN search_documents d ON d.rowid=search_fts.rowid WHERE search_fts MATCH ? AND d.project_id=? AND d.archived=0 ORDER BY bm25(search_fts,2.0,1.0),d.id LIMIT ? OFFSET ?',
-      )
+      .prepare(rankedText + ' LIMIT ? OFFSET ?')
       .all(match, projectId, limit, offset) as unknown as SearchHit[];
+  }
+  rankedPages(reader: Reader, projectId: string, query: string) {
+    this.open();
+    const snapshot = snapshotConnections.get(reader);
+    if (snapshot?.shared !== this.shared) return undefined;
+    return this.cursorPages(snapshot.db, projectId, query);
+  }
+  private async *cursorPages(db: DatabaseSync, projectId: string, query: string) {
+    const match = textMatch(query);
+    if (!match) return;
+    let hits: SearchHit[] = [];
+    for (const row of db.prepare(rankedText).iterate(match, projectId)) {
+      hits.push(row as unknown as SearchHit);
+      if (hits.length === 100) {
+        yield hits;
+        hits = [];
+      }
+    }
+    if (hits.length) yield hits;
   }
   async coverage(projectId: string, _profile?: EmbeddingProfile) {
     this.open();
