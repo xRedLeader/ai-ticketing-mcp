@@ -217,6 +217,7 @@ it('reads ticket requirements and criteria from the same snapshot during concurr
       if (key === 'readSnapshot')
         return (work: (reader: Reader) => Promise<unknown>) =>
           f.storage.readSnapshot((reader) => work(wrap(reader)));
+      if (key === 'get' || key === 'find') assert.fail('ticket_get read outside its snapshot');
       return Reflect.get(target, key);
     },
   }) as StorageAdapter;

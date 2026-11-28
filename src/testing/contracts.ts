@@ -533,9 +533,17 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
           f.search.capabilities?.semantic === false
             ? undefined
             : { profile: testEmbeddings.profile, vector: [1, 1, 0.2] };
-        const ranked = await f.search.search(f.project.id, 'database', 1000, semantic);
-        assert.ok(ranked.findIndex((hit) => hit.id === eligible.id) > 100);
-        if (!f.search.capabilities?.pagination) {
+        const first = await f.search.search(f.project.id, 'database', 100, semantic);
+        assert.equal(first.length, 100);
+        assert.ok(!first.some((hit) => hit.id === eligible.id));
+        const streamed = await f.storage.readSnapshot(async (reader) => {
+          const pages = f.search.rankedPages?.(reader, f.project.id, 'database', semantic);
+          if (!pages) return undefined;
+          const hits = [];
+          for await (const page of pages) hits.push(...page);
+          return hits;
+        });
+        if (!f.search.capabilities?.pagination && !streamed) {
           await assert.rejects(
             f.app.execute(f.worker.id, 'search', {
               project_id: f.project.id,
@@ -547,10 +555,20 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
           );
           return;
         }
-        const pages = [];
-        for (let offset = 0; offset < ranked.length; offset += 17)
-          pages.push(...(await f.search.search(f.project.id, 'database', 17, semantic, offset)));
-        assert.deepEqual(pages, ranked);
+        const expectedCount = blockers.length + 2;
+        if (f.search.capabilities?.pagination) {
+          const ranked = [...first, ...(await f.search.search(f.project.id, 'database', 100, semantic, 100))];
+          assert.equal(ranked.length, expectedCount);
+          assert.ok(ranked.findIndex((hit) => hit.id === eligible.id) >= 100);
+          const pages = [];
+          for (let offset = 0; offset < ranked.length; offset += 17)
+            pages.push(...(await f.search.search(f.project.id, 'database', 17, semantic, offset)));
+          assert.deepEqual(pages, ranked);
+          if (streamed) assert.deepEqual(streamed, ranked);
+        } else {
+          assert.equal(streamed!.length, expectedCount);
+          assert.deepEqual(streamed!.slice(0, 100), first);
+        }
         for (const filters of [
           { status: 'ready' },
           { labels: ['target'] },

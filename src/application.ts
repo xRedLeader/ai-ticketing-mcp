@@ -5001,6 +5001,27 @@ export class Application {
         }
         return response;
       });
+    if (operation === 'ticket_get')
+      return this.storage.readSnapshot(async (reader) => {
+        const actor = await this.actor(actorId, reader);
+        const project = await this.access(reader, actor, input.project_id);
+        const ticket = await this.ticket(reader, project.id, input.ticket_id);
+        const [source] = this.storage.ideaIntake
+          ? await reader.find('idea_tickets', {
+              where: { project_id: project.id, ticket_id: ticket.id },
+              limit: 1,
+            })
+          : [];
+        return {
+          ...(await this.details(reader, project, ticket, actor)),
+          ...(source ? { source_idea: source } : {}),
+          ...(this.storage.milestones
+            ? {
+                milestone_id: (await reader.get('milestone_memberships', ticket.id))?.milestone_id ?? null,
+              }
+            : {}),
+        };
+      });
     if (operation === 'ticket_context') {
       const snapshot = await this.storage.readSnapshot(async (reader) => {
         const actor = await this.actor(actorId, reader);
@@ -5157,28 +5178,6 @@ export class Application {
             }),
           };
         });
-      case 'ticket_get': {
-        return this.storage.readSnapshot(async (reader) => {
-          const actor = await this.actor(actorId, reader);
-          const project = await this.access(reader, actor, input.project_id);
-          const ticket = await this.ticket(reader, project.id, input.ticket_id);
-          const [source] = this.storage.ideaIntake
-            ? await reader.find('idea_tickets', {
-                where: { project_id: project.id, ticket_id: ticket.id },
-                limit: 1,
-              })
-            : [];
-          return {
-            ...(await this.details(reader, project, ticket, actor)),
-            ...(source ? { source_idea: source } : {}),
-            ...(this.storage.milestones
-              ? {
-                  milestone_id: (await reader.get('milestone_memberships', ticket.id))?.milestone_id ?? null,
-                }
-              : {}),
-          };
-        });
-      }
       case 'ticket_history': {
         if (['checkpoints', 'executions', 'changes', 'submissions'].includes(input.kind))
           return this.storage.readSnapshot(async (reader) => {
