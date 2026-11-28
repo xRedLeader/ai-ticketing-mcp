@@ -819,9 +819,10 @@ async function assessCommands(runtime: any, database: string, manifest: any, dir
   await mkdir(directory, { mode: 0o700 });
   await copyFile(manifest.snapshots.after.path, database, 1);
   const load = (name: string) => import(pathToFileURL(join(runtime.root, 'dist', name)).href);
-  const [{ createSqliteAdapters }, { fixture }] = await Promise.all([
+  const [{ createSqliteAdapters }, { fixture }, { schemas: runtimeSchemas }] = await Promise.all([
     load('adapters/sqlite.js'),
     load('testing/contracts.js'),
+    load('schemas.js'),
   ]);
   const a = createSqliteAdapters(database);
   let fixtureIds: any;
@@ -899,6 +900,9 @@ async function assessCommands(runtime: any, database: string, manifest: any, dir
         instructions:
           'Assess coordination protocol behavior only. Evidence is synthetic and does not establish implementation completion.',
         policy: 'independent',
+        ...(runtimeSchemas.project_create.shape.reviewer_actor_id
+          ? { reviewer_actor_id: manifest.actor_ids.reviewer }
+          : {}),
         idempotency_key: randomUUID(),
       },
       'fixture-project-create',

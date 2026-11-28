@@ -169,6 +169,7 @@ export function registerExecutionRecoveryContractTests(
       const p = (await f.app.execute(f.admin.id, 'project_create', {
         key: `R${randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase()}`,
         name: 'Other project',
+        reviewer_actor_id: f.reviewer.id,
         idempotency_key: randomUUID(),
       })) as any;
       const controllers = await Promise.all([

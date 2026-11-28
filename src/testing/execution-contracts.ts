@@ -249,6 +249,7 @@ export function registerExecutionContractTests(
       idempotency_key: randomUUID(),
       key: 'C' + randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase(),
       name: 'Other project',
+      reviewer_actor_id: f.reviewer.id,
     })) as any;
     await assert.rejects(
       f.app.execute(f.admin.id, 'run_cancel', { ...input, project_id: foreign.id }),

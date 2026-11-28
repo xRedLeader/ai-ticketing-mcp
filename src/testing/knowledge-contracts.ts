@@ -647,6 +647,11 @@ export function registerKnowledgeContractTests(name: string, factory: () => Prom
         'VERSION_CONFLICT',
       );
       const verified = await read(f, proposed.id);
+      await f.call(f.admin.id, 'member_set', { actor_id: f.other.id, role: 'verifier' });
+      await f.call(f.admin.id, 'project_update', {
+        expected_revision: f.project.revision,
+        reviewer_actor_id: f.other.id,
+      });
       await f.call(f.admin.id, 'member_set', { actor_id: f.reviewer.id, role: 'reader' });
       await assert.rejects(
         f.call(f.reviewer.id, 'knowledge_write', {

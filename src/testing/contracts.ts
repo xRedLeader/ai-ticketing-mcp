@@ -58,6 +58,7 @@ export async function fixture(adapters: ContractAdapters, policy: Policy = 'inde
     key: 'T' + randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase(),
     name: 'Contract test',
     policy,
+    ...(policy === 'independent' ? { reviewer_actor_id: reviewer.id } : {}),
     idempotency_key: randomUUID(),
   })) as Project;
   const project = (await storage.get('projects', createdProject.id))!;
@@ -66,12 +67,13 @@ export async function fixture(adapters: ContractAdapters, policy: Policy = 'inde
     [other, 'contributor'],
     [reviewer, 'verifier'],
   ] as const)
-    await app.execute(admin.id, 'member_set', {
-      project_id: project.id,
-      actor_id: person.id,
-      role,
-      idempotency_key: randomUUID(),
-    });
+    if (policy !== 'independent' || person.id !== reviewer.id)
+      await app.execute(admin.id, 'member_set', {
+        project_id: project.id,
+        actor_id: person.id,
+        role,
+        idempotency_key: randomUUID(),
+      });
   const call = async (actorId: string, operation: any, input: Record<string, unknown> = {}) =>
     app.execute(actorId, operation, { project_id: project.id, idempotency_key: randomUUID(), ...input });
   const ticket = async (overrides: Record<string, unknown> = {}) => {
@@ -144,41 +146,87 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
           await adapters.dispose?.();
         }
       });
-    check(
-      'persists optional independent reviewer assignment and clears it when access is revoked',
-      async (f) => {
-        assert.equal(f.project.reviewer_actor_id, undefined);
-        const create = (reviewerId: string) =>
-          f.app.execute(f.admin.id, 'project_create', {
-            key: 'T' + randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase(),
-            name: 'Automatic independent review',
-            reviewer_actor_id: reviewerId,
-            idempotency_key: randomUUID(),
-          }) as Promise<Project>;
-        await assert.rejects(create(randomUUID()), hasCode('UNAUTHENTICATED'));
-        const project = await create(f.other.id);
-        assert.equal(project.reviewer_actor_id, f.other.id);
-        const read = () =>
-          f.app.execute(f.admin.id, 'project_get', { project_id: project.id }) as Promise<{
-            project: Project;
-            members: { actor_id: string; role: string }[];
-          }>;
-        assert.equal(
-          (await read()).members.find((member) => member.actor_id === f.other.id)?.role,
-          'verifier',
-        );
-        assert.equal((await read()).project.reviewer_actor_id, f.other.id);
-        await f.app.execute(f.admin.id, 'member_set', {
+    check('requires a registered independent reviewer and protects selected access', async (f) => {
+      assert.equal(f.project.reviewer_actor_id, f.reviewer.id);
+      const create = (reviewerId?: string) =>
+        f.app.execute(f.admin.id, 'project_create', {
+          key: 'T' + randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase(),
+          name: 'Automatic independent review',
+          reviewer_actor_id: reviewerId,
+          idempotency_key: randomUUID(),
+        }) as Promise<Project>;
+      await assert.rejects(create(), hasCode('REVIEWER_REQUIRED'));
+      await assert.rejects(create(randomUUID()), hasCode('INVALID_REVIEWER'));
+      const project = await create(f.other.id);
+      assert.equal(project.reviewer_actor_id, f.other.id);
+      const read = () =>
+        f.app.execute(f.admin.id, 'project_get', { project_id: project.id }) as Promise<{
+          project: Project;
+          members: { actor_id: string; role: string }[];
+        }>;
+      assert.equal((await read()).members.find((member) => member.actor_id === f.other.id)?.role, 'verifier');
+      assert.equal((await read()).project.reviewer_actor_id, f.other.id);
+      await assert.rejects(
+        f.app.execute(f.admin.id, 'member_set', {
           project_id: project.id,
           actor_id: f.other.id,
           role: 'none',
           idempotency_key: randomUUID(),
-        });
-        const current = (await read()).project;
-        assert.equal(current.reviewer_actor_id, undefined);
-        assert.equal(current.revision, project.revision + 1);
-      },
-    );
+        }),
+        hasCode('REVIEWER_REQUIRED'),
+      );
+      const current = (await read()).project;
+      assert.equal(current.reviewer_actor_id, f.other.id);
+      assert.equal(current.revision, project.revision);
+    });
+    check('requires a reviewer only when enabling independent review', async (f) => {
+      const update = (expected_revision: number, changes: Record<string, unknown>) =>
+        f.call(f.admin.id, 'project_update', { expected_revision, ...changes }) as Promise<Project>;
+      const self = await update(f.project.revision, { policy: 'self' });
+      assert.equal(self.reviewer_actor_id, undefined);
+      await assert.rejects(update(self.revision, { policy: 'independent' }), hasCode('REVIEWER_REQUIRED'));
+      await assert.rejects(
+        update(self.revision, { policy: 'independent', reviewer_actor_id: f.worker.id }),
+        hasCode('INVALID_REVIEWER'),
+      );
+      const independent = await update(self.revision, {
+        policy: 'independent',
+        reviewer_actor_id: f.reviewer.id,
+      });
+      assert.equal(independent.reviewer_actor_id, f.reviewer.id);
+      await f.storage.transaction(f.project.id, async (tx) => {
+        const legacy = (await tx.get('projects', f.project.id))!;
+        delete legacy.reviewer_actor_id;
+        await tx.put('projects', legacy);
+      });
+      const legacy = await update(independent.revision, { name: 'Legacy project' });
+      assert.equal(legacy.reviewer_actor_id, undefined);
+    });
+    check('replays old project creation receipts without requiring a reviewer', async (f) => {
+      const idempotency_key = randomUUID();
+      const { id, key, name, revision } = f.project;
+      const result = { id, key, name, revision, policy: 'independent' };
+      const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+      await f.storage.transaction('catalog', (tx) =>
+        tx.put('receipts', {
+          id: hash([f.admin.id, 'catalog', 'project_create', idempotency_key]),
+          project_id: null,
+          actor_id: f.admin.id,
+          operation: 'project_create',
+          input_hash: hash({ idempotency_key, instructions: '', key, name, policy: 'independent' }),
+          result,
+          created_at: f.clock.now.toISOString(),
+        }),
+      );
+      assert.deepEqual(
+        await f.app.execute(f.admin.id, 'project_create', {
+          key,
+          name,
+          idempotency_key,
+        }),
+        result,
+      );
+    });
     check('queues ticket indexing only for requirements changes and explicit rebuilds', async (f) => {
       const ticket = await f.ticket();
       const id = `ticket:${ticket.id}`;

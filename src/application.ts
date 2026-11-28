@@ -3571,13 +3571,22 @@ export class Application {
         case 'project_create': {
           const data = input as Input<'project_create'>;
           const reviewerId = data.reviewer_actor_id;
+          ensure(
+            data.policy !== 'independent' || reviewerId,
+            'REVIEWER_REQUIRED',
+            'Select a registered reviewer with reviewer_actor_id when creating an independent-review project.',
+          );
           if (reviewerId) {
             ensure(
               data.policy === 'independent',
               'INVALID_INPUT',
               'Select a reviewer only for independent review.',
             );
-            await this.actor(reviewerId, tx);
+            ensure(
+              await tx.get('actors', reviewerId),
+              'INVALID_REVIEWER',
+              'Register the selected reviewer first.',
+            );
           }
           const created: Project = {
             id: randomUUID(),
@@ -3613,6 +3622,13 @@ export class Application {
         }
         case 'project_update': {
           this.version(project, input.expected_revision);
+          ensure(
+            (input.policy ?? project.policy) !== 'independent' ||
+              project.policy === 'independent' ||
+              input.reviewer_actor_id,
+            'REVIEWER_REQUIRED',
+            'Select a project reviewer with reviewer_actor_id when enabling independent review.',
+          );
           if (input.reviewer_actor_id) {
             ensure(
               (input.policy ?? project.policy) === 'independent',
@@ -3656,20 +3672,19 @@ export class Application {
             role: input.role,
           };
           const current = await tx.get('members', member.id);
+          ensure(
+            project.reviewer_actor_id !== input.actor_id ||
+              input.role === 'verifier' ||
+              input.role === 'admin',
+            'REVIEWER_REQUIRED',
+            'Select another project reviewer before removing this reviewer’s verifier access.',
+          );
           if (current?.role === 'admin' && input.role !== 'admin') {
             const admins = await tx.find('members', {
               where: { project_id: project.id, role: 'admin' },
               limit: 2,
             });
             ensure(admins.length > 1, 'LAST_ADMIN', 'Grant another admin before removing the last one.');
-          }
-          if (
-            project.reviewer_actor_id === input.actor_id &&
-            input.role !== 'admin' &&
-            input.role !== 'verifier'
-          ) {
-            delete project.reviewer_actor_id;
-            project.revision++;
           }
           if (input.role === 'none') await tx.remove('members', member.id);
           else await tx.put('members', member);
