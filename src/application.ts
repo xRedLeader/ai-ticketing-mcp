@@ -4089,10 +4089,13 @@ export class Application {
     return created;
   }
   private async replaceCriteria(tx: Transaction, ticket: Ticket, texts: string[]) {
-    for (const previous of await tx.find('criteria', {
+    const previous = await tx.find('criteria', {
       where: { project_id: ticket.project_id, ticket_id: ticket.id },
-    }))
-      await tx.remove('criteria', previous.id);
+      order: [{ field: 'position', direction: 'asc' }],
+    });
+    if (previous.length === texts.length && previous.every((item, position) => item.text === texts[position]))
+      return false;
+    for (const criterion of previous) await tx.remove('criteria', criterion.id);
     for (const [position, text] of texts.entries())
       await tx.put('criteria', {
         id: randomUUID(),
@@ -4101,6 +4104,7 @@ export class Application {
         text,
         position,
       });
+    return true;
   }
   private async link(tx: Transaction, project: Project, actor: Actor, input: Input<'ticket_link'>) {
     const source = await this.ticket(tx, project.id, input.source_id);
@@ -4109,6 +4113,9 @@ export class Application {
     deliveryOnly(target);
     ensure(source.id !== target.id, 'DEPENDENCY_CYCLE', 'A ticket cannot reference itself.');
     const id = `${source.id}:${target.id}:${input.kind}`;
+    const existing = await tx.get('links', id);
+    if ((input.action === 'add') === !!existing)
+      return { source_id: source.id, target_id: target.id, kind: input.kind, action: input.action };
     if (input.action === 'add' && input.kind === 'blocks')
       await this.checkCycle(tx, project.id, target.id, source.id);
     if (input.action === 'add')
@@ -4240,6 +4247,9 @@ export class Application {
       }
       case 'ticket_update': {
         this.version(ticket, input.expected_revision);
+        let requirementsChanged =
+          (input.title !== undefined && input.title !== ticket.title) ||
+          (input.description !== undefined && input.description !== ticket.description);
         if (input.execution_hints !== undefined) {
           if (input.execution_hints) ticket.execution_hints = input.execution_hints;
           else delete ticket.execution_hints;
@@ -4255,6 +4265,7 @@ export class Application {
           if (parentTicket) deliveryOnly(parentTicket);
           const parent = parentTicket?.id ?? null;
           await this.checkParent(tx, ticket, parent);
+          requirementsChanged ||= parent !== oldParent;
           ticket.parent_id = parent;
         }
         for (const key of [
@@ -4266,10 +4277,9 @@ export class Application {
           'assignee_id',
         ] as const)
           if (input[key] !== undefined) (ticket as any)[key] = input[key];
-        if (input.criteria) await this.replaceCriteria(tx, ticket, input.criteria);
-        const requirementsChanged = ['title', 'description', 'criteria', 'parent_id'].some(
-          (key) => input[key] !== undefined,
-        );
+        if (input.criteria)
+          requirementsChanged =
+            (await this.replaceCriteria(tx, ticket, input.criteria)) || requirementsChanged;
         // Reassignment revokes a live claim held by anyone other than the new assignee.
         if (ticket.assignee_id && !requirementsChanged) {
           const claim = await tx.get('claims', ticket.id);
@@ -4933,7 +4943,7 @@ export class Application {
           },
         };
         const tokens = () => this.responseTokens(this.result('run_get', response));
-        if (Buffer.byteLength(JSON.stringify(checkpoint)) > input.max_tokens || tokens() > input.max_tokens) {
+        if (tokens() > input.max_tokens) {
           response.checkpoint = null;
           response.omitted.push({
             section: 'checkpoint',
@@ -5147,23 +5157,26 @@ export class Application {
           };
         });
       case 'ticket_get': {
-        const ticket = await this.ticket(this.storage, project.id, input.ticket_id);
-        const [source] = this.storage.ideaIntake
-          ? await this.storage.find('idea_tickets', {
-              where: { project_id: project.id, ticket_id: ticket.id },
-              limit: 1,
-            })
-          : [];
-        return {
-          ...(await this.details(this.storage, project, ticket, actor)),
-          ...(source ? { source_idea: source } : {}),
-          ...(this.storage.milestones
-            ? {
-                milestone_id:
-                  (await this.storage.get('milestone_memberships', ticket.id))?.milestone_id ?? null,
-              }
-            : {}),
-        };
+        return this.storage.readSnapshot(async (reader) => {
+          const actor = await this.actor(actorId, reader);
+          const project = await this.access(reader, actor, input.project_id);
+          const ticket = await this.ticket(reader, project.id, input.ticket_id);
+          const [source] = this.storage.ideaIntake
+            ? await reader.find('idea_tickets', {
+                where: { project_id: project.id, ticket_id: ticket.id },
+                limit: 1,
+              })
+            : [];
+          return {
+            ...(await this.details(reader, project, ticket, actor)),
+            ...(source ? { source_idea: source } : {}),
+            ...(this.storage.milestones
+              ? {
+                  milestone_id: (await reader.get('milestone_memberships', ticket.id))?.milestone_id ?? null,
+                }
+              : {}),
+          };
+        });
       }
       case 'ticket_history': {
         if (['checkpoints', 'executions', 'changes', 'submissions'].includes(input.kind))
@@ -5276,15 +5289,16 @@ export class Application {
         });
       }
       case 'changes_since': {
-        const events = await this.storage.find('events', {
+        const rows = await this.storage.find('events', {
           where: { project_id: project.id, seq: { gt: input.cursor } },
           order: [{ field: 'seq', direction: 'asc' }],
-          limit: input.limit,
+          limit: input.limit + 1,
         });
+        const events = rows.slice(0, input.limit);
         return {
           events,
           next_cursor: events.at(-1)?.seq ?? input.cursor,
-          has_more: events.length === input.limit,
+          has_more: rows.length > input.limit,
         };
       }
       case 'search':
@@ -5776,7 +5790,7 @@ export class Application {
       authorization_binding,
       actor: { id: actor.id, kind: actor.kind, system_admin: actor.system_admin },
       role: member?.role ?? null,
-      project,
+      project: { ...project, ticket_seq: undefined, event_seq: undefined },
       ticket,
       criteria: detail.criteria,
       dependencies: dependencyDetails,
@@ -6040,15 +6054,38 @@ export class Application {
       'CONTEXT_TOO_LARGE',
       receipt?.handoff
         ? 'Handoff context exceeds max_tokens. Increase max_tokens and retry; the previous owner remains unchanged.'
-        : 'Required context exceeds max_tokens. Read ticket_get and project_get; claim with include_context:false and a fresh idempotency key if necessary.',
+        : reviewer
+          ? 'Review context exceeds max_tokens. Follow retrieval for requirements and exact submission history; read each native evidence reference with artifact_read before review.'
+          : 'Required context exceeds max_tokens. Read ticket_get and project_get; claim with include_context:false and a fresh idempotency key if necessary.',
       {
         required_tokens: requiredTokens,
         max_tokens: maxTokens,
         project_id: project.id,
         ticket_id: ticket.id,
         retrieval: [
+          ...(reviewer && requiredTokens <= 32768
+            ? [
+                {
+                  tool: 'ticket_context',
+                  arguments: {
+                    project_id: project.id,
+                    ticket_id: ticket.id,
+                    detail: input.detail,
+                    // The changed budget also changes the 64-character fingerprint's token count.
+                    max_tokens: Math.min(32768, requiredTokens + 64),
+                  },
+                },
+              ]
+            : []),
           { tool: 'ticket_get', arguments: { project_id: project.id, ticket_id: ticket.id } },
           { tool: 'project_get', arguments: { project_id: project.id } },
+          ...(reviewer
+            ? [
+                ...sections.filter((section) => !section.empty).map((section) => section.omission),
+                ...overflow.filter((omission) => omission.section !== 'submission_artifact'),
+                ...overflow.filter((omission) => omission.section === 'submission_artifact').slice(0, 1),
+              ].map((omission) => ({ tool: omission.retrieve_with, arguments: omission.arguments }))
+            : []),
         ],
       },
     );
