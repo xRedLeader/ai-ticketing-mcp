@@ -25,6 +25,7 @@ export function registerSharedMemoryContractTests(name: string, factory: () => P
       const destination = (await f.app.execute(f.admin.id, 'project_create', {
         key: `S${randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase()}`,
         name: 'Explicit shared scope',
+        reviewer_actor_id: f.reviewer.id,
         idempotency_key: randomUUID(),
       })) as any;
       for (const project of [f.project.id, destination.id])

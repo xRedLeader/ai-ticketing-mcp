@@ -1,12 +1,101 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { adapters } from './helpers.js';
 import { fixture, testEmbeddings } from '../../src/testing/contracts.js';
 import type { SearchDocument } from '../../src/contracts.js';
 import { createApplication } from '../../src/application.js';
 
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
+
+it('fuses complete lexical and semantic ranks before paging the best hit', async () => {
+  const a = adapters();
+  try {
+    await a.storage.migrate();
+    await a.search.configure(testEmbeddings.profile);
+    const f = await fixture(a);
+    const document = {
+      id: randomUUID(),
+      project_id: f.project.id,
+      kind: 'ticket' as const,
+      revision: 1,
+      title: 'database',
+      text: '',
+      archived: false,
+    };
+    for (let i = 0; i < 3; i++) {
+      await a.search.indexText({
+        ...document,
+        id: randomUUID(),
+        title: 'database database database',
+        text: 'database database',
+      });
+      const vector = { ...document, id: randomUUID(), title: 'unrelated' };
+      await a.search.indexText(vector);
+      await a.search.indexVector(vector, testEmbeddings.profile, [1, 0, 0]);
+    }
+    await a.search.indexText(document);
+    await a.search.indexVector(document, testEmbeddings.profile, [1, 0.5, 0]);
+    const semantic = { profile: testEmbeddings.profile, vector: [1, 0, 0] };
+    const all = await a.search.search(f.project.id, 'database', 20, semantic);
+    assert.equal(all[0]?.id, document.id);
+    assert.ok(Math.abs(all[0]!.score - 2 / 64) < 1e-12);
+    assert.deepEqual(await a.search.search(f.project.id, 'database', 1, semantic), all.slice(0, 1));
+    assert.deepEqual(await a.search.search(f.project.id, 'database', 2, semantic, 1), all.slice(1, 3));
+  } finally {
+    await a.dispose();
+  }
+});
+
+it('streams multiple pages of one fused ranking on the reader connection and closes it on early return', async (t) => {
+  const a = adapters();
+  try {
+    await a.storage.migrate();
+    await a.search.configure(testEmbeddings.profile);
+    const f = await fixture(a);
+    const document = {
+      project_id: f.project.id,
+      kind: 'ticket' as const,
+      revision: 1,
+      title: 'database',
+      text: 'rank test',
+      archived: false,
+    };
+    for (let i = 0; i < 205; i++) {
+      const row = { ...document, id: randomUUID() };
+      await a.search.indexText(row);
+      if (i % 3 === 0) await a.search.indexVector(row, testEmbeddings.profile, [1, 0, 0]);
+    }
+    const semantic = { profile: testEmbeddings.profile, vector: [1, 0, 0] };
+    const expected = await a.search.search(f.project.id, 'database', 205, semantic);
+    const statements: string[] = [];
+    a.storage.pool.once('acquire', (client) => {
+      const query = client.query.bind(client);
+      t.mock.method(client, 'query', (sql: string, ...args: unknown[]) => {
+        statements.push(sql);
+        return Reflect.apply(query, client, [sql, ...args]);
+      });
+    });
+    await a.storage.readSnapshot(async (reader) => {
+      const pages = a.search.rankedPages(reader, f.project.id, 'database', semantic)!;
+      const received = [];
+      for await (const hits of pages) {
+        received.push(...hits);
+        if (received.length === 200) break;
+      }
+      assert.deepEqual(received, expected.slice(0, 200));
+      assert.ok(await reader.get('projects', f.project.id));
+    });
+    assert.equal(
+      statements.filter((sql) => sql.startsWith('DECLARE ') && sql.includes('WITH ranked')).length,
+      1,
+    );
+    assert.equal(statements.filter((sql) => sql.startsWith('FETCH ')).length, 2);
+    assert.equal(statements.filter((sql) => sql.startsWith('CLOSE ')).length, 1);
+  } finally {
+    await a.dispose();
+  }
+});
 
 it('skips provider calls for unchanged source text and preserves optional-adapter fallback', async () => {
   const a = adapters();

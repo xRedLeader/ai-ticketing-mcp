@@ -2,6 +2,7 @@ import { mkdir, open, readdir, rename, rmdir, unlink, writeFile, type FileHandle
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { JSONRPCMessage, Transport } from '@modelcontextprotocol/server';
 
 export interface ProfileOptions {
@@ -409,7 +410,17 @@ export async function createManagedProfileRecorder(
     options.maxFiles ?? defaults.max_files,
   );
   await mkdir(root, { recursive: true, mode: 0o700 });
-  await mkdir(lock, { mode: 0o700 });
+  const deadline = Date.now() + 2000;
+  while (true) {
+    try {
+      await mkdir(lock, { mode: 0o700 });
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      if (Date.now() >= deadline) throw new Error('CAPTURE_ADMISSION_BUSY');
+      await delay(25);
+    }
+  }
   try {
     for (const entry of await readdir(root, { withFileTypes: true })) {
       if (!managedRun.test(entry.name)) continue;

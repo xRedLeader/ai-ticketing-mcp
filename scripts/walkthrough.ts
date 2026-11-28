@@ -56,6 +56,7 @@ try {
     key: 'DEMO' + randomUUID().slice(0, 6).toUpperCase(),
     name: 'Two-agent walkthrough',
     instructions: 'Demonstrate durable handoffs and independent evidence review.',
+    reviewer_actor_id: identities[2]!.id,
     idempotency_key: randomUUID(),
   });
   for (const [i, role] of [

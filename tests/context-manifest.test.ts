@@ -150,6 +150,203 @@ async function setup(t: TestContext) {
   };
 }
 
+async function queuedRuns(f: Awaited<ReturnType<typeof setup>>, count: number) {
+  const runs: string[] = [];
+  for (let index = 0; index < count; index++) {
+    f.clock.now = new Date(f.clock.now.getTime() + 1);
+    const submitted = (await f.app.execute(f.worker.id, 'run_submit', {
+      project_id: f.project.id,
+      ticket_id: f.ticket.id,
+      claim_token: f.initialClaim.claim.token,
+      idempotency_key: randomUUID(),
+      recipe_id: 'verify',
+      checkpoint: { progress: `Queued verification ${index}.` },
+      completion_condition: { kind: 'exit_code', exit_code: 0 },
+    })) as any;
+    runs.push(submitted.run_id);
+  }
+  return runs;
+}
+
+function executionRows(packet: any): any[] {
+  return [
+    ...(packet.context.execution_outcomes ?? []),
+    ...packet.retrieved.flatMap((page: any) => (page.arguments.kind === 'executions' ? page.data.items : [])),
+  ];
+}
+
+for (const count of [2, 12])
+  it(`invalidates retained brief execution history when an older of ${count} queued runs is cancelled`, async (t) => {
+    const f = await setup(t);
+    const runs = await queuedRuns(f, count);
+    const manifest = createContextManifest(await f.connect());
+    const first = await manifest.context(f.input, 'execution');
+    assert.equal(first.complete, true);
+    assert.equal(executionRows(first).find((item) => item.run.id === runs[0])?.run.status, 'queued');
+    assert.equal(executionRows(first).length, count + 1);
+    await f.app.cancelExecutionRun(f.admin.id, f.project.id, runs[0]!);
+    const current = await manifest.context(f.input, 'execution');
+    assert.equal(current.complete, true);
+    assert.notEqual(current.context.fingerprint, first.context.fingerprint);
+    assert.equal(executionRows(current).find((item) => item.run.id === runs[0])?.run.status, 'failed');
+    assert.equal(
+      serializeSuccessEnvelope(current),
+      serializeSuccessEnvelope(await createContextManifest(await f.connect()).context(f.input, 'execution')),
+    );
+    const before = f.calls.length;
+    assert.deepEqual(await manifest.context(f.input, 'execution'), current);
+    assert.equal(f.calls.length, before + 1);
+    const conditional = (await f.app.execute(f.worker.id, 'ticket_context', {
+      ...f.input,
+      if_none_match: first.context.fingerprint,
+    })) as any;
+    assert.equal(conditional.not_modified, false, 'Plain conditional readers must also invalidate.');
+  });
+
+it('invalidates deep execution history on reservation and start without relying on ticket events', async (t) => {
+  const f = await setup(t);
+  const [oldest] = await queuedRuns(f, 12);
+  const manifest = createContextManifest(await f.connect());
+  let packet = await manifest.context(f.input, 'execution');
+  const project = (await f.storage.get('projects', f.project.id))!;
+  const reserved = (await f.app.reserveExecutionRun(f.admin.id, f.project.id, oldest!, 60000))!;
+  for (const expected of ['reserved', 'running']) {
+    if (expected === 'running')
+      await f.app.startExecutionRun(f.admin.id, f.project.id, oldest!, reserved.reservation_token!, 60000);
+    const current = await manifest.context(f.input, 'execution');
+    assert.notEqual(current.context.fingerprint, packet.context.fingerprint);
+    assert.equal(executionRows(current).find((item) => item.run.id === oldest)?.run.status, expected);
+    assert.equal(current.complete, true);
+    packet = current;
+  }
+  assert.equal((await f.storage.get('projects', f.project.id))!.event_seq, project.event_seq);
+});
+
+it('rejects a deep execution transition during required recovery and retries without retained material', async (t) => {
+  const f = await setup(t);
+  const [oldest] = await queuedRuns(f, 12);
+  const client = await f.connect();
+  const callTool = client.callTool.bind(client);
+  let changed = false;
+  client.callTool = async (request, ...rest) => {
+    const response = await callTool(request, ...rest);
+    if (
+      !changed &&
+      request.name === 'ticket_history' &&
+      request.arguments?.kind === 'executions' &&
+      (response.structuredContent as any).data.items.some((item: any) => item.run.id === oldest)
+    ) {
+      changed = true;
+      await f.app.reserveExecutionRun(f.admin.id, f.project.id, oldest!, 60000);
+    }
+    return response;
+  };
+  const manifest = createContextManifest(client);
+  await assert.rejects(manifest.context(f.input, 'execution'), hasCode('CONTEXT_CHANGED'));
+  assert.equal(changed, true);
+  assert.equal(f.calls.at(-1)!.name, 'ticket_context');
+  assert.equal(f.calls.at(-1)!.data.not_modified, false);
+  const before = f.calls.length;
+  const packet = await manifest.context(f.input, 'execution');
+  assert.equal(f.calls[before]!.arguments.if_none_match, undefined);
+  assert.equal(executionRows(packet).find((item) => item.run.id === oldest)?.run.status, 'reserved');
+});
+
+it('keeps execution fingerprints local to the ticket and rechecks the live owner authority and lease', async (t) => {
+  const f = await setup(t);
+  await queuedRuns(f, 2);
+  const read = (fingerprint?: string) =>
+    f.app.execute(f.other.id, 'ticket_context', {
+      ...f.input,
+      ...(fingerprint ? { if_none_match: fingerprint } : {}),
+    }) as Promise<any>;
+  const first = await read();
+  await f.call(f.worker.id, 'tickets_create', {
+    tickets: [
+      { title: 'Unrelated work', description: 'Separate ticket.', criteria: ['Verify unrelated work.'] },
+    ],
+  });
+  assert.equal((await read(first.fingerprint)).not_modified, true);
+  await f.app.execute(f.admin.id, 'member_set', {
+    project_id: f.project.id,
+    actor_id: f.worker.id,
+    role: 'reader',
+    idempotency_key: randomUUID(),
+  });
+  const revoked = await read(first.fingerprint);
+  assert.equal(revoked.not_modified, false);
+  await f.storage.transaction(f.project.id, (tx) => tx.put('actors', { ...f.worker, system_admin: true }));
+  assert.equal((await read(revoked.fingerprint)).not_modified, false);
+  await f.storage.transaction(f.project.id, (tx) => tx.put('actors', f.worker));
+  await f.app.execute(f.admin.id, 'member_set', {
+    project_id: f.project.id,
+    actor_id: f.worker.id,
+    role: 'contributor',
+    idempotency_key: randomUUID(),
+  });
+  assert.equal((await read()).fingerprint, first.fingerprint);
+  f.clock.now = new Date(Date.parse(f.initialClaim.claim.expires_at) + 1);
+  assert.equal((await read(first.fingerprint)).not_modified, false);
+});
+
+it('uses bounded histogram pages when an execution adapter has no optimized summary', async (t) => {
+  const f = await setup(t);
+  const source = (await f.storage.find('execution_jobs', { limit: 1 }))[0]!;
+  const continuation = (await f.storage.get('continuations', source.continuation_id))!;
+  const oldest = randomUUID();
+  await f.storage.transaction(f.project.id, async (tx) => {
+    for (let index = 0; index < 1000; index++) {
+      const runId = index ? randomUUID() : oldest;
+      const continuationId = randomUUID();
+      await tx.put('execution_jobs', {
+        ...source,
+        id: runId,
+        continuation_id: continuationId,
+        status: 'queued',
+        reservation_token: null,
+        locked_until: null,
+        started_at: null,
+        finished_at: null,
+        exit_code: null,
+        artifacts: [],
+        created_at: '2000-01-01T00:00:00.000Z',
+      });
+      await tx.put('continuations', {
+        ...continuation,
+        id: continuationId,
+        run_id: runId,
+        status: 'pending',
+        settled_at: null,
+      });
+    }
+  });
+  assert.deepEqual(await f.storage.executionStatusCounts!(f.project.id, f.ticket.id), {
+    queued: 1000,
+    succeeded: 1,
+  });
+  const offsets: number[] = [];
+  const readSnapshot = f.storage.readSnapshot.bind(f.storage);
+  f.storage.readSnapshot = (work) =>
+    readSnapshot((reader) => {
+      const fallback = { ...reader };
+      delete fallback.executionStatusCounts;
+      fallback.find = (table, query) => {
+        if (table === 'execution_jobs' && query?.limit === 1000) offsets.push(query.offset ?? 0);
+        return reader.find(table, query);
+      };
+      return work(fallback);
+    });
+  const first = (await f.app.execute(f.worker.id, 'ticket_context', f.input)) as any;
+  assert.deepEqual(offsets, [0, 1000]);
+  await f.app.cancelExecutionRun(f.admin.id, f.project.id, oldest);
+  const changed = (await f.app.execute(f.worker.id, 'ticket_context', {
+    ...f.input,
+    if_none_match: first.fingerprint,
+  })) as any;
+  assert.equal(changed.not_modified, false);
+  assert.deepEqual(offsets, [0, 1000, 0, 1000]);
+});
+
 it('leaves required reviewer artifact bytes explicit and outside retained packets', async (t) => {
   const f = await setup(t);
   const args = { project_id: f.project.id, ticket_id: f.ticket.id };

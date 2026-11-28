@@ -9,7 +9,13 @@ export function adapters() {
     );
   const storage = new PostgresStorage(url);
   const search = new PostgresSearch(storage.pool);
-  return { storage, search, dispose: () => storage.close() };
+  return {
+    storage,
+    search,
+    initialTime: async () =>
+      (await storage.pool.query<{ now: Date }>('SELECT clock_timestamp() AS now')).rows[0]!.now,
+    dispose: () => storage.close(),
+  };
 }
 export async function setup(policy: Policy = 'independent') {
   const a = adapters();

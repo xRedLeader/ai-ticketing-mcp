@@ -414,6 +414,15 @@ function repository(db: Executor): Transaction {
     return `"${key}"`;
   };
   return {
+    async executionStatusCounts(projectId, ticketId) {
+      const rows = (
+        await db.query(
+          'SELECT status,count(*) AS count FROM execution_jobs WHERE project_id=$1 AND ticket_id=$2 GROUP BY status',
+          [projectId, ticketId],
+        )
+      ).rows;
+      return Object.fromEntries(rows.map((row) => [row.status, Number(row.count)]));
+    },
     async milestoneProgress(projectId, milestoneId) {
       return milestoneProgress(
         (await db.query(milestoneProgressSql('$1', '$2'), [projectId, milestoneId])).rows[0],
@@ -633,7 +642,12 @@ function repository(db: Executor): Transaction {
   };
 }
 
+const snapshotClients = new WeakMap<Reader, { pool: pg.Pool; client: pg.PoolClient }>();
+
 export class PostgresStorage implements StorageAdapter {
+  executionStatusCounts(projectId: string, ticketId: string) {
+    return this.reader.executionStatusCounts!(projectId, ticketId);
+  }
   readonly researchSpikes = true as const;
   readonly ideaIntake = true as const;
   readonly milestones = true as const;
@@ -702,8 +716,23 @@ export class PostgresStorage implements StorageAdapter {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
-      const { get, find, unansweredQuestions, workCandidates, milestoneProgress } = repository(client);
-      const result = await work({ get, find, unansweredQuestions, workCandidates, milestoneProgress });
+      const { get, find, unansweredQuestions, workCandidates, milestoneProgress, executionStatusCounts } =
+        repository(client);
+      const reader = {
+        get,
+        find,
+        unansweredQuestions,
+        workCandidates,
+        milestoneProgress,
+        executionStatusCounts,
+      };
+      snapshotClients.set(reader, { pool: this.pool, client });
+      let result: T;
+      try {
+        result = await work(reader);
+      } finally {
+        snapshotClients.delete(reader);
+      }
       await client.query('COMMIT');
       return result;
     } catch (error) {
@@ -843,6 +872,7 @@ function vectorLiteral(vector: number[], profile: EmbeddingProfile) {
   return `[${vector.join(',')}]`;
 }
 export class PostgresSearch implements SearchAdapter {
+  readonly capabilities = Object.freeze({ semantic: true, pagination: true as const });
   private coverageCache = new Map<
     string,
     { expires: number; value: Promise<{ documents: number; embedded: number; observed_at: string }> }
@@ -934,41 +964,69 @@ export class PostgresSearch implements SearchAdapter {
     query: string,
     limit: number,
     semantic?: { profile: EmbeddingProfile; vector: number[] },
+    offset = 0,
   ): Promise<SearchHit[]> {
-    const textResults = await this.pool.query(
-      `SELECT id,kind,revision FROM search_documents WHERE project_id=$1 AND NOT archived AND search @@ websearch_to_tsquery('english',$2) ORDER BY ts_rank_cd(search,websearch_to_tsquery('english',$2)) DESC,id LIMIT $3`,
-      [projectId, query, limit * 3],
+    ensure(
+      Number.isSafeInteger(limit) && limit >= 1 && Number.isSafeInteger(offset) && offset >= 0,
+      'INVALID_QUERY',
+      'Search limit must be positive and offset must be nonnegative.',
     );
-    let vectorRows: { id: string; kind: SearchDocument['kind']; revision: number }[] = [];
-    if (semantic) {
-      const p = semantic.profile;
-      vectorLiteral(semantic.vector, p);
-      ensure(
-        /^[a-f0-9]{16,64}$/.test(p.id) &&
-          Number.isInteger(p.dimensions) &&
-          p.dimensions >= 1 &&
-          p.dimensions <= 2000,
-        'INVALID_PROFILE',
-        'Invalid vector profile.',
-      );
-      const result = await this.pool.query(
-        `SELECT d.id,d.kind,d.revision FROM search_vectors v JOIN search_documents d ON d.id=v.document_id AND d.revision=v.revision WHERE d.project_id=$1 AND NOT d.archived AND v.profile_id='${p.id}' ORDER BY v.embedding::vector(${p.dimensions}) <=> $2::vector(${p.dimensions}),d.id LIMIT $3`,
-        [projectId, vectorLiteral(semantic.vector, p), limit * 3],
-      );
-      vectorRows = result.rows;
+    const ranking = this.ranking(projectId, query, semantic);
+    const count = ranking.values.length;
+    const result = await this.pool.query(ranking.sql + ` LIMIT $${count + 1} OFFSET $${count + 2}`, [
+      ...ranking.values,
+      limit,
+      offset,
+    ]);
+    return result.rows.map((row, i) => ({ ...row, score: row.score ?? 1 / (61 + offset + i) }));
+  }
+  rankedPages(
+    reader: Reader,
+    projectId: string,
+    query: string,
+    semantic?: Parameters<SearchAdapter['search']>[3],
+  ) {
+    const snapshot = snapshotClients.get(reader);
+    if (snapshot?.pool !== this.pool) return undefined;
+    return this.cursorPages(snapshot.client, projectId, query, semantic);
+  }
+  private async *cursorPages(
+    client: pg.PoolClient,
+    projectId: string,
+    query: string,
+    semantic?: Parameters<SearchAdapter['search']>[3],
+  ) {
+    const ranking = this.ranking(projectId, query, semantic);
+    const cursor = 'search_' + randomUUID().replaceAll('-', '');
+    await client.query(`DECLARE ${cursor} NO SCROLL CURSOR FOR ${ranking.sql}`, ranking.values);
+    try {
+      for (let offset = 0; ; offset += 100) {
+        const { rows } = await client.query(`FETCH FORWARD 100 FROM ${cursor}`);
+        if (rows.length) yield rows.map((row, i) => ({ ...row, score: row.score ?? 1 / (61 + offset + i) }));
+        if (rows.length < 100) break;
+      }
+    } finally {
+      await client.query(`CLOSE ${cursor}`);
     }
-    const merged = new Map<string, SearchHit>();
-    for (const rows of [textResults.rows, vectorRows])
-      rows.forEach((row, i) => {
-        const previous = merged.get(row.id);
-        merged.set(row.id, {
-          id: row.id,
-          kind: row.kind,
-          revision: row.revision,
-          score: (previous?.score ?? 0) + 1 / (60 + i + 1),
-        });
-      });
-    return [...merged.values()].sort((a, b) => b.score - a.score || a.id.localeCompare(b.id)).slice(0, limit);
+  }
+  private ranking(projectId: string, query: string, semantic?: Parameters<SearchAdapter['search']>[3]) {
+    const lexical =
+      "SELECT id,kind,revision FROM search_documents WHERE project_id=$1 AND NOT archived AND search @@ websearch_to_tsquery('english',$2) ORDER BY ts_rank_cd(search,websearch_to_tsquery('english',$2)) DESC,id";
+    if (!semantic) return { sql: lexical, values: [projectId, query] };
+    const p = semantic.profile;
+    ensure(
+      /^[a-f0-9]{16,64}$/.test(p.id) &&
+        Number.isInteger(p.dimensions) &&
+        p.dimensions >= 1 &&
+        p.dimensions <= 2000,
+      'INVALID_PROFILE',
+      'Invalid vector profile.',
+    );
+    const vectorQuery = `UNION ALL SELECT d.id,d.kind,d.revision,1.0/(60+row_number() OVER (ORDER BY v.embedding::vector(${p.dimensions}) <=> $3::vector(${p.dimensions}),d.id)) AS score FROM search_vectors v JOIN search_documents d ON d.id=v.document_id AND d.revision=v.revision WHERE d.project_id=$1 AND NOT d.archived AND v.profile_id='${p.id}'`;
+    return {
+      sql: `WITH ranked AS (SELECT id,kind,revision,1.0/(60+row_number() OVER (ORDER BY ts_rank_cd(search,websearch_to_tsquery('english',$2)) DESC,id)) AS score FROM search_documents WHERE project_id=$1 AND NOT archived AND search @@ websearch_to_tsquery('english',$2) ${vectorQuery}) SELECT id,kind,revision,sum(score)::float8 AS score FROM ranked GROUP BY id,kind,revision ORDER BY sum(score) DESC,id`,
+      values: [projectId, query, vectorLiteral(semantic.vector, p)],
+    };
   }
   async coverage(projectId: string, profile?: EmbeddingProfile) {
     // shortcut: coverage is a five-second snapshot; use durable counters if exact live counts become necessary.

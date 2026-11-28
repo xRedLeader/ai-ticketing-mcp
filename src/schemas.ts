@@ -226,7 +226,7 @@ export const schemas = {
       name: text.max(200),
       instructions: z.string().max(16000).default(''),
       policy: z.enum(['self', 'independent', 'human']).default('independent'),
-      reviewer_actor_id: id.optional().describe('Registered reviewer for independent review.'),
+      reviewer_actor_id: id.optional().describe('Registered reviewer required for independent review.'),
       scheduling_policy: schedulingPolicy.optional(),
       execution_hints: executionHintsSchema.optional(),
     })
@@ -563,7 +563,8 @@ export const descriptions: Record<Operation, string> = {
     'Link or refresh a configured repository PR and read immutable checks for its exact head SHA.',
   project_list: 'List accessible projects.',
   project_get: 'Read project instructions, policy and members.',
-  project_create: 'Create a project. Requires system administrator access.',
+  project_create:
+    'Create a project. Independent review requires reviewer_actor_id. Requires system administrator access.',
   project_update: 'Update project instructions or policy with revision protection. Requires project admin.',
   member_set:
     'Grant a registered identity a project role, or remove it with role none. The last admin cannot be removed. Requires project admin.',

@@ -10,6 +10,10 @@ The application owns workflow, permissions, review policy, graph validation, and
 
 Optional `capabilities.semantic:false` declares full-text-only search. The application skips query/document embeddings and reports the capability explicitly; absent capabilities preserve semantic support. Coverage accepts an optional profile and reports zero embedded documents when no profile or vector support is available. `ApplicationOptions.embeddings` may be omitted for full-text operation.
 
+Advertise `capabilities.pagination:true` when `search(projectId, query, limit, semantic, offset)` returns complete ranked pages with stable scores and source-ID ties for an unchanged index. Apply pagination after lexical/semantic rank fusion. The application checks ticket metadata in batches and reads criteria only for eligible tickets. It continues until the requested number of eligible hits is found or the ranking ends.
+
+An optional `rankedPages(reader, projectId, query, semantic)` can stream unique hits in rank order using the supplied storage snapshot, up to 100 hits per page. Return `undefined` for an unrelated reader. The built-in adapters stream one database ranking per search, so PostgreSQL computes semantic fusion once even when filters need later pages. Separate search stores fetch ranking pages outside storage transactions. The application rechecks earlier selections together with each new page so all returned results pass their filters in one snapshot. A custom adapter without pagination receives `UNSUPPORTED_SEARCH` when a full candidate page cannot satisfy the request.
+
 `EmbeddingProvider` exposes its model/profile/dimensions and generates query/document vectors. The supplied HTTP implementation supports Ollama and OpenAI-compatible APIs. Document inputs are split into 6,000-character pieces; normalized mean pooling includes every piece in one document vector. This favors a small index over passage-level semantic precision. Changing the chunking algorithm requires a new profile and reindexing.
 
 ## Required storage guarantees

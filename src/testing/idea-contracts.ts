@@ -245,6 +245,7 @@ export function registerIdeaContractTests(name: string, factory: () => Promise<C
     const foreign = (await f.app.execute(f.admin.id, 'project_create', {
       key: `I${randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase()}`,
       name: 'Other project',
+      reviewer_actor_id: f.reviewer.id,
       idempotency_key: randomUUID(),
     })) as any;
     await assert.rejects(

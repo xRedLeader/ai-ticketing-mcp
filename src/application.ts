@@ -13,6 +13,7 @@ import {
   type Transaction,
   type StorageAdapter,
   type SearchAdapter,
+  type SearchHit,
   type EmbeddingProvider,
   type Role,
   type Note,
@@ -3571,13 +3572,22 @@ export class Application {
         case 'project_create': {
           const data = input as Input<'project_create'>;
           const reviewerId = data.reviewer_actor_id;
+          ensure(
+            data.policy !== 'independent' || reviewerId,
+            'REVIEWER_REQUIRED',
+            'Select a registered reviewer with reviewer_actor_id when creating an independent-review project.',
+          );
           if (reviewerId) {
             ensure(
               data.policy === 'independent',
               'INVALID_INPUT',
               'Select a reviewer only for independent review.',
             );
-            await this.actor(reviewerId, tx);
+            ensure(
+              await tx.get('actors', reviewerId),
+              'INVALID_REVIEWER',
+              'Register the selected reviewer first.',
+            );
           }
           const created: Project = {
             id: randomUUID(),
@@ -3613,6 +3623,13 @@ export class Application {
         }
         case 'project_update': {
           this.version(project, input.expected_revision);
+          ensure(
+            (input.policy ?? project.policy) !== 'independent' ||
+              project.policy === 'independent' ||
+              input.reviewer_actor_id,
+            'REVIEWER_REQUIRED',
+            'Select a project reviewer with reviewer_actor_id when enabling independent review.',
+          );
           if (input.reviewer_actor_id) {
             ensure(
               (input.policy ?? project.policy) === 'independent',
@@ -3656,20 +3673,19 @@ export class Application {
             role: input.role,
           };
           const current = await tx.get('members', member.id);
+          ensure(
+            project.reviewer_actor_id !== input.actor_id ||
+              input.role === 'verifier' ||
+              input.role === 'admin',
+            'REVIEWER_REQUIRED',
+            'Select another project reviewer before removing this reviewer’s verifier access.',
+          );
           if (current?.role === 'admin' && input.role !== 'admin') {
             const admins = await tx.find('members', {
               where: { project_id: project.id, role: 'admin' },
               limit: 2,
             });
             ensure(admins.length > 1, 'LAST_ADMIN', 'Grant another admin before removing the last one.');
-          }
-          if (
-            project.reviewer_actor_id === input.actor_id &&
-            input.role !== 'admin' &&
-            input.role !== 'verifier'
-          ) {
-            delete project.reviewer_actor_id;
-            project.revision++;
           }
           if (input.role === 'none') await tx.remove('members', member.id);
           else await tx.put('members', member);
@@ -4074,10 +4090,13 @@ export class Application {
     return created;
   }
   private async replaceCriteria(tx: Transaction, ticket: Ticket, texts: string[]) {
-    for (const previous of await tx.find('criteria', {
+    const previous = await tx.find('criteria', {
       where: { project_id: ticket.project_id, ticket_id: ticket.id },
-    }))
-      await tx.remove('criteria', previous.id);
+      order: [{ field: 'position', direction: 'asc' }],
+    });
+    if (previous.length === texts.length && previous.every((item, position) => item.text === texts[position]))
+      return false;
+    for (const criterion of previous) await tx.remove('criteria', criterion.id);
     for (const [position, text] of texts.entries())
       await tx.put('criteria', {
         id: randomUUID(),
@@ -4086,6 +4105,7 @@ export class Application {
         text,
         position,
       });
+    return true;
   }
   private async link(tx: Transaction, project: Project, actor: Actor, input: Input<'ticket_link'>) {
     const source = await this.ticket(tx, project.id, input.source_id);
@@ -4094,6 +4114,9 @@ export class Application {
     deliveryOnly(target);
     ensure(source.id !== target.id, 'DEPENDENCY_CYCLE', 'A ticket cannot reference itself.');
     const id = `${source.id}:${target.id}:${input.kind}`;
+    const existing = await tx.get('links', id);
+    if ((input.action === 'add') === !!existing)
+      return { source_id: source.id, target_id: target.id, kind: input.kind, action: input.action };
     if (input.action === 'add' && input.kind === 'blocks')
       await this.checkCycle(tx, project.id, target.id, source.id);
     if (input.action === 'add')
@@ -4225,6 +4248,9 @@ export class Application {
       }
       case 'ticket_update': {
         this.version(ticket, input.expected_revision);
+        let requirementsChanged =
+          (input.title !== undefined && input.title !== ticket.title) ||
+          (input.description !== undefined && input.description !== ticket.description);
         if (input.execution_hints !== undefined) {
           if (input.execution_hints) ticket.execution_hints = input.execution_hints;
           else delete ticket.execution_hints;
@@ -4240,6 +4266,7 @@ export class Application {
           if (parentTicket) deliveryOnly(parentTicket);
           const parent = parentTicket?.id ?? null;
           await this.checkParent(tx, ticket, parent);
+          requirementsChanged ||= parent !== oldParent;
           ticket.parent_id = parent;
         }
         for (const key of [
@@ -4251,10 +4278,9 @@ export class Application {
           'assignee_id',
         ] as const)
           if (input[key] !== undefined) (ticket as any)[key] = input[key];
-        if (input.criteria) await this.replaceCriteria(tx, ticket, input.criteria);
-        const requirementsChanged = ['title', 'description', 'criteria', 'parent_id'].some(
-          (key) => input[key] !== undefined,
-        );
+        if (input.criteria)
+          requirementsChanged =
+            (await this.replaceCriteria(tx, ticket, input.criteria)) || requirementsChanged;
         // Reassignment revokes a live claim held by anyone other than the new assignee.
         if (ticket.assignee_id && !requirementsChanged) {
           const claim = await tx.get('claims', ticket.id);
@@ -4918,7 +4944,7 @@ export class Application {
           },
         };
         const tokens = () => this.responseTokens(this.result('run_get', response));
-        if (Buffer.byteLength(JSON.stringify(checkpoint)) > input.max_tokens || tokens() > input.max_tokens) {
+        if (tokens() > input.max_tokens) {
           response.checkpoint = null;
           response.omitted.push({
             section: 'checkpoint',
@@ -4974,6 +5000,27 @@ export class Application {
           return compact;
         }
         return response;
+      });
+    if (operation === 'ticket_get')
+      return this.storage.readSnapshot(async (reader) => {
+        const actor = await this.actor(actorId, reader);
+        const project = await this.access(reader, actor, input.project_id);
+        const ticket = await this.ticket(reader, project.id, input.ticket_id);
+        const [source] = this.storage.ideaIntake
+          ? await reader.find('idea_tickets', {
+              where: { project_id: project.id, ticket_id: ticket.id },
+              limit: 1,
+            })
+          : [];
+        return {
+          ...(await this.details(reader, project, ticket, actor)),
+          ...(source ? { source_idea: source } : {}),
+          ...(this.storage.milestones
+            ? {
+                milestone_id: (await reader.get('milestone_memberships', ticket.id))?.milestone_id ?? null,
+              }
+            : {}),
+        };
       });
     if (operation === 'ticket_context') {
       const snapshot = await this.storage.readSnapshot(async (reader) => {
@@ -5131,25 +5178,6 @@ export class Application {
             }),
           };
         });
-      case 'ticket_get': {
-        const ticket = await this.ticket(this.storage, project.id, input.ticket_id);
-        const [source] = this.storage.ideaIntake
-          ? await this.storage.find('idea_tickets', {
-              where: { project_id: project.id, ticket_id: ticket.id },
-              limit: 1,
-            })
-          : [];
-        return {
-          ...(await this.details(this.storage, project, ticket, actor)),
-          ...(source ? { source_idea: source } : {}),
-          ...(this.storage.milestones
-            ? {
-                milestone_id:
-                  (await this.storage.get('milestone_memberships', ticket.id))?.milestone_id ?? null,
-              }
-            : {}),
-        };
-      }
       case 'ticket_history': {
         if (['checkpoints', 'executions', 'changes', 'submissions'].includes(input.kind))
           return this.storage.readSnapshot(async (reader) => {
@@ -5261,15 +5289,16 @@ export class Application {
         });
       }
       case 'changes_since': {
-        const events = await this.storage.find('events', {
+        const rows = await this.storage.find('events', {
           where: { project_id: project.id, seq: { gt: input.cursor } },
           order: [{ field: 'seq', direction: 'asc' }],
-          limit: input.limit,
+          limit: input.limit + 1,
         });
+        const events = rows.slice(0, input.limit);
         return {
           events,
           next_cursor: events.at(-1)?.seq ?? input.cursor,
-          has_more: events.length === input.limit,
+          has_more: rows.length > input.limit,
         };
       }
       case 'search':
@@ -5287,49 +5316,54 @@ export class Application {
       const note = await reader.get('notes', id);
       if (!note || note.kind !== 'checkpoint') return null;
       const parent = await reader.get('tickets', note.ticket_id);
-      if (!parent || parent.work_kind === 'research') return null;
-      return {
-        id: note.id,
-        project_id: note.project_id,
-        ticket_id: parent.id,
-        kind,
-        revision: note.ticket_revision,
-        title: `${parent.key} checkpoint`,
-        text: `${note.body}\n${JSON.stringify(note.metadata)}`,
-        archived: false,
-      };
+      return parent && parent.work_kind !== 'research' ? this.checkpointDocument(note, parent) : null;
     }
     if (kind === 'knowledge') {
       const item = await reader.get('knowledge', id);
-      return item
-        ? {
-            id: item.id,
-            project_id: item.project_id,
-            kind,
-            revision: item.revision,
-            title: item.title,
-            text: item.body,
-            archived: item.archived,
-            memory: {
-              status: item.status,
-              verification_state: item.verification.state,
-              trusted_reuse: false,
-              validity: 'unsupported',
-              contradiction_count: 0,
-            },
-          }
-        : null;
+      return item ? this.knowledgeDocument(item) : null;
     }
     const ticket = await reader.get('tickets', id);
-    if (!ticket || ticket.work_kind === 'research') return null;
+    return ticket && ticket.work_kind !== 'research' ? this.ticketDocument(reader, ticket) : null;
+  }
+  private checkpointDocument(note: Note, parent: Ticket): SearchDocument {
+    return {
+      id: note.id,
+      project_id: note.project_id,
+      ticket_id: parent.id,
+      kind: 'checkpoint',
+      revision: note.ticket_revision,
+      title: `${parent.key} checkpoint`,
+      text: `${note.body}\n${JSON.stringify(note.metadata)}`,
+      archived: false,
+    };
+  }
+  private knowledgeDocument(item: Knowledge): SearchDocument {
+    return {
+      id: item.id,
+      project_id: item.project_id,
+      kind: 'knowledge',
+      revision: item.revision,
+      title: item.title,
+      text: item.body,
+      archived: item.archived,
+      memory: {
+        status: item.status,
+        verification_state: item.verification.state,
+        trusted_reuse: false,
+        validity: 'unsupported',
+        contradiction_count: 0,
+      },
+    };
+  }
+  private async ticketDocument(reader: Reader, ticket: Ticket): Promise<SearchDocument> {
     const criteria = await reader.find('criteria', {
-      where: { project_id: ticket.project_id, ticket_id: id },
+      where: { project_id: ticket.project_id, ticket_id: ticket.id },
       order: [{ field: 'position', direction: 'asc' }],
     });
     return {
-      id,
+      id: ticket.id,
       project_id: ticket.project_id,
-      kind,
+      kind: 'ticket',
       // Content revision: notes, claims, and checkpoints must not hide a ticket from search.
       revision: ticket.requirements_revision,
       title: ticket.title,
@@ -5337,9 +5371,25 @@ export class Application {
       archived: ticket.status === 'cancelled',
     };
   }
+  private async *searchPages(
+    projectId: string,
+    query: string,
+    semantic?: Parameters<SearchAdapter['search']>[3],
+  ) {
+    for (let offset = 0; ; offset += 100) {
+      const hits = await this.searchAdapter.search(projectId, query, 100, semantic, offset);
+      yield hits;
+      if (hits.length < 100) return;
+      ensure(
+        this.searchAdapter.capabilities?.pagination,
+        'UNSUPPORTED_SEARCH',
+        'Search adapter must support pagination to inspect remaining eligible results.',
+      );
+    }
+  }
   private async search(actor: Actor, input: Input<'search'>) {
     let degraded: string | null = null;
-    let semantic;
+    let semantic: Parameters<SearchAdapter['search']>[3];
     const embeddings = this.searchAdapter.capabilities?.semantic === false ? undefined : this.embeddings;
     if (embeddings) {
       try {
@@ -5348,89 +5398,158 @@ export class Application {
         degraded = 'Embedding provider unavailable; returning full-text results.';
       }
     } else degraded = 'Semantic search is disabled; returning full-text results.';
-    const hits = await this.searchAdapter.search(
-      input.project_id,
-      input.query,
-      Math.min(100, input.limit * 3),
-      semantic,
-    );
-    const results = await this.storage.readSnapshot(async (tx) => {
-      await this.access(tx, await this.actor(actor.id, tx), input.project_id);
+    type Match = { hit: SearchHit; source: SearchDocument };
+    const authorize = async (tx: Reader) => this.access(tx, await this.actor(actor.id, tx), input.project_id);
+    const validator = (tx: Reader) => {
       let inspect: Awaited<ReturnType<typeof inspectMemory>> | undefined;
-      const results = [];
-      for (const hit of hits) {
-        if (input.kind && input.kind !== hit.kind) continue;
-        const source = await this.sourceDocument(tx, hit.kind, hit.id);
-        if (
-          !source ||
-          source.project_id !== input.project_id ||
-          source.archived ||
-          source.revision !== hit.revision
-        )
-          continue;
-        if (hit.kind === 'knowledge') {
-          const document = (await tx.get('knowledge', hit.id))!;
-          const uncited =
-            !document.fact && !document.sources.length && !document.expires_at && !document.supersedes.length;
-          if (!uncited) inspect ??= await inspectMemory(tx, input.project_id, this.timestamp());
-          const assessment = uncited
-            ? { validity: 'unsupported' as const, trusted_reuse: false, contradictions: [] }
-            : await inspect!(document);
-          if (assessment.validity === 'unavailable') {
-            degraded =
-              'Memory validity is unavailable above 1,000 project records or accepted revisions; knowledge results are withheld.';
-            continue;
+      const at = this.timestamp();
+      return async (hits: SearchHit[], limit: number): Promise<Match[]> => {
+        hits = hits.filter((hit) => !input.kind || hit.kind === input.kind);
+        const checkpointIds = hits.filter((hit) => hit.kind === 'checkpoint').map((hit) => hit.id);
+        const notes = checkpointIds.length
+          ? await tx.find('notes', {
+              where: { project_id: input.project_id, kind: 'checkpoint', id: { in: checkpointIds } },
+              limit: checkpointIds.length,
+            })
+          : [];
+        const checkpoints = new Map(notes.map((note) => [note.id, note]));
+        const ticketIds = [
+          ...new Set([
+            ...hits.filter((hit) => hit.kind === 'ticket').map((hit) => hit.id),
+            ...notes.map((note) => note.ticket_id),
+          ]),
+        ];
+        const tickets = ticketIds.length
+          ? await tx.find('tickets', {
+              where: {
+                project_id: input.project_id,
+                id: { in: ticketIds },
+                ...(input.status ? { status: input.status } : {}),
+              },
+              limit: ticketIds.length,
+            })
+          : [];
+        const eligible = new Map(
+          tickets
+            .filter(
+              (ticket) =>
+                ticket.status !== 'cancelled' &&
+                ticket.work_kind !== 'research' &&
+                input.labels.every((label) => ticket.labels.includes(label)),
+            )
+            .map((ticket) => [ticket.id, ticket]),
+        );
+        const matches: Match[] = [];
+        const matched = new Set<string>();
+        for (const hit of hits) {
+          if (matched.has(hit.id)) continue;
+          let source: SearchDocument;
+          if (hit.kind === 'knowledge') {
+            if (input.status || input.labels.length) continue;
+            const document = await tx.get('knowledge', hit.id);
+            if (
+              !document ||
+              document.project_id !== input.project_id ||
+              document.archived ||
+              document.revision !== hit.revision
+            )
+              continue;
+            source = this.knowledgeDocument(document);
+            const uncited =
+              !document.fact &&
+              !document.sources.length &&
+              !document.expires_at &&
+              !document.supersedes.length;
+            if (!uncited) inspect ??= await inspectMemory(tx, input.project_id, at);
+            const assessment = uncited
+              ? { validity: 'unsupported' as const, trusted_reuse: false, contradictions: [] }
+              : await inspect!(document);
+            if (assessment.validity === 'unavailable') {
+              degraded =
+                'Memory validity is unavailable above 1,000 project records or accepted revisions; knowledge results are withheld.';
+              continue;
+            }
+            if (['stale', 'expired', 'superseded', 'archived'].includes(assessment.validity)) continue;
+            source.memory = {
+              status: document.status,
+              verification_state: document.verification.state,
+              validity: assessment.validity,
+              trusted_reuse: assessment.trusted_reuse,
+              contradiction_count: assessment.contradictions.length,
+            };
+          } else if (hit.kind === 'ticket') {
+            const ticket = eligible.get(hit.id);
+            if (!ticket || ticket.requirements_revision !== hit.revision) continue;
+            source = await this.ticketDocument(tx, ticket);
+          } else {
+            const note = checkpoints.get(hit.id);
+            const parent = note && eligible.get(note.ticket_id);
+            if (!note || !parent || note.ticket_revision !== hit.revision) continue;
+            source = this.checkpointDocument(note, parent);
           }
-          if (['stale', 'expired', 'superseded', 'archived'].includes(assessment.validity)) continue;
-          source.memory = {
-            status: document.status,
-            verification_state: document.verification.state,
-            validity: assessment.validity,
-            trusted_reuse: assessment.trusted_reuse,
-            contradiction_count: assessment.contradictions.length,
-          };
+          matches.push({ hit, source });
+          matched.add(hit.id);
+          if (matches.length === limit) break;
         }
-        if (hit.kind === 'ticket' || hit.kind === 'checkpoint') {
-          const ticket = await tx.get('tickets', source.ticket_id ?? hit.id);
-          if (ticket?.status === 'cancelled') continue;
-          if (
-            (input.status && ticket?.status !== input.status) ||
-            !input.labels.every((label) => ticket?.labels.includes(label))
-          )
-            continue;
-        } else if (input.status || input.labels.length) continue;
-        results.push({
-          id: source.id,
-          kind: source.kind,
-          title: source.title,
-          revision: source.revision,
-          excerpt: queryExcerpt(source.text, input.query, this.countTokens),
-          score: hit.score,
-          resource_uri: `ticketing://${hit.kind}/${source.project_id}/${source.id}`,
-          retrieval: {
-            tool:
-              hit.kind === 'ticket'
-                ? 'ticket_get'
-                : hit.kind === 'checkpoint'
-                  ? 'checkpoint_get'
-                  : 'knowledge_get',
-            arguments: {
-              project_id: source.project_id,
-              [hit.kind === 'ticket'
-                ? 'ticket_id'
-                : hit.kind === 'checkpoint'
-                  ? 'checkpoint_id'
-                  : 'knowledge_id']: source.id,
-              ...(hit.kind === 'knowledge' ? { revision: source.revision } : {}),
-            },
-          },
-          untrusted_content: true,
-          ...(source.memory ? { memory: source.memory } : {}),
+        return matches;
+      };
+    };
+    const rankedPages = this.searchAdapter.rankedPages?.bind(this.searchAdapter);
+    let matches =
+      rankedPages &&
+      (await this.storage.readSnapshot(async (tx) => {
+        const pages = rankedPages(tx, input.project_id, input.query, semantic);
+        if (!pages) return undefined;
+        await authorize(tx);
+        const select = validator(tx);
+        const selected: Match[] = [];
+        for await (const hits of pages) {
+          selected.push(...(await select(hits, input.limit - selected.length)));
+          if (selected.length === input.limit) break;
+        }
+        return selected;
+      }));
+    if (!matches) {
+      let selected: Match[] = [];
+      for await (const hits of this.searchPages(input.project_id, input.query, semantic)) {
+        // External rankings run outside the database. Recheck earlier winners in the same view as this page.
+        const candidates = [...selected.map((match) => match.hit), ...hits];
+        selected = await this.storage.readSnapshot(async (tx) => {
+          await authorize(tx);
+          return validator(tx)(candidates, input.limit);
         });
-        if (results.length === input.limit) break;
+        if (selected.length === input.limit) break;
       }
-      return results;
-    });
+      matches = selected;
+    }
+    const results = matches.map(({ hit, source }) => ({
+      id: source.id,
+      kind: source.kind,
+      title: source.title,
+      revision: source.revision,
+      excerpt: queryExcerpt(source.text, input.query, this.countTokens),
+      score: hit.score,
+      resource_uri: `ticketing://${hit.kind}/${source.project_id}/${source.id}`,
+      retrieval: {
+        tool:
+          hit.kind === 'ticket'
+            ? 'ticket_get'
+            : hit.kind === 'checkpoint'
+              ? 'checkpoint_get'
+              : 'knowledge_get',
+        arguments: {
+          project_id: source.project_id,
+          [hit.kind === 'ticket'
+            ? 'ticket_id'
+            : hit.kind === 'checkpoint'
+              ? 'checkpoint_id'
+              : 'knowledge_id']: source.id,
+          ...(hit.kind === 'knowledge' ? { revision: source.revision } : {}),
+        },
+      },
+      untrusted_content: true,
+      ...(source.memory ? { memory: source.memory } : {}),
+    }));
     const coverage = await this.searchAdapter.coverage(input.project_id, embeddings?.profile);
     // Recheck live grants after providers and the authorized snapshot complete.
     await this.access(this.storage, await this.actor(actor.id), input.project_id);
@@ -5583,6 +5702,36 @@ export class Application {
   ) {
     return this.packContext(await this.collectContext(reader, actor, project, input), input, receipt);
   }
+  private async executionHistoryIdentity(reader: Reader, projectId: string, ticketId: string) {
+    let statuses = await reader.executionStatusCounts?.(projectId, ticketId);
+    if (!statuses) {
+      statuses = {};
+      for (let offset = 0; ; offset += 1000) {
+        const runs = await reader.find('execution_jobs', {
+          where: { project_id: projectId, ticket_id: ticketId },
+          order: [{ field: 'id', direction: 'asc' }],
+          limit: 1000,
+          offset,
+        });
+        for (const run of runs) statuses[run.status] = (statuses[run.status] ?? 0) + 1;
+        if (runs.length < 1000) break;
+      }
+    }
+    const claim = await reader.get('claims', ticketId);
+    const [owner, member] = claim
+      ? await Promise.all([
+          reader.get('actors', claim.actor_id),
+          reader.get('members', `${projectId}:${claim.actor_id}`),
+        ])
+      : [null, null];
+    // States only move forward; terminal projections are immutable and only the current claim can be live.
+    return {
+      statuses,
+      claim,
+      owner: owner ? { id: owner.id, system_admin: owner.system_admin } : null,
+      role: member?.role ?? null,
+    };
+  }
   private async collectContext(
     reader: Reader,
     actor: Actor,
@@ -5666,9 +5815,10 @@ export class Application {
           limit: limit + 1,
         })
       : [];
-    const executions = await Promise.all(
-      runs.slice(0, limit).map((run) => this.executionResume(reader, run)),
-    );
+    const [executions, executionHistory] = await Promise.all([
+      Promise.all(runs.slice(0, limit).map((run) => this.executionResume(reader, run))),
+      runs.length > limit ? this.executionHistoryIdentity(reader, project.id, ticket.id) : undefined,
+    ]);
     return {
       reviewer: viewerProfile === 'reviewer',
       actor,
@@ -5685,6 +5835,7 @@ export class Application {
       dependencies,
       runs,
       executions,
+      executionHistory,
       changes,
       afterSequence,
       authorization_binding:
@@ -5714,6 +5865,7 @@ export class Application {
       dependencies,
       runs,
       executions,
+      executionHistory,
       changes,
       afterSequence,
       authorization_binding,
@@ -5743,7 +5895,7 @@ export class Application {
       authorization_binding,
       actor: { id: actor.id, kind: actor.kind, system_admin: actor.system_admin },
       role: member?.role ?? null,
-      project,
+      project: { ...project, ticket_seq: undefined, event_seq: undefined },
       ticket,
       criteria: detail.criteria,
       dependencies: dependencyDetails,
@@ -5754,6 +5906,7 @@ export class Application {
       checkpoint,
       prior_checkpoints: checkpoints.slice(1),
       executions,
+      execution_history: executionHistory,
       changes,
       questions,
       reviews,
@@ -6007,15 +6160,38 @@ export class Application {
       'CONTEXT_TOO_LARGE',
       receipt?.handoff
         ? 'Handoff context exceeds max_tokens. Increase max_tokens and retry; the previous owner remains unchanged.'
-        : 'Required context exceeds max_tokens. Read ticket_get and project_get; claim with include_context:false and a fresh idempotency key if necessary.',
+        : reviewer
+          ? 'Review context exceeds max_tokens. Follow retrieval for requirements and exact submission history; read each native evidence reference with artifact_read before review.'
+          : 'Required context exceeds max_tokens. Read ticket_get and project_get; claim with include_context:false and a fresh idempotency key if necessary.',
       {
         required_tokens: requiredTokens,
         max_tokens: maxTokens,
         project_id: project.id,
         ticket_id: ticket.id,
         retrieval: [
+          ...(reviewer && requiredTokens <= 32768
+            ? [
+                {
+                  tool: 'ticket_context',
+                  arguments: {
+                    project_id: project.id,
+                    ticket_id: ticket.id,
+                    detail: input.detail,
+                    // The changed budget also changes the 64-character fingerprint's token count.
+                    max_tokens: Math.min(32768, requiredTokens + 64),
+                  },
+                },
+              ]
+            : []),
           { tool: 'ticket_get', arguments: { project_id: project.id, ticket_id: ticket.id } },
           { tool: 'project_get', arguments: { project_id: project.id } },
+          ...(reviewer
+            ? [
+                ...sections.filter((section) => !section.empty).map((section) => section.omission),
+                ...overflow.filter((omission) => omission.section !== 'submission_artifact'),
+                ...overflow.filter((omission) => omission.section === 'submission_artifact').slice(0, 1),
+              ].map((omission) => ({ tool: omission.retrieve_with, arguments: omission.arguments }))
+            : []),
         ],
       },
     );

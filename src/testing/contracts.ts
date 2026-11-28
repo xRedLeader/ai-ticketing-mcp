@@ -32,11 +32,12 @@ export const testEmbeddings: EmbeddingProvider = {
 export interface ContractAdapters {
   storage: StorageAdapter;
   search: SearchAdapter;
+  initialTime?: () => Promise<Date>;
   dispose?: () => Promise<void>;
 }
 export async function fixture(adapters: ContractAdapters, policy: Policy = 'independent') {
   const { storage, search } = adapters;
-  const clock = { now: new Date() };
+  const clock = { now: adapters.initialTime ? await adapters.initialTime() : new Date() };
   const app = createApplication({ storage, search, embeddings: testEmbeddings, now: () => clock.now });
   const actor = (name: string, kind: Actor['kind'] = 'agent', system_admin = false): Actor => ({
     id: randomUUID(),
@@ -58,6 +59,7 @@ export async function fixture(adapters: ContractAdapters, policy: Policy = 'inde
     key: 'T' + randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase(),
     name: 'Contract test',
     policy,
+    ...(policy === 'independent' ? { reviewer_actor_id: reviewer.id } : {}),
     idempotency_key: randomUUID(),
   })) as Project;
   const project = (await storage.get('projects', createdProject.id))!;
@@ -66,12 +68,13 @@ export async function fixture(adapters: ContractAdapters, policy: Policy = 'inde
     [other, 'contributor'],
     [reviewer, 'verifier'],
   ] as const)
-    await app.execute(admin.id, 'member_set', {
-      project_id: project.id,
-      actor_id: person.id,
-      role,
-      idempotency_key: randomUUID(),
-    });
+    if (policy !== 'independent' || person.id !== reviewer.id)
+      await app.execute(admin.id, 'member_set', {
+        project_id: project.id,
+        actor_id: person.id,
+        role,
+        idempotency_key: randomUUID(),
+      });
   const call = async (actorId: string, operation: any, input: Record<string, unknown> = {}) =>
     app.execute(actorId, operation, { project_id: project.id, idempotency_key: randomUUID(), ...input });
   const ticket = async (overrides: Record<string, unknown> = {}) => {
@@ -144,41 +147,87 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
           await adapters.dispose?.();
         }
       });
-    check(
-      'persists optional independent reviewer assignment and clears it when access is revoked',
-      async (f) => {
-        assert.equal(f.project.reviewer_actor_id, undefined);
-        const create = (reviewerId: string) =>
-          f.app.execute(f.admin.id, 'project_create', {
-            key: 'T' + randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase(),
-            name: 'Automatic independent review',
-            reviewer_actor_id: reviewerId,
-            idempotency_key: randomUUID(),
-          }) as Promise<Project>;
-        await assert.rejects(create(randomUUID()), hasCode('UNAUTHENTICATED'));
-        const project = await create(f.other.id);
-        assert.equal(project.reviewer_actor_id, f.other.id);
-        const read = () =>
-          f.app.execute(f.admin.id, 'project_get', { project_id: project.id }) as Promise<{
-            project: Project;
-            members: { actor_id: string; role: string }[];
-          }>;
-        assert.equal(
-          (await read()).members.find((member) => member.actor_id === f.other.id)?.role,
-          'verifier',
-        );
-        assert.equal((await read()).project.reviewer_actor_id, f.other.id);
-        await f.app.execute(f.admin.id, 'member_set', {
+    check('requires a registered independent reviewer and protects selected access', async (f) => {
+      assert.equal(f.project.reviewer_actor_id, f.reviewer.id);
+      const create = (reviewerId?: string) =>
+        f.app.execute(f.admin.id, 'project_create', {
+          key: 'T' + randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase(),
+          name: 'Automatic independent review',
+          reviewer_actor_id: reviewerId,
+          idempotency_key: randomUUID(),
+        }) as Promise<Project>;
+      await assert.rejects(create(), hasCode('REVIEWER_REQUIRED'));
+      await assert.rejects(create(randomUUID()), hasCode('INVALID_REVIEWER'));
+      const project = await create(f.other.id);
+      assert.equal(project.reviewer_actor_id, f.other.id);
+      const read = () =>
+        f.app.execute(f.admin.id, 'project_get', { project_id: project.id }) as Promise<{
+          project: Project;
+          members: { actor_id: string; role: string }[];
+        }>;
+      assert.equal((await read()).members.find((member) => member.actor_id === f.other.id)?.role, 'verifier');
+      assert.equal((await read()).project.reviewer_actor_id, f.other.id);
+      await assert.rejects(
+        f.app.execute(f.admin.id, 'member_set', {
           project_id: project.id,
           actor_id: f.other.id,
           role: 'none',
           idempotency_key: randomUUID(),
-        });
-        const current = (await read()).project;
-        assert.equal(current.reviewer_actor_id, undefined);
-        assert.equal(current.revision, project.revision + 1);
-      },
-    );
+        }),
+        hasCode('REVIEWER_REQUIRED'),
+      );
+      const current = (await read()).project;
+      assert.equal(current.reviewer_actor_id, f.other.id);
+      assert.equal(current.revision, project.revision);
+    });
+    check('requires a reviewer only when enabling independent review', async (f) => {
+      const update = (expected_revision: number, changes: Record<string, unknown>) =>
+        f.call(f.admin.id, 'project_update', { expected_revision, ...changes }) as Promise<Project>;
+      const self = await update(f.project.revision, { policy: 'self' });
+      assert.equal(self.reviewer_actor_id, undefined);
+      await assert.rejects(update(self.revision, { policy: 'independent' }), hasCode('REVIEWER_REQUIRED'));
+      await assert.rejects(
+        update(self.revision, { policy: 'independent', reviewer_actor_id: f.worker.id }),
+        hasCode('INVALID_REVIEWER'),
+      );
+      const independent = await update(self.revision, {
+        policy: 'independent',
+        reviewer_actor_id: f.reviewer.id,
+      });
+      assert.equal(independent.reviewer_actor_id, f.reviewer.id);
+      await f.storage.transaction(f.project.id, async (tx) => {
+        const legacy = (await tx.get('projects', f.project.id))!;
+        delete legacy.reviewer_actor_id;
+        await tx.put('projects', legacy);
+      });
+      const legacy = await update(independent.revision, { name: 'Legacy project' });
+      assert.equal(legacy.reviewer_actor_id, undefined);
+    });
+    check('replays old project creation receipts without requiring a reviewer', async (f) => {
+      const idempotency_key = randomUUID();
+      const { id, key, name, revision } = f.project;
+      const result = { id, key, name, revision, policy: 'independent' };
+      const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+      await f.storage.transaction('catalog', (tx) =>
+        tx.put('receipts', {
+          id: hash([f.admin.id, 'catalog', 'project_create', idempotency_key]),
+          project_id: null,
+          actor_id: f.admin.id,
+          operation: 'project_create',
+          input_hash: hash({ idempotency_key, instructions: '', key, name, policy: 'independent' }),
+          result,
+          created_at: f.clock.now.toISOString(),
+        }),
+      );
+      assert.deepEqual(
+        await f.app.execute(f.admin.id, 'project_create', {
+          key,
+          name,
+          idempotency_key,
+        }),
+        result,
+      );
+    });
     check('queues ticket indexing only for requirements changes and explicit rebuilds', async (f) => {
       const ticket = await f.ticket();
       const id = `ticket:${ticket.id}`;
@@ -442,6 +491,134 @@ export function registerAdapterContractTests(name: string, factory: () => Promis
       await f.search.indexText({ ...source, revision: source.revision + 1, archived: true });
       assert.equal((await f.search.coverage(f.project.id, testEmbeddings.profile)).documents, 0);
     });
+    check(
+      'finds filtered and eligible hits beyond the first search page without changing ranks',
+      async (f) => {
+        const template = await f.ticket({ labels: ['target'] });
+        const source = (await f.app.sourceDocument(f.storage, 'ticket', template.id))!;
+        const blockers = Array.from({ length: 105 }, (_, i) => ({
+          ...template,
+          id: `00000000-${f.project.id.slice(9, 23)}-${f.project.id.slice(-8)}${i.toString(16).padStart(4, '0')}`,
+          key: `${f.project.key}-SEARCH-${i}`,
+          status: 'backlog' as const,
+          labels: [],
+        }));
+        const eligible = {
+          ...template,
+          id: `ffffffff-ffff-4fff-8fff-${f.project.id.replaceAll('-', '').slice(0, 12)}`,
+          key: `${f.project.key}-SEARCH-OK`,
+        };
+        await f.storage.transaction(f.project.id, async (tx) => {
+          for (const ticket of [...blockers, eligible]) await tx.put('tickets', ticket);
+        });
+        const knowledge = (await f.call(f.worker.id, 'knowledge_write', {
+          title: source.title,
+          body: source.text,
+          kind: 'note',
+        })) as { id: string };
+        for (const document of [
+          ...[...blockers, eligible].map((ticket) => ({ ...source, id: ticket.id })),
+          { ...source, id: knowledge.id, kind: 'knowledge' as const, revision: 1 },
+        ]) {
+          await f.search.indexText(document);
+          if (f.search.capabilities?.semantic !== false)
+            await f.search.indexVector(document, testEmbeddings.profile, [1, 1, 0.2]);
+        }
+        // Candidates are indexed directly; leave no setup jobs in a shared contract database.
+        await f.storage.transaction(f.project.id, async (tx) => {
+          await tx.remove('jobs', `ticket:${template.id}`);
+          await tx.remove('jobs', `knowledge:${knowledge.id}`);
+        });
+        const semantic =
+          f.search.capabilities?.semantic === false
+            ? undefined
+            : { profile: testEmbeddings.profile, vector: [1, 1, 0.2] };
+        const first = await f.search.search(f.project.id, 'database', 100, semantic);
+        assert.equal(first.length, 100);
+        assert.ok(!first.some((hit) => hit.id === eligible.id));
+        const streamed = await f.storage.readSnapshot(async (reader) => {
+          const pages = f.search.rankedPages?.(reader, f.project.id, 'database', semantic);
+          if (!pages) return undefined;
+          const hits = [];
+          for await (const page of pages) hits.push(...page);
+          return hits;
+        });
+        if (!f.search.capabilities?.pagination && !streamed) {
+          await assert.rejects(
+            f.app.execute(f.worker.id, 'search', {
+              project_id: f.project.id,
+              query: 'database',
+              labels: ['target'],
+              limit: 1,
+            }),
+            hasCode('UNSUPPORTED_SEARCH'),
+          );
+          return;
+        }
+        const expectedCount = blockers.length + 2;
+        if (f.search.capabilities?.pagination) {
+          const ranked = [...first, ...(await f.search.search(f.project.id, 'database', 100, semantic, 100))];
+          assert.equal(ranked.length, expectedCount);
+          assert.ok(ranked.findIndex((hit) => hit.id === eligible.id) >= 100);
+          const pages = [];
+          for (let offset = 0; offset < ranked.length; offset += 17)
+            pages.push(...(await f.search.search(f.project.id, 'database', 17, semantic, offset)));
+          assert.deepEqual(pages, ranked);
+          if (streamed) assert.deepEqual(streamed, ranked);
+        } else {
+          assert.equal(streamed!.length, expectedCount);
+          assert.deepEqual(streamed!.slice(0, 100), first);
+        }
+        for (const filters of [
+          { status: 'ready' },
+          { labels: ['target'] },
+          { kind: 'knowledge' },
+          { kind: 'ticket', status: 'ready', labels: ['target'] },
+        ]) {
+          const result = (await f.app.execute(f.worker.id, 'search', {
+            project_id: f.project.id,
+            query: 'database',
+            limit: 1,
+            ...filters,
+          })) as { results: { id: string }[] };
+          assert.deepEqual(
+            result.results.map((hit) => hit.id),
+            [filters.kind === 'knowledge' ? knowledge.id : eligible.id],
+          );
+        }
+        const unpaged: SearchAdapter = {
+          capabilities: { semantic: false },
+          configure: (profile) => f.search.configure(profile),
+          indexText: (document) => f.search.indexText(document),
+          indexVector: (document, profile, vector) => f.search.indexVector(document, profile, vector),
+          search: (project, query, limit, semantic) => f.search.search(project, query, limit, semantic),
+          coverage: (project, profile) => f.search.coverage(project, profile),
+          health: () => f.search.health(),
+          close: async () => {},
+        };
+        await assert.rejects(
+          createApplication({ storage: f.storage, search: unpaged }).execute(f.worker.id, 'search', {
+            project_id: f.project.id,
+            query: 'database',
+            labels: ['target'],
+            limit: 1,
+          }),
+          hasCode('UNSUPPORTED_SEARCH'),
+        );
+        await f.storage.transaction(f.project.id, async (tx) => {
+          for (const ticket of blockers) await tx.put('tickets', { ...ticket, status: 'cancelled' });
+        });
+        const result = (await f.app.execute(f.worker.id, 'search', {
+          project_id: f.project.id,
+          query: 'database',
+          limit: 1,
+        })) as { results: { id: string }[] };
+        assert.deepEqual(
+          result.results.map((hit) => hit.id),
+          [knowledge.id],
+        );
+      },
+    );
     check('retains immutable GitHub evidence and its exact SHA/check metadata', async (f) => {
       const ticket = await f.ticket();
       const row: GitHubEvidence = {

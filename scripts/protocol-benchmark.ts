@@ -187,6 +187,7 @@ async function seed(workflow: any, scenario: number) {
     name: contract.project.name,
     instructions: contract.project.instructions,
     policy: workflow.policy,
+    ...(!baseline && workflow.policy === 'independent' ? { reviewer_actor_id: reviewer.id } : {}),
     revision: 1,
     ticket_seq: workflow.blocking ? 2 : 1,
     event_seq: 0,

@@ -62,7 +62,7 @@ Requirement edits revoke claims and invalidate affected reviews, completed depen
 
 ## Independent review
 
-Set `reviewer_actor_id` on an independent project to opt into a designated reviewer. `project_create` grants the selected registered identity verifier access unless it already owns the project. For `project_update`, grant the identity verifier or admin access first. Revoking that access clears the assignment. The local dispatcher requires an assigned agent with verifier or admin access. [Dispatcher setup](operations.md#automatic-local-independent-review)
+New independent projects (the default policy) require `reviewer_actor_id` for a registered identity. `project_create` grants it verifier access unless it already owns the project. When enabling independent review with `project_update`, grant and select a verifier or admin first. Select a replacement before removing the selected reviewer's access. Existing independent projects without a selection and old idempotent receipts remain valid. The local dispatcher requires the assigned agent to have verifier or admin access. [Dispatcher setup](operations.md#automatic-local-independent-review)
 
 Native artifact references in the exact selected submission require the reviewer's own complete byte and hash reads even when requirements and evidence were retrieved directly through `ticket_get` and `ticket_history`. The assessment validators derive those required reads from the submission itself, and reject passing claims contradicted by the actual native result or its pipeline steps and cleanup state.
 

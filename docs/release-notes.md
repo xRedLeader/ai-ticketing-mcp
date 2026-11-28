@@ -6,6 +6,8 @@ These notes include the breaking changes merged in PR #1 and the self-hosted add
 
 ### Required migration from the original MCP API
 
+- New independent-review projects require a registered `reviewer_actor_id`; enabling independent review requires selecting a project verifier or admin. Selected reviewer access is protected until replaced or the review policy changes. Existing independent projects without a selection and old creation receipts are retained. The existing project-reviewer migration supplies the optional field; no new migration is needed.
+
 - Custom storage adapters must implement `readSnapshot<T>(work: (reader: Reader) => Promise<T>): Promise<T>` and `unansweredQuestions`. A snapshot must be consistent and read-only without taking the project mutation lock. Standalone context collection releases the snapshot before token packing. Run the exported adapter contract suite before deploying a replacement adapter; see [adapter requirements](adapters.md).
 - MCP defaults to the worker profile. Select `full` for the original administrative tool surface, or `planner` / `reviewer` for those roles. Profiles do not grant permissions.
 - The `ticket_history` filter is now `nonblocking_unanswered:true`, replacing `unanswered_questions:true` without an alias. It returns only unanswered non-blocking questions; blocking questions remain in context blockers. Generated omission references use the new name. `kind:'notes'` and the prohibition on combining the filter with `item_id` are unchanged.

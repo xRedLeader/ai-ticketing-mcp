@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fixture, hasCode, type ContractAdapters, testEmbeddings } from './contracts.js';
 import { createApplication } from '../application.js';
 
@@ -217,28 +218,38 @@ export function registerKnowledgeContractTests(name: string, factory: () => Prom
     check('rechecks revoked access after a delayed search provider returns candidates', async (f) => {
       const a = await acceptFact(f);
       await f.app.indexOnce(1000);
-      const search = new Proxy(f.search, {
-        get(target, key) {
-          const value = Reflect.get(target, key);
-          if (key === 'search')
-            return async (...args: any[]) => {
-              const candidates = await value.apply(target, args);
-              await f.call(f.admin.id, 'member_set', { actor_id: f.worker.id, role: 'none' });
-              return candidates;
-            };
-          return typeof value === 'function' ? value.bind(target) : value;
-        },
-      });
-      const app = createApplication({ storage: f.storage, search, embeddings: testEmbeddings });
-      await assert.rejects(
-        app.execute(f.worker.id, 'search', {
-          project_id: f.project.id,
-          query: 'database',
-          kind: 'knowledge',
-        }),
-        hasCode('FORBIDDEN'),
-      );
-      await assert.rejects(read(f, a.accepted.id), hasCode('FORBIDDEN'));
+      const revoke = () => f.call(f.admin.id, 'member_set', { actor_id: f.worker.id, role: 'none' });
+      for (const paired of f.search.rankedPages ? [false, true] : [false]) {
+        if (paired) await f.call(f.admin.id, 'member_set', { actor_id: f.worker.id, role: 'contributor' });
+        const search = Object.create(f.search) as typeof f.search;
+        search.search = async (...args) => {
+          const candidates = await f.search.search(...args);
+          await revoke();
+          return candidates;
+        };
+        search.rankedPages = paired
+          ? (...args) => {
+              const pages = f.search.rankedPages!(...args);
+              if (!pages) return undefined;
+              return (async function* () {
+                for await (const hits of pages) {
+                  await revoke();
+                  yield hits;
+                }
+              })();
+            }
+          : undefined;
+        const app = createApplication({ storage: f.storage, search, embeddings: testEmbeddings });
+        await assert.rejects(
+          app.execute(f.worker.id, 'search', {
+            project_id: f.project.id,
+            query: 'database',
+            kind: 'knowledge',
+          }),
+          hasCode('FORBIDDEN'),
+        );
+        await assert.rejects(read(f, a.accepted.id), hasCode('FORBIDDEN'));
+      }
     });
 
     check('keeps ticket-only and empty searches free of memory scans and project write locks', async (f) => {
@@ -647,6 +658,11 @@ export function registerKnowledgeContractTests(name: string, factory: () => Prom
         'VERSION_CONFLICT',
       );
       const verified = await read(f, proposed.id);
+      await f.call(f.admin.id, 'member_set', { actor_id: f.other.id, role: 'verifier' });
+      await f.call(f.admin.id, 'project_update', {
+        expected_revision: f.project.revision,
+        reviewer_actor_id: f.other.id,
+      });
       await f.call(f.admin.id, 'member_set', { actor_id: f.reviewer.id, role: 'reader' });
       await assert.rejects(
         f.call(f.reviewer.id, 'knowledge_write', {
@@ -745,14 +761,22 @@ export function registerKnowledgeContractTests(name: string, factory: () => Prom
         const contextInput = { project_id: f.project.id, ticket_id: ticket.id };
         const context = (await f.app.execute(f.worker.id, 'ticket_context', contextInput)) as any;
         const proposed = (await f.call(f.worker.id, 'knowledge_write', input)) as any;
+        const index = async () => {
+          const deadline = Date.now() + 10000;
+          while (await f.storage.get('jobs', `knowledge:${proposed.id}`)) {
+            assert.ok(Date.now() < deadline, 'The current knowledge indexing job must finish.');
+            if (!(await f.app.indexOnce(1000))) await delay(10);
+          }
+        };
         const search = () =>
           f.app.execute(f.worker.id, 'search', {
             project_id: f.project.id,
             query: 'database',
             kind: 'knowledge',
           }) as Promise<any>;
-        await f.app.indexOnce(1000);
+        await index();
         const hit = (await search()).results.find((row: any) => row.id === proposed.id);
+        assert.ok(hit, 'The current knowledge revision must appear in search.');
         assert.equal(hit.memory.status, 'proposed');
         assert.equal(hit.memory.verification_state, 'unverified');
         assert.equal(hit.memory.trusted_reuse, false);
@@ -774,7 +798,7 @@ export function registerKnowledgeContractTests(name: string, factory: () => Prom
           (await search()).results.some((row: any) => row.id === proposed.id),
           false,
         );
-        await f.app.indexOnce(1000);
+        await index();
         assert.equal(
           (await search()).results.find((row: any) => row.id === proposed.id).memory.trusted_reuse,
           false,
